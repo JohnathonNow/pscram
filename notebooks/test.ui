@@ -1,0 +1,15 @@
+:> 1. Interactive stateful counter compiled with MiniJS
+var count := 0
+let readout := ui::html('<span>Count: <strong style="font-size:1.3em">0</strong></span>')
+
+let inc := ui::button("+1";) do
+    count := count + 1
+    readout:set_html('<span>Count: <strong style="font-size:1.3em">{count}</strong></span>')
+end
+
+let dec := ui::button("-1";) do
+    count := count - 1
+    readout:set_html('<span>Count: <strong style="font-size:1.3em">{count}</strong></span>')
+end
+
+ui::show(ui::card("Reactive Counter", ui::hbox(dec, readout, inc)))

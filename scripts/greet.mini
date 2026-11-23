@@ -1,0 +1,27 @@
+:> Custom user script invocable via:
+:>   POST /invoke/scripts/greet.mini
+:>   {
+:>     "params": {
+:>       "name":    { "type": "string",  "value": "Minilang" },
+:>       "repeat":  { "type": "integer", "value": 3 },
+:>       "excited": { "type": "boolean", "value": true }
+:>     }
+:>   }
+
+let who := Params["name"] or "World"
+let times := Params["repeat"] or 1
+let bang := if Params["excited"] = true then "!" else "." end
+
+let lines := []
+for i in 1 .. times do
+    let msg := '[{i}] Hello, {who}{bang}'
+    println(msg)
+    lines:put(msg)
+end
+
+{
+    "greeting" is 'Hello, {who}{bang}',
+    "count" is times,
+    "lines" is lines,
+    "timestamp" is now()
+}

@@ -1,0 +1,42 @@
+{
+  "format": "minilang-notebook",
+  "version": 1,
+  "title": "welcome.mnb",
+  "cells": [
+    {
+      "id": "cell-welcome-md",
+      "cell_type": "markdown",
+      "source": "# Welcome to Minilang Notebook\n\nAn interactive Jupyter-style REPL environment for **Minilang**, powered by an isolated Minilang kernel per notebook.\n\n- Press **`Shift+Enter`** to run a cell and advance\n- Press **`Tab`** for live identifier & keyword completion\n- Click **Variables** in the top-right bar to inspect your live session state\n- Browse, edit, and open `.mnb` notebooks or `.mini` scripts from the sidebar",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "cell-basics",
+      "cell_type": "code",
+      "source": ":> Variables, strings, and expressions persist across cells\nvar x := 10\nlet greeting := 'Hello from Minilang! x * 4 = {x * 4}'\nprintln(greeting)\nlist([1, 2, 3, 4, 5] -> fun(n) n * n)",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "cell-functions",
+      "cell_type": "code",
+      "source": ":> Define a recursive Fibonacci function and call it\nfun fib(n) do\n    if n <= 1 then ret n end\n    ret fib(n - 1) + fib(n - 2)\nend\n\nlist(0 .. 12, fib)",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "cell-rich-output",
+      "cell_type": "code",
+      "source": ":> Rich notebook outputs: html(), svg(), and markdown()\nlet rows := list(1 .. 6; i) '<tr><td>{i}</td><td>{i * i}</td><td>{i * i * i}</td></tr>'\nhtml('<table><thead><tr><th>n</th><th>n²</th><th>n³</th></tr></thead><tbody>{rows:join}</tbody></table>')",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "cell-svg",
+      "cell_type": "code",
+      "source": ":> Render inline SVG graphics directly from Minilang!\nlet bars := list(1 .. 8; i) do\n    let h := i * 14\n    '<rect x=\"{i * 34}\" y=\"{130 - h}\" width=\"24\" height=\"{h}\" rx=\"4\" fill=\"hsl({i * 32}, 75%, 60%)\"/>'\nend\nsvg('<svg width=\"320\" height=\"140\" viewBox=\"0 0 320 140\" xmlns=\"http://www.w3.org/2000/svg\">{bars:join}</svg>')",
+      "execution_count": null,
+      "output": null
+    }
+  ]
+}

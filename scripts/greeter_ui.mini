@@ -1,0 +1,49 @@
+:> Custom interactive Minilang UI that calls scripts/greet.mini via exec()
+:> Run in a notebook cell, click "Run in Minilang", or open /ui/scripts/greeter_ui.mini
+
+let name_inp := ui::input("Enter a name...", "Minilang")
+let repeat_num := ui::number(3, 1, 10, 1)
+let excited_cb := ui::checkbox("Add exclamation mark!", true)
+let result_view := ui::html("<p style='color:var(--text-muted);margin:0'><em>Fill out the form and click Greet to invoke <code>scripts/greet.mini</code>.</em></p>")
+
+let greet_btn := ui::button("Greet!";) do
+    result_view:set_html("<p style='margin:0'>Calling <code>/invoke/scripts/greet.mini</code>...</p>")
+    exec("scripts/greet.mini", {
+        "name" is name_inp:value,
+        "repeat" is repeat_num:value,
+        "excited" is excited_cb:value
+    }; res, err, meta) do
+        if err then
+            result_view:set_html('<div class="mlui-error-banner">{err}</div>')
+        else
+            let items := list(res["lines"]; line) '<li>{line}</li>'
+            result_view:set_html(
+                '<div style="display:flex;flex-direction:column;gap:6px">' +
+                '<div><strong>{res["greeting"]}</strong> ' +
+                '<span class="mlui-badge mlui-badge-success">{res["count"]}x</span></div>' +
+                '<ul style="margin:4px 0 0;padding-left:20px">{items:join}</ul>' +
+                '</div>'
+            )
+        end
+    end
+end
+
+let clear_btn := ui::button("Reset";) do
+    name_inp:set_value("Minilang")
+    repeat_num:set_value(3)
+    excited_cb:set_value(true)
+    result_view:set_html("<p style='color:var(--text-muted);margin:0'><em>Reset.</em></p>")
+end
+
+let app := ui::card("Minilang Greeter UI",
+    ui::vbox(
+        ui::hbox(ui::label("Name:"), name_inp),
+        ui::hbox(ui::label("Repeat:"), repeat_num),
+        excited_cb,
+        ui::hbox(greet_btn, clear_btn),
+        ui::divider(),
+        result_view
+    )
+)
+
+ui::show(app)

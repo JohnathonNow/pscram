@@ -1,0 +1,17 @@
+[package]
+name = "minilang-notebook"
+version = "0.1.0"
+edition = "2021"
+description = "Jupyter-like notebook webapp for the Minilang REPL with file browser sidebar"
+
+[dependencies]
+axum = { version = "0.6", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.3", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync", "time", "fs", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+cc = "1"

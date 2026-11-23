@@ -1,0 +1,35 @@
+{
+  "format": "minilang-notebook",
+  "version": 1,
+  "title": "custom_ui.mnb",
+  "cells": [
+    {
+      "id": "ui-intro",
+      "cell_type": "markdown",
+      "source": "# Custom User Interfaces in Minilang\n\nBuild interactive browser UIs directly in Minilang using the `ui` module and `exec()`!\n\n- **Containers**: `ui::vbox`, `ui::hbox` (`ui::row`), `ui::grid`, `ui::card`, `ui::panel`, `ui::form`, `ui::tabs`\n- **Form Elements**: `ui::input`, `ui::textarea`, `ui::number`, `ui::slider`, `ui::checkbox`, `ui::select`, `ui::radio`, `ui::date`, `ui::color`, `ui::button`\n- **Display & Raw HTML**: `ui::heading`, `ui::label`, `ui::text`, `ui::badge`, `ui::code`, `ui::divider`, `ui::html`\n- **Compile & Display**: `ui::compile(fn_or_widget)` compiles closures + widget trees via **MiniJS** bytecode; `ui::show(widget)` renders them live.\n- **Server Script Execution**: `exec(script, params; result, err, meta) do ... end` invokes `/invoke/<script>` with tagged JSON and runs your Minilang callback on the result.",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ui-counter",
+      "cell_type": "code",
+      "source": ":> 1. Interactive stateful counter compiled with MiniJS\nvar count := 0\nlet readout := ui::html('<span>Count: <strong style=\"font-size:1.3em\">0</strong></span>')\n\nlet inc := ui::button(\"+1\";) do\n    count := count + 1\n    readout:set_html('<span>Count: <strong style=\"font-size:1.3em\">{count}</strong></span>')\nend\n\nlet dec := ui::button(\"-1\";) do\n    count := count - 1\n    readout:set_html('<span>Count: <strong style=\"font-size:1.3em\">{count}</strong></span>')\nend\n\nui::show(ui::card(\"Reactive Counter\", ui::hbox(dec, readout, inc)))",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ui-exec-greet",
+      "cell_type": "code",
+      "source": ":> 2. Form elements + exec() calling scripts/greet.mini with a callback\nlet name_inp := ui::input(\"Enter name\", \"Ada\")\nlet repeat_sl := ui::slider(3, 1, 8, 1)\nlet excited_cb := ui::checkbox(\"Excited!\", true)\nlet out := ui::html(\"<em>Click Run to invoke scripts/greet.mini</em>\")\n\nlet run_btn := ui::button(\"Invoke greet.mini\";) do\n    out:set_html(\"<em>Running...</em>\")\n    exec(\"scripts/greet.mini\", {\n        \"name\" is name_inp:value,\n        \"repeat\" is repeat_sl:value,\n        \"excited\" is excited_cb:value\n    }; res, err) do\n        if err then\n            out:set_html('<div class=\"mlui-error-banner\">{err}</div>')\n        else\n            let rows := list(res[\"lines\"]; l) '<li>{l}</li>'\n            out:set_html('<h4>{res[\"greeting\"]}</h4><ul>{rows:join}</ul>')\n        end\n    end\nend\n\nui::show(ui::card(\"Script Invoker Form\",\n    ui::vbox(\n        ui::hbox(ui::label(\"Name:\"), name_inp),\n        ui::hbox(ui::label(\"Repeat:\"), repeat_sl),\n        excited_cb,\n        run_btn,\n        ui::divider(),\n        out\n    )\n))",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ui-compile-fn",
+      "cell_type": "code",
+      "source": ":> 3. Explicitly compiling a UI builder closure with ui::compile() and calling scripts/stats.mini\nlet compiled := ui::compile(fun() do\n    let nums := ui::input(\"Comma-separated numbers\", \"12.5, 18.0, 9.5, 24.0\")\n    let scale_inp := ui::number(2.0, 0.1, 100, 0.5)\n    let table_out := ui::html(\"<em>Click Compute Stats</em>\")\n\n    let compute_btn := ui::button(\"Compute Stats\";) do\n        let parsed := list(nums:value:split(\",\"); s) real(s:trim)\n        exec(\"scripts/stats.mini\", {\n            \"label\" is \"samples\",\n            \"values\" is parsed\n        }; res, err) do\n            if err then\n                table_out:set_html('<div class=\"mlui-error-banner\">{err}</div>')\n            else\n                table_out:set_html(\n                    '<table><thead><tr><th>Count</th><th>Sum</th><th>Mean</th><th>Min</th><th>Max</th></tr></thead>' +\n                    '<tbody><tr><td>{res[\"count\"]}</td><td>{res[\"sum\"]}</td><td>{res[\"mean\"]}</td><td>{res[\"min\"]}</td><td>{res[\"max\"]}</td></tr></tbody></table>'\n                )\n            end\n        end\n    end\n\n    ui::show(ui::card(\"Compiled Stats UI (ui::compile)\",\n        ui::vbox(\n            ui::hbox(ui::label(\"Numbers:\"), nums),\n            ui::hbox(ui::label(\"Scale:\"), scale_inp),\n            compute_btn,\n            table_out\n        )\n    ))\nend)\n\nui::show(compiled)",
+      "execution_count": null,
+      "output": null
+    }
+  ]
+}

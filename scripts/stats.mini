@@ -1,0 +1,47 @@
+:> Custom statistics script invocable via:
+:>   POST /invoke/scripts/stats.mini
+:>   {
+:>     "params": {
+:>       "label":  { "type": "string", "value": "latency_ms" },
+:>       "values": {
+:>         "type": "list",
+:>         "value": [
+:>           { "type": "real", "value": 12.5 },
+:>           { "type": "real", "value": 18.0 },
+:>           { "type": "real", "value": 9.5 }
+:>         ]
+:>       }
+:>     }
+:>   }
+:>
+:> Or invoke the `scale` function directly:
+:>   POST /invoke/scripts/stats.mini
+:>   { "function": "scale", "params": { "values": ... }, "args": [{ "type": "real", "value": 2.0 }] }
+
+let vals := Params["values"] or []
+let name := Params["label"] or "series"
+
+fun scale(factor) do
+    ret list(vals -> fun(x) x * factor)
+end
+
+if vals:count = 0 then
+    { "label" is name, "count" is 0, "sum" is 0, "mean" is nil }
+else
+    var total := 0.0
+    var lo := vals[1]
+    var hi := vals[1]
+    for v in vals do
+        total := total + v
+        if v < lo then lo := v end
+        if v > hi then hi := v end
+    end
+    {
+        "label" is name,
+        "count" is vals:count,
+        "sum" is total,
+        "mean" is total / vals:count,
+        "min" is lo,
+        "max" is hi
+    }
+end

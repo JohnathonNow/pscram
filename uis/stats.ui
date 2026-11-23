@@ -1,0 +1,54 @@
+:> Custom Minilang UI file — served at /ui/uis/stats.ui (or /ui/stats.ui)
+:> Demonstrates container widgets (tabs, card, vbox, hbox), form elements, ui::html,
+:> and calling scripts/stats.mini via exec() both directly and via function := "scale".
+
+let nums_inp := ui::input("Comma-separated numbers", "12.5, 18.0, 9.5, 24.0, 16.0")
+let label_inp := ui::input("Series label", "latency_ms")
+let scale_slider := ui::slider(2, 1, 10, 1)
+
+let summary_out := ui::html("<p style='color:var(--text-muted);margin:0'><em>Click Compute Statistics to invoke <code>scripts/stats.mini</code>.</em></p>")
+let scaled_out := ui::html("<p style='color:var(--text-muted);margin:0'><em>Click Scale Values to invoke <code>scale()</code> inside <code>scripts/stats.mini</code>.</em></p>")
+
+let compute_btn := ui::button("Compute Statistics";) do
+    let parsed := list(nums_inp:value:split(","); s) real(s:trim)
+    summary_out:set_html("<em>Computing...</em>")
+    exec("scripts/stats.mini", {
+        "label" is label_inp:value,
+        "values" is parsed
+    }; res, err) do
+        if err then
+            summary_out:set_html('<div class="mlui-error-banner">{err}</div>')
+        else
+            summary_out:set_html(
+                '<table><thead><tr><th>Label</th><th>Count</th><th>Sum</th><th>Mean</th><th>Min</th><th>Max</th></tr></thead>' +
+                '<tbody><tr><td>{res["label"]}</td><td>{res["count"]}</td><td>{res["sum"]}</td><td>{res["mean"]}</td><td>{res["min"]}</td><td>{res["max"]}</td></tr></tbody></table>'
+            )
+        end
+    end
+end
+
+let scale_btn := ui::button("Scale Values";) do
+    let parsed := list(nums_inp:value:split(","); s) real(s:trim)
+    scaled_out:set_html("<em>Scaling...</em>")
+    exec("scripts/stats.mini", {"values" is parsed}, {
+        "function" is "scale",
+        "args" is [scale_slider:value]
+    }; res, err) do
+        if err then
+            scaled_out:set_html('<div class="mlui-error-banner">{err}</div>')
+        else
+            scaled_out:set_html('<div><strong>Scaled ({scale_slider:value}x):</strong> <code>{res}</code></div>')
+        end
+    end
+end
+
+ui::show(ui::card("Minilang Stats Dashboard",
+    ui::vbox(
+        ui::hbox(ui::label("Label:"), label_inp),
+        ui::hbox(ui::label("Numbers:"), nums_inp),
+        ui::tabs({
+            "Summary" is ui::vbox(compute_btn, summary_out),
+            "Scale" is ui::vbox(ui::hbox(ui::label("Factor:"), scale_slider), scale_btn, scaled_out)
+        })
+    )
+))

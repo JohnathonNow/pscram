@@ -1,0 +1,6 @@
+[submodule "minijs"]
+	path = minijs
+	url = https://github.com/wrapl/minijs
+[submodule "minilang"]
+	path = minilang
+	url = https://github.com/wrapl/minilang
