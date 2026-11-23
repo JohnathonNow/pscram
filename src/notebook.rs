@@ -1,10 +1,16 @@
 use crate::kernel_proc::{DisplayItem, EvalError, EvalValue};
 use serde::{Deserialize, Serialize};
 
+fn default_language() -> String {
+    "minilang".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotebookDocument {
     pub format: String,
     pub version: u32,
+    #[serde(default = "default_language")]
+    pub language: String,
     pub title: Option<String>,
     pub cells: Vec<NotebookCell>,
 }
@@ -35,10 +41,11 @@ pub struct CellOutput {
 }
 
 impl NotebookDocument {
-    pub fn empty(title: Option<String>) -> Self {
+    pub fn empty(title: Option<String>, language: Option<&str>) -> Self {
         Self {
             format: "minilang-notebook".to_string(),
             version: 1,
+            language: language.unwrap_or("minilang").to_string(),
             title,
             cells: vec![NotebookCell {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -50,17 +57,17 @@ impl NotebookDocument {
         }
     }
 
-    pub fn from_mini_script(title: &str, content: &str) -> Self {
+    pub fn from_script(title: &str, content: &str, language: &str) -> Self {
         let mut cells = Vec::new();
-        // Support `# %%` or `:>> ---` cell markers if present, otherwise single code cell
-        let has_markers = content
-            .lines()
-            .any(|l| l.trim().starts_with(":> %%") || l.trim().starts_with("# %%"));
+        let has_markers = content.lines().any(|l| {
+            let t = l.trim();
+            t.starts_with(":> %%") || t.starts_with("// %%") || t.starts_with("# %%")
+        });
         if has_markers {
             let mut current = Vec::new();
             for line in content.lines() {
                 let t = line.trim();
-                if t.starts_with(":> %%") || t.starts_with("# %%") {
+                if t.starts_with(":> %%") || t.starts_with("// %%") || t.starts_with("# %%") {
                     if !current.is_empty() {
                         cells.push(NotebookCell {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -105,23 +112,24 @@ impl NotebookDocument {
         Self {
             format: "minilang-notebook".to_string(),
             version: 1,
+            language: language.to_string(),
             title: Some(title.to_string()),
             cells,
         }
     }
 
-    pub fn to_mini_script(&self) -> String {
+    pub fn to_script(&self, comment_prefix: &str) -> String {
         let mut parts = Vec::new();
         for (i, cell) in self.cells.iter().enumerate() {
             if cell.cell_type == "markdown" {
                 let commented: Vec<String> = cell
                     .source
                     .lines()
-                    .map(|l| format!(":> {}", l))
+                    .map(|l| format!("{} {}", comment_prefix, l))
                     .collect();
                 parts.push(commented.join("\n"));
             } else {
-                parts.push(format!(":> %% Cell {}\n{}", i + 1, cell.source));
+                parts.push(format!("{} %% Cell {}\n{}", comment_prefix, i + 1, cell.source));
             }
         }
         parts.join("\n\n") + "\n"

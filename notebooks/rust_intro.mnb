@@ -1,0 +1,36 @@
+{
+  "format": "minilang-notebook",
+  "version": 1,
+  "language": "rust",
+  "title": "rust_intro.mnb",
+  "cells": [
+    {
+      "id": "rs-welcome",
+      "cell_type": "markdown",
+      "source": "# Rust Interactive Notebook\n\nThis notebook runs on the **Rust** kernel backend (`rustc --edition 2021`).\n\n- Variables, functions, structs, and imports persist across cells\n- Trailing expressions automatically display their `{:?}` value and Rust type\n- Use `html(...)`, `svg(...)`, and `markdown(...)` for rich cell outputs\n- Switch any notebook's kernel between **Minilang** and **Rust** in the top toolbar",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "rs-vars",
+      "cell_type": "code",
+      "source": "// Define variables and compute a trailing expression\nlet mut nums = vec![1, 2, 3, 4, 5];\nnums.push(6);\nprintln!(\"Vector has {} elements\", nums.len());\nnums.iter().map(|x| x * x).collect::<Vec<_>>()",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "rs-struct",
+      "cell_type": "code",
+      "source": "// Define structs and functions — available to all subsequent cells!\n#[derive(Debug)]\nstruct Point {\n    x: f64,\n    y: f64,\n}\n\nimpl Point {\n    fn dist(&self) -> f64 {\n        (self.x * self.x + self.y * self.y).sqrt()\n    }\n}\n\nlet p = Point { x: 3.0, y: 4.0 };\nformat!(\"{:?} -> distance = {:.2}\", p, p.dist())",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "rs-html",
+      "cell_type": "code",
+      "source": "// Access `nums` from Cell 1 and render a rich HTML table!\nlet rows: String = nums.iter()\n    .map(|n| format!(\"<tr><td>{}</td><td>{}</td><td>{}</td></tr>\", n, n * n, n * n * n))\n    .collect();\nhtml(format!(\n    \"<table><thead><tr><th>n</th><th>n²</th><th>n³</th></tr></thead><tbody>{}</tbody></table>\",\n    rows\n));",
+      "execution_count": null,
+      "output": null
+    }
+  ]
+}

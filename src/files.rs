@@ -14,7 +14,9 @@ pub struct FileEntry {
     pub extension: String,
     pub is_notebook: bool,
     pub is_minilang: bool,
+    pub is_rust: bool,
     pub is_ui: bool,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +137,12 @@ impl FileStore {
                 dt.to_rfc3339()
             });
 
+            let language = match ext.as_str() {
+                "mini" | "ui" => Some("minilang".to_string()),
+                "rs" => Some("rust".to_string()),
+                _ => None,
+            };
+
             entries.push(FileEntry {
                 name,
                 path: rel_path,
@@ -143,7 +151,9 @@ impl FileStore {
                 modified,
                 is_notebook: ext == "mnb",
                 is_minilang: ext == "mini",
+                is_rust: ext == "rs",
                 is_ui: ext == "ui",
+                language,
                 extension: ext,
             });
         }
@@ -213,6 +223,11 @@ impl FileStore {
                             .unwrap_or("")
                             .to_lowercase()
                     };
+                    let language = match ext.as_str() {
+                        "mini" | "ui" => Some("minilang".to_string()),
+                        "rs" => Some("rust".to_string()),
+                        _ => None,
+                    };
                     results.push(FileEntry {
                         name,
                         path: rel_path,
@@ -221,7 +236,9 @@ impl FileStore {
                         modified: None,
                         is_notebook: ext == "mnb",
                         is_minilang: ext == "mini",
+                        is_rust: ext == "rs",
                         is_ui: ext == "ui",
+                        language,
                         extension: ext,
                     });
                 }
@@ -280,7 +297,12 @@ impl FileStore {
         Ok(self.to_rel_string(&abs))
     }
 
-    pub fn create_entry(&self, rel: &str, kind: &str) -> Result<String, String> {
+    pub fn create_entry(
+        &self,
+        rel: &str,
+        kind: &str,
+        language: Option<&str>,
+    ) -> Result<String, String> {
         let abs = self.resolve_new(rel)?;
         if abs.exists() {
             return Err(format!("'{}' already exists", rel));
@@ -297,7 +319,7 @@ impl FileStore {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string());
-                let doc = NotebookDocument::empty(title);
+                let doc = NotebookDocument::empty(title, language);
                 let json = serde_json::to_string_pretty(&doc)
                     .map_err(|e| format!("serialize failed: {}", e))?;
                 fs::write(&abs, json).map_err(|e| format!("write failed: {}", e))?;

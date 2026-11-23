@@ -2,7 +2,9 @@ mod api;
 mod files;
 mod kernel_mgr;
 mod kernel_proc;
+mod lang;
 mod notebook;
+mod rust_kernel_proc;
 mod tagged;
 
 use clap::Parser;
@@ -11,11 +13,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "minilang-notebook", version, about = "Jupyter-like notebook webapp for the Minilang REPL")]
+#[command(name = "minilang-notebook", version, about = "Polyglot Jupyter-like notebook & script webapp (Minilang + Rust)")]
 struct Cli {
-    /// Internal mode: run as an isolated Minilang REPL kernel worker over stdio
+    /// Internal mode: run as an isolated REPL kernel worker over stdio
     #[arg(long, hide = true)]
     kernel: bool,
+
+    /// Internal mode: language id for `--kernel` (default: minilang)
+    #[arg(long, hide = true, default_value = "minilang")]
+    lang: String,
 
     /// Host interface to bind to
     #[arg(long, default_value = "127.0.0.1")]
@@ -38,8 +44,12 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.kernel {
-        if let Err(e) = kernel_proc::run_kernel_process() {
-            eprintln!("minilang kernel error: {}", e);
+        let res = match cli.lang.as_str() {
+            "rust" => rust_kernel_proc::run_rust_kernel_process(),
+            _ => kernel_proc::run_kernel_process(),
+        };
+        if let Err(e) = res {
+            eprintln!("{} kernel error: {}", cli.lang, e);
             std::process::exit(1);
         }
         return;
@@ -56,11 +66,13 @@ fn main() {
             std::process::exit(1);
         });
         let root_canon = files.root().to_path_buf();
-        let kernels = kernel_mgr::KernelManager::new(root_canon.clone());
+        let languages = Arc::new(lang::LanguageRegistry::with_defaults());
+        let kernels = kernel_mgr::KernelManager::new(root_canon.clone(), languages.clone());
 
         let state = Arc::new(api::AppState {
             files,
             kernels,
+            languages,
             web_dir: cli.web_dir,
         });
 

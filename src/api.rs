@@ -1,6 +1,7 @@
 use crate::files::FileStore;
 use crate::kernel_mgr::{InvokeExecError, KernelManager};
 use crate::kernel_proc::KernelResponse;
+use crate::lang::LanguageRegistry;
 use crate::notebook::NotebookDocument;
 use crate::tagged::TaggedValue;
 use axum::extract::{Path, Query, State};
@@ -22,6 +23,7 @@ const EMBED_MINIJS_VM_JS: &str = include_str!("../web/minijs_vm.js");
 pub struct AppState {
     pub files: FileStore,
     pub kernels: KernelManager,
+    pub languages: Arc<LanguageRegistry>,
     pub web_dir: Option<PathBuf>,
 }
 
@@ -33,14 +35,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/minijs_vm.js", get(serve_minijs_vm))
         .route("/ui/*script", get(serve_standalone_ui))
         .route("/api/info", get(api_info))
+        .route("/api/languages", get(api_languages))
         // File browser API
         .route("/api/files", get(api_list_files))
         .route("/api/files/search", get(api_search_files))
         .route("/api/file", get(api_read_file).put(api_write_file).delete(api_delete_file))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
-        .route("/api/notebook/from-mini", post(api_notebook_from_mini))
-        .route("/api/notebook/to-mini", post(api_notebook_to_mini))
+        .route("/api/notebook/from-mini", post(api_notebook_from_script))
+        .route("/api/notebook/to-mini", post(api_notebook_to_script))
+        .route("/api/notebook/from-script", post(api_notebook_from_script))
+        .route("/api/notebook/to-script", post(api_notebook_to_script))
         // Custom .mini script invocation API
         .route("/invoke", post(api_invoke_root))
         .route("/invoke/*script", post(api_invoke_path))
@@ -266,7 +271,16 @@ async fn compile_ui_source(
     let cwd = abs_path.parent().unwrap_or_else(|| st.files.root()).to_path_buf();
     let res = st
         .kernels
-        .invoke_script(code, rel_path.to_string(), cwd, BTreeMap::new(), Vec::new(), None, 30_000)
+        .invoke_script(
+            "minilang",
+            code,
+            rel_path.to_string(),
+            cwd,
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            30_000,
+        )
         .await;
 
     match res {
@@ -301,10 +315,15 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "app": "Minilang Notebook",
         "version": env!("CARGO_PKG_VERSION"),
         "minilang_version": "2.17.0",
+        "languages": st.languages.list_info(),
         "root_name": root_name,
         "root_path": st.files.root().display().to_string(),
     }))
     .into_response()
+}
+
+async fn api_languages(State(st): State<Arc<AppState>>) -> Response {
+    Json(json!({ "languages": st.languages.list_info() })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -374,6 +393,8 @@ struct CreateFileBody {
     path: String,
     #[serde(default = "default_kind")]
     kind: String,
+    #[serde(default)]
+    language: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -384,7 +405,10 @@ async fn api_create_file(
     State(st): State<Arc<AppState>>,
     Json(body): Json<CreateFileBody>,
 ) -> Response {
-    match st.files.create_entry(&body.path, &body.kind) {
+    match st
+        .files
+        .create_entry(&body.path, &body.kind, body.language.as_deref())
+    {
         Ok(created_path) => Json(json!({ "ok": true, "path": created_path })).into_response(),
         Err(e) => api_err(StatusCode::BAD_REQUEST, e),
     }
@@ -417,18 +441,41 @@ async fn api_delete_file(
 }
 
 #[derive(Deserialize)]
-struct FromMiniBody {
+struct FromScriptBody {
     title: String,
     content: String,
+    #[serde(default)]
+    language: Option<String>,
 }
 
-async fn api_notebook_from_mini(Json(body): Json<FromMiniBody>) -> Response {
-    let doc = NotebookDocument::from_mini_script(&body.title, &body.content);
+async fn api_notebook_from_script(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<FromScriptBody>,
+) -> Response {
+    let lang = body.language.unwrap_or_else(|| {
+        let ext = std::path::Path::new(&body.title)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mini");
+        st.languages
+            .by_extension(ext)
+            .map(|b| b.info().id)
+            .unwrap_or_else(|| "minilang".to_string())
+    });
+    let doc = NotebookDocument::from_script(&body.title, &body.content, &lang);
     Json(doc).into_response()
 }
 
-async fn api_notebook_to_mini(Json(doc): Json<NotebookDocument>) -> Response {
-    let script = doc.to_mini_script();
+async fn api_notebook_to_script(
+    State(st): State<Arc<AppState>>,
+    Json(doc): Json<NotebookDocument>,
+) -> Response {
+    let comment_prefix = st
+        .languages
+        .by_id(&doc.language)
+        .map(|b| b.info().comment_prefix)
+        .unwrap_or_else(|| ":>".to_string());
+    let script = doc.to_script(&comment_prefix);
     Json(json!({ "script": script })).into_response()
 }
 
@@ -442,6 +489,7 @@ async fn api_list_kernels(State(st): State<Arc<AppState>>) -> Response {
 #[derive(Deserialize, Default)]
 struct CreateKernelBody {
     session_id: Option<String>,
+    language: Option<String>,
     cwd: Option<String>,
 }
 
@@ -456,12 +504,16 @@ async fn api_create_kernel(
         .and_then(|rel| st.files.resolve_existing(rel).ok())
         .map(|p| if p.is_file() { p.parent().unwrap_or(st.files.root()).to_path_buf() } else { p });
 
-    match st.kernels.get_or_create(body.session_id, cwd).await {
+    match st
+        .kernels
+        .get_or_create(body.session_id, body.language.as_deref(), cwd)
+        .await
+    {
         Ok(session) => {
             let status = session.status().await;
             Json(status).into_response()
         }
-        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -487,6 +539,7 @@ async fn api_kernel_status(
 struct ExecuteBody {
     code: String,
     source: Option<String>,
+    language: Option<String>,
 }
 
 async fn api_kernel_execute(
@@ -494,7 +547,11 @@ async fn api_kernel_execute(
     Path(id): Path<String>,
     Json(body): Json<ExecuteBody>,
 ) -> Response {
-    let session = match st.kernels.get_or_create(Some(id), None).await {
+    let session = match st
+        .kernels
+        .get_or_create(Some(id), body.language.as_deref(), None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -521,7 +578,7 @@ async fn api_kernel_restart(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let session = match st.kernels.get_or_create(Some(id), None).await {
+    let session = match st.kernels.get_or_create(Some(id), None, None).await {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -562,7 +619,7 @@ async fn api_kernel_complete(
     Path(id): Path<String>,
     Json(body): Json<CompleteBody>,
 ) -> Response {
-    let session = match st.kernels.get_or_create(Some(id), None).await {
+    let session = match st.kernels.get_or_create(Some(id), None, None).await {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -582,7 +639,7 @@ async fn api_kernel_chdir(
     Path(id): Path<String>,
     Json(body): Json<ChdirBody>,
 ) -> Response {
-    let session = match st.kernels.get_or_create(Some(id), None).await {
+    let session = match st.kernels.get_or_create(Some(id), None, None).await {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -627,36 +684,65 @@ struct InvokeRequestBody {
     timeout_ms: Option<u64>,
 }
 
-fn resolve_mini_script(files: &FileStore, requested: &str) -> Result<(String, PathBuf), (StatusCode, String)> {
+fn resolve_invocable_script(
+    files: &FileStore,
+    languages: &LanguageRegistry,
+    requested: &str,
+) -> Result<(String, PathBuf, String), (StatusCode, String)> {
     let trimmed = requested.trim().trim_start_matches('/');
+    let supported_exts = languages.all_script_extensions();
     if trimmed.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Missing 'script' path (must point to a .mini file)".to_string(),
+            format!(
+                "Missing 'script' path (supported extensions: {})",
+                supported_exts.join(", ")
+            ),
         ));
     }
 
-    let mut candidates: Vec<String> = Vec::new();
-    let has_ext = std::path::Path::new(trimmed).extension().is_some();
-    if has_ext {
-        if !trimmed.ends_with(".mini") {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Only '.mini' scripts can be invoked (got '{}')", trimmed),
-            ));
-        }
-        candidates.push(trimmed.to_string());
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let ext_opt = std::path::Path::new(trimmed)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+
+    if let Some(ext) = ext_opt {
+        let backend = match languages.by_extension(&ext) {
+            Some(b) if b.info().supports_invoke => b,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Unsupported script extension '.{}' (supported: {})",
+                        ext,
+                        supported_exts
+                            .iter()
+                            .map(|e| format!(".{}", e))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        };
+        let lang_id = backend.info().id;
+        candidates.push((trimmed.to_string(), lang_id.clone()));
         if !trimmed.starts_with("scripts/") {
-            candidates.push(format!("scripts/{}", trimmed));
+            candidates.push((format!("scripts/{}", trimmed), lang_id));
         }
     } else {
-        candidates.push(format!("{}.mini", trimmed));
-        if !trimmed.starts_with("scripts/") {
-            candidates.push(format!("scripts/{}.mini", trimmed));
+        for ext in &supported_exts {
+            if let Some(backend) = languages.by_extension(ext) {
+                let lang_id = backend.info().id;
+                candidates.push((format!("{}.{}", trimmed, ext), lang_id.clone()));
+                if !trimmed.starts_with("scripts/") {
+                    candidates.push((format!("scripts/{}.{}", trimmed, ext), lang_id));
+                }
+            }
         }
     }
 
-    for cand in &candidates {
+    for (cand, lang_id) in &candidates {
         if let Ok(abs) = files.resolve_existing(cand) {
             if abs.is_file() {
                 let rel = abs
@@ -664,14 +750,14 @@ fn resolve_mini_script(files: &FileStore, requested: &str) -> Result<(String, Pa
                     .unwrap_or(&abs)
                     .to_string_lossy()
                     .replace('\\', "/");
-                return Ok((rel, abs));
+                return Ok((rel, abs, lang_id.clone()));
             }
         }
     }
 
     Err((
         StatusCode::NOT_FOUND,
-        format!("Minilang script '{}' not found", trimmed),
+        format!("Script '{}' not found", trimmed),
     ))
 }
 
@@ -683,10 +769,11 @@ async fn execute_invoke(
     function: Option<String>,
     timeout_ms: Option<u64>,
 ) -> Response {
-    let (rel_path, abs_path) = match resolve_mini_script(&st.files, &script_path) {
-        Ok(pair) => pair,
-        Err((status, msg)) => return api_err(status, msg),
-    };
+    let (rel_path, abs_path, language_id) =
+        match resolve_invocable_script(&st.files, &st.languages, &script_path) {
+            Ok(t) => t,
+            Err((status, msg)) => return api_err(status, msg),
+        };
 
     let code = match std::fs::read_to_string(&abs_path) {
         Ok(c) => c,
@@ -701,7 +788,16 @@ async fn execute_invoke(
 
     match st
         .kernels
-        .invoke_script(code, rel_path.clone(), cwd, params, args, function, timeout)
+        .invoke_script(
+            &language_id,
+            code,
+            rel_path.clone(),
+            cwd,
+            params,
+            args,
+            function,
+            timeout,
+        )
         .await
     {
         Ok(KernelResponse::InvokeResult {
@@ -723,6 +819,7 @@ async fn execute_invoke(
                 Json(json!({
                     "ok": error.is_none(),
                     "script": rel_path,
+                    "language": language_id,
                     "result": result,
                     "type_name": type_name,
                     "repr": repr,
@@ -792,8 +889,16 @@ async fn api_invoke_path(
 }
 
 async fn api_list_scripts(State(st): State<Arc<AppState>>) -> Response {
-    let mut entries = st.files.search_files(".mini", 200);
-    entries.retain(|e| e.kind == "file" && e.is_minilang);
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ext in st.languages.all_script_extensions() {
+        let dot_ext = format!(".{}", ext);
+        for e in st.files.search_files(&dot_ext, 200) {
+            if e.kind == "file" && e.extension == ext && seen.insert(e.path.clone()) {
+                entries.push(e);
+            }
+        }
+    }
     // Prioritize scripts/ directory first
     entries.sort_by(|a, b| {
         let a_scripts = a.path.starts_with("scripts/");

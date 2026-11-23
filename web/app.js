@@ -210,6 +210,190 @@
     return out;
   }
 
+  const RUST_KEYWORDS = new Set([
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
+    "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop",
+    "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+    "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while"
+  ]);
+
+  const RUST_TYPES = new Set([
+    "bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize",
+    "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
+    "String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "Cell", "RefCell",
+    "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Value", "Params", "Some",
+    "None", "Ok", "Err"
+  ]);
+
+  function highlightRust(code) {
+    let out = "";
+    let i = 0;
+    const n = code.length;
+
+    while (i < n) {
+      const ch = code[i];
+      const next = i + 1 < n ? code[i + 1] : "";
+
+      // Line comment // ...
+      if (ch === "/" && next === "/") {
+        let j = i + 2;
+        while (j < n && code[j] !== "\n") j++;
+        out += `<span class="tok-comment">${escapeHtml(code.slice(i, j))}</span>`;
+        i = j;
+        continue;
+      }
+
+      // Block comment /* ... */
+      if (ch === "/" && next === "*") {
+        let depth = 1;
+        let j = i + 2;
+        while (j < n && depth > 0) {
+          if (code[j] === "/" && code[j + 1] === "*") { depth++; j += 2; }
+          else if (code[j] === "*" && code[j + 1] === "/") { depth--; j += 2; }
+          else j++;
+        }
+        out += `<span class="tok-comment">${escapeHtml(code.slice(i, j))}</span>`;
+        i = j;
+        continue;
+      }
+
+      // Attribute #[...] or #![...]
+      if (ch === "#" && (next === "[" || (next === "!" && code[i + 2] === "["))) {
+        let j = i + (next === "!" ? 3 : 2);
+        let depth = 1;
+        while (j < n && depth > 0) {
+          if (code[j] === "[") depth++;
+          else if (code[j] === "]") depth--;
+          j++;
+        }
+        out += `<span class="tok-symbol">${escapeHtml(code.slice(i, j))}</span>`;
+        i = j;
+        continue;
+      }
+
+      // Raw string r#"..."# or r"..."
+      if (ch === "r" && (next === '"' || next === "#") && (i === 0 || !/[A-Za-z0-9_]/.test(code[i - 1]))) {
+        let j = i + 1;
+        let hashes = 0;
+        while (j < n && code[j] === "#") { hashes++; j++; }
+        if (j < n && code[j] === '"') {
+          j++;
+          while (j < n) {
+            if (code[j] === '"') {
+              let h = 0;
+              while (h < hashes && code[j + 1 + h] === "#") h++;
+              if (h === hashes) { j += 1 + hashes; break; }
+            }
+            j++;
+          }
+          out += `<span class="tok-string">${escapeHtml(code.slice(i, j))}</span>`;
+          i = j;
+          continue;
+        }
+      }
+
+      // Double-quoted string
+      if (ch === '"') {
+        let j = i + 1;
+        while (j < n && code[j] !== '"') {
+          if (code[j] === "\\" && j + 1 < n) j += 2;
+          else j++;
+        }
+        if (j < n && code[j] === '"') j++;
+        out += `<span class="tok-string">${escapeHtml(code.slice(i, j))}</span>`;
+        i = j;
+        continue;
+      }
+
+      // Char literal or lifetime 'a
+      if (ch === "'") {
+        if (i + 2 < n && code[i + 1] === "\\") {
+          let j = i + 2;
+          while (j < n && code[j] !== "'" && code[j] !== "\n") j++;
+          if (j < n && code[j] === "'") j++;
+          out += `<span class="tok-string">${escapeHtml(code.slice(i, j))}</span>`;
+          i = j;
+          continue;
+        } else if (i + 2 < n && code[i + 2] === "'") {
+          out += `<span class="tok-string">${escapeHtml(code.slice(i, i + 3))}</span>`;
+          i += 3;
+          continue;
+        } else if (/[A-Za-z_]/.test(next)) {
+          let j = i + 2;
+          while (j < n && /[A-Za-z0-9_]/.test(code[j])) j++;
+          out += `<span class="tok-symbol">${escapeHtml(code.slice(i, j))}</span>`;
+          i = j;
+          continue;
+        }
+      }
+
+      // Numbers
+      if (/[0-9]/.test(ch)) {
+        let j = i;
+        if (ch === "0" && (next === "x" || next === "X" || next === "b" || next === "o")) {
+          j += 2;
+          while (j < n && /[0-9a-fA-F_]/.test(code[j])) j++;
+        } else {
+          while (j < n && /[0-9_]/.test(code[j])) j++;
+          if (j < n && code[j] === "." && j + 1 < n && /[0-9]/.test(code[j + 1])) {
+            j++;
+            while (j < n && /[0-9_]/.test(code[j])) j++;
+          }
+          if (j < n && (code[j] === "e" || code[j] === "E")) {
+            j++;
+            if (j < n && (code[j] === "+" || code[j] === "-")) j++;
+            while (j < n && /[0-9_]/.test(code[j])) j++;
+          }
+        }
+        while (j < n && /[A-Za-z0-9_]/.test(code[j])) j++;
+        out += `<span class="tok-number">${escapeHtml(code.slice(i, j))}</span>`;
+        i = j;
+        continue;
+      }
+
+      // Identifiers, keywords, types, macros
+      if (/[A-Za-z_]/.test(ch)) {
+        let j = i + 1;
+        while (j < n && /[A-Za-z0-9_]/.test(code[j])) j++;
+        const word = code.slice(i, j);
+        if (j < n && code[j] === "!") {
+          out += `<span class="tok-func">${escapeHtml(word + "!")}</span>`;
+          i = j + 1;
+          continue;
+        }
+        if (RUST_KEYWORDS.has(word)) {
+          out += `<span class="tok-keyword">${escapeHtml(word)}</span>`;
+        } else if (RUST_TYPES.has(word)) {
+          out += `<span class="tok-type">${escapeHtml(word)}</span>`;
+        } else if (word === "html" || word === "svg" || word === "markdown" || word === "display") {
+          out += `<span class="tok-func">${escapeHtml(word)}</span>`;
+        } else {
+          out += escapeHtml(word);
+        }
+        i = j;
+        continue;
+      }
+
+      if (/[+\-*/%=!<>|&^~.:;?()[\]{};,]/.test(ch)) {
+        out += `<span class="tok-op">${escapeHtml(ch)}</span>`;
+        i++;
+        continue;
+      }
+
+      out += escapeHtml(ch);
+      i++;
+    }
+
+    if (code.endsWith("\n") || code.length === 0) out += "\n";
+    return out;
+  }
+
+  function highlightCode(code, language = "minilang") {
+    if (language === "rust") return highlightRust(code);
+    return highlightMinilang(code);
+  }
+
   // --- Lightweight Markdown Renderer ---
   function renderMarkdown(md) {
     if (!md || !md.trim()) {
@@ -379,15 +563,29 @@
   // --- Application State ---
   const state = {
     rootName: "workspace",
+    languages: [
+      { id: "minilang", name: "Minilang", version: "2.17.0", extensions: ["mini"], supports_notebook: true, supports_invoke: true, supports_ui: true },
+      { id: "rust", name: "Rust", version: "1.x", extensions: ["rs"], supports_notebook: true, supports_invoke: true, supports_ui: false },
+    ],
     currentDir: "",
     showHidden: false,
     searchQuery: "",
     dirEntries: [],
-    tabs: [], // { id, kind: 'notebook'|'file', path, title, dirty, kernelId, doc?, activeCellId?, content?, extension? }
+    tabs: [], // { id, kind: 'notebook'|'file', path, title, dirty, kernelId, language?, doc?, activeCellId?, content?, extension? }
     activeTabId: null,
     varsOpen: false,
     ac: { visible: false, items: [], index: 0, cellId: null, textarea: null, startPos: 0 },
   };
+
+  function langInfo(id) {
+    return state.languages.find((l) => l.id === id) || state.languages[0];
+  }
+
+  function langByExtension(ext) {
+    if (!ext) return null;
+    if (ext === "ui") return langInfo("minilang");
+    return state.languages.find((l) => (l.extensions || []).includes(ext)) || null;
+  }
 
   function uid() {
     return (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
@@ -413,6 +611,9 @@
     }
     if (entry.is_minilang) {
       return `<span class="file-icon mini"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></span>`;
+    }
+    if (entry.is_rust) {
+      return `<span class="file-icon rust"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></span>`;
     }
     if (entry.is_ui) {
       return `<span class="file-icon ui"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></span>`;
@@ -594,8 +795,8 @@
   }
 
   // --- Tabs & Opening Files ---
-  async function ensureKernel(sessionId, cwdPath = "") {
-    const body = { session_id: sessionId };
+  async function ensureKernel(sessionId, cwdPath = "", language = "minilang") {
+    const body = { session_id: sessionId, language };
     if (cwdPath) body.cwd = cwdPath;
     const status = await api("/api/kernels", { method: "POST", body: JSON.stringify(body) });
     refreshKernelList();
@@ -629,6 +830,7 @@
             cells: [{ id: uid(), cell_type: "code", source: file.content, execution_count: null, output: null }],
           };
         }
+        if (!doc.language) doc.language = "minilang";
         if (doc.cells.length === 0) {
           doc.cells.push({ id: uid(), cell_type: "code", source: "", execution_count: null, output: null });
         }
@@ -638,7 +840,7 @@
         });
         const kernelId = `nb-${uid().slice(0, 8)}`;
         const dir = relPath.includes("/") ? relPath.slice(0, relPath.lastIndexOf("/")) : "";
-        await ensureKernel(kernelId, dir);
+        await ensureKernel(kernelId, dir, doc.language);
         const tab = {
           id: uid(),
           kind: "notebook",
@@ -646,6 +848,7 @@
           title: file.name,
           dirty: false,
           kernelId,
+          language: doc.language,
           doc,
           activeCellId: doc.cells[0].id,
         };
@@ -672,15 +875,18 @@
     }
   }
 
-  async function createUntitledNotebook(doc = null, title = "Untitled.mnb", path = null) {
+  async function createUntitledNotebook(doc = null, title = "Untitled.mnb", path = null, language = "minilang") {
+    const lang = (doc && doc.language) || language || "minilang";
     const kernelId = `nb-${uid().slice(0, 8)}`;
-    await ensureKernel(kernelId, state.currentDir);
+    await ensureKernel(kernelId, state.currentDir, lang);
     const nbDoc = doc || {
       format: "minilang-notebook",
       version: 1,
+      language: lang,
       title,
       cells: [{ id: uid(), cell_type: "code", source: "", execution_count: null, output: null }],
     };
+    if (!nbDoc.language) nbDoc.language = lang;
     const tab = {
       id: uid(),
       kind: "notebook",
@@ -688,6 +894,7 @@
       title,
       dirty: !path,
       kernelId,
+      language: nbDoc.language,
       doc: nbDoc,
       activeCellId: nbDoc.cells[0].id,
     };
@@ -757,6 +964,11 @@
       fileToolbar.classList.add("hidden");
       nbView.classList.remove("hidden");
       fileView.classList.add("hidden");
+      const langSel = document.getElementById("tb-lang-select");
+      if (langSel) langSel.value = tab.doc.language || "minilang";
+      const linfo = langInfo(tab.doc.language || "minilang");
+      const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
+      document.getElementById("tb-export-mini").querySelector("span").textContent = `Export .${ext}`;
       renderCells();
     } else {
       nbToolbar.classList.add("hidden");
@@ -766,30 +978,33 @@
 
       const ta = document.getElementById("file-editor-textarea");
       ta.value = tab.content || "";
-      const isMini = tab.extension === "mini";
       const isUi = tab.extension === "ui";
-      syncFileEditorHighlight(tab.content || "", isMini || isUi);
+      const fileLang = langByExtension(tab.extension);
+      const isScript = !!(fileLang && fileLang.supports_invoke && !isUi);
+      const highlightLang = isUi ? "minilang" : (fileLang ? fileLang.id : null);
+      syncFileEditorHighlight(tab.content || "", highlightLang);
       ta.scrollTop = 0;
       ta.scrollLeft = 0;
       syncFileEditorScroll();
       document.getElementById("ftb-meta").textContent = `${tab.path} (${formatSize(tab.content.length)})`;
-      document.getElementById("ftb-run-mini").classList.toggle("hidden", !(isMini || isUi));
-      document.getElementById("ftb-run-mini").querySelector("span").textContent = isUi ? "Preview UI" : "Run in Minilang";
-      document.getElementById("ftb-invoke-mini").classList.toggle("hidden", !isMini);
-      document.getElementById("ftb-launch-ui").classList.toggle("hidden", !(isMini || isUi));
-      document.getElementById("ftb-open-as-nb").classList.toggle("hidden", !isMini);
+      document.getElementById("ftb-run-mini").classList.toggle("hidden", !(isScript || isUi));
+      document.getElementById("ftb-run-mini").querySelector("span").textContent =
+        isUi ? "Preview UI" : (fileLang ? `Run in ${fileLang.name}` : "Run");
+      document.getElementById("ftb-invoke-mini").classList.toggle("hidden", !isScript);
+      document.getElementById("ftb-launch-ui").classList.toggle("hidden", !(isUi || (fileLang && fileLang.supports_ui)));
+      document.getElementById("ftb-open-as-nb").classList.toggle("hidden", !isScript);
       document.getElementById("file-run-output").classList.add("hidden");
       document.getElementById("file-invoke-panel").classList.add("hidden");
     }
   }
 
-  function syncFileEditorHighlight(code, useMinilangHighlight) {
+  function syncFileEditorHighlight(code, highlightLang) {
     const shell = document.getElementById("file-editor-shell");
     const hl = document.getElementById("file-editor-highlight");
     const gutter = document.getElementById("file-editor-gutter");
-    shell.classList.toggle("highlighted", !!useMinilangHighlight);
-    if (useMinilangHighlight) {
-      hl.innerHTML = highlightMinilang(code);
+    shell.classList.toggle("highlighted", !!highlightLang);
+    if (highlightLang) {
+      hl.innerHTML = highlightCode(code, highlightLang);
     } else {
       hl.textContent = "";
     }
@@ -975,10 +1190,11 @@
       const wrap = document.createElement("div");
       wrap.className = "cell-editor-wrap";
 
+      const cellLang = tab.doc.language || "minilang";
       const pre = document.createElement("pre");
       pre.className = "code-highlight";
       pre.setAttribute("aria-hidden", "true");
-      pre.innerHTML = highlightMinilang(cell.source);
+      pre.innerHTML = highlightCode(cell.source, cellLang);
 
       const ta = document.createElement("textarea");
       ta.className = "code-textarea";
@@ -986,12 +1202,12 @@
       ta.autocomplete = "off";
       ta.autocapitalize = "off";
       ta.value = cell.source;
-      ta.placeholder = "Enter Minilang code... (Shift+Enter to run)";
+      ta.placeholder = `Enter ${langInfo(cellLang).name} code... (Shift+Enter to run)`;
 
       ta.addEventListener("focus", () => selectCell(cell.id, false));
       ta.addEventListener("input", () => {
         cell.source = ta.value;
-        pre.innerHTML = highlightMinilang(ta.value);
+        pre.innerHTML = highlightCode(ta.value, tab.doc.language || "minilang");
         markDirty(tab);
         hideAutocomplete();
       });
@@ -1258,7 +1474,7 @@
       ta.value = ta.value.slice(0, pos) + "    " + ta.value.slice(end);
       ta.selectionStart = ta.selectionEnd = pos + 4;
       cell.source = ta.value;
-      pre.innerHTML = highlightMinilang(ta.value);
+      pre.innerHTML = highlightCode(ta.value, tab.doc.language || "minilang");
       markDirty(tab);
       return;
     }
@@ -1284,7 +1500,7 @@
     const nextPos = startPos + text.length;
     ta.selectionStart = ta.selectionEnd = nextPos;
     cell.source = ta.value;
-    pre.innerHTML = highlightMinilang(ta.value);
+    pre.innerHTML = highlightCode(ta.value, tab.doc.language || "minilang");
     markDirty(tab);
   }
 
@@ -1466,11 +1682,13 @@
     }
     try {
       const st = await api(`/api/kernels/${encodeURIComponent(tab.kernelId)}/status`);
-      if (!st.alive) setKernelIndicator("dead", "Kernel stopped");
-      else if (st.busy) setKernelIndicator("busy", "Running...");
-      else setKernelIndicator("idle", `Minilang (pid ${st.pid})`);
+      const lname = langInfo(st.language || tab.language || "minilang").name;
+      if (!st.alive) setKernelIndicator("dead", `${lname} stopped`);
+      else if (st.busy) setKernelIndicator("busy", `Running ${lname}...`);
+      else setKernelIndicator("idle", `${lname} (pid ${st.pid})`);
     } catch {
-      setKernelIndicator("idle", "Minilang 2.17");
+      const lname = langInfo(tab.language || "minilang").name;
+      setKernelIndicator("idle", lname);
     }
   }
 
@@ -1556,6 +1774,7 @@
         const cleanDoc = {
           format: tab.doc.format || "minilang-notebook",
           version: tab.doc.version || 1,
+          language: tab.doc.language || "minilang",
           title: tab.title,
           cells: tab.doc.cells.map((c) => ({
             id: c.id,
@@ -1595,10 +1814,12 @@
   async function exportAsMini() {
     const tab = activeTab();
     if (!tab || tab.kind !== "notebook") return;
-    const base = tab.title.replace(/\.mnb$/i, "") + ".mini";
+    const linfo = langInfo(tab.doc.language || "minilang");
+    const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
+    const base = tab.title.replace(/\.mnb$/i, "") + `.${ext}`;
     const name = await showModal({
-      title: "Export as Minilang Script",
-      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Export cells to <code>.mini</code> file in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+      title: `Export as ${linfo.name} Script`,
+      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Export cells to <code>.${ext}</code> file in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
       confirmText: "Export",
       inputValue: base,
     });
@@ -1607,6 +1828,7 @@
       const cleanDoc = {
         format: "minilang-notebook",
         version: 1,
+        language: tab.doc.language || "minilang",
         title: tab.title,
         cells: tab.doc.cells.map((c) => ({
           id: c.id,
@@ -1616,7 +1838,7 @@
           output: null,
         })),
       };
-      const res = await api("/api/notebook/to-mini", {
+      const res = await api("/api/notebook/to-script", {
         method: "POST",
         body: JSON.stringify(cleanDoc),
       });
@@ -1675,20 +1897,31 @@
 
   // Sidebar file creation buttons
   document.getElementById("btn-new-notebook").onclick = async () => {
+    const langOpts = state.languages
+      .filter((l) => l.supports_notebook)
+      .map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.name)} (${escapeHtml(l.version)})</option>`)
+      .join("");
     const name = await showModal({
-      title: "New Minilang Notebook",
-      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+      title: "New Notebook",
+      bodyHtml: `
+        <p style="margin:0 0 8px;color:var(--text-secondary)">Language kernel:</p>
+        <select id="modal-lang-select" class="modal-input" style="margin-bottom:12px">${langOpts}</select>
+        <p style="margin:0 0 8px;color:var(--text-secondary)">Create in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
       confirmText: "Create",
       inputValue: "untitled.mnb",
     });
     if (!name || !name.trim()) return;
+    const chosenLang = document.getElementById("modal-lang-select")?.value || "minilang";
     const fname = name.trim().endsWith(".mnb") ? name.trim() : `${name.trim()}.mnb`;
     const fullPath = state.currentDir ? `${state.currentDir}/${fname}` : fname;
     try {
-      await api("/api/file/new", { method: "POST", body: JSON.stringify({ path: fullPath, kind: "notebook" }) });
+      await api("/api/file/new", {
+        method: "POST",
+        body: JSON.stringify({ path: fullPath, kind: "notebook", language: chosenLang }),
+      });
       await loadDirectory();
       await openPathInTab(fullPath);
-      toast(`Created ${fname}`, "success");
+      toast(`Created ${fname} (${langInfo(chosenLang).name})`, "success");
     } catch (e) {
       toast(e.message, "error");
     }
@@ -1794,6 +2027,26 @@
     renderCells();
   };
   document.getElementById("tb-export-mini").onclick = exportAsMini;
+  document.getElementById("tb-lang-select").onchange = async (e) => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "notebook") return;
+    const nextLang = e.target.value;
+    if (tab.doc.language === nextLang) return;
+    tab.doc.language = nextLang;
+    tab.language = nextLang;
+    markDirty(tab);
+    const dir = tab.path && tab.path.includes("/") ? tab.path.slice(0, tab.path.lastIndexOf("/")) : state.currentDir;
+    try {
+      setKernelIndicator("busy", `Switching to ${langInfo(nextLang).name}...`);
+      await ensureKernel(tab.kernelId, dir, nextLang);
+      renderActiveWorkspace();
+      updateKernelPill();
+      if (state.varsOpen) refreshVariables();
+      toast(`Switched kernel to ${langInfo(nextLang).name}`, "success");
+    } catch (err) {
+      toast(`Failed to switch kernel: ${err.message}`, "error");
+    }
+  };
 
   // Text file editor buttons & live syntax highlighting
   const fileEditorTa = document.getElementById("file-editor-textarea");
@@ -1801,8 +2054,10 @@
     const tab = activeTab();
     if (tab && tab.kind === "file") {
       tab.content = e.target.value;
-      const isMinilangFile = tab.extension === "mini" || tab.extension === "ui";
-      syncFileEditorHighlight(tab.content, isMinilangFile);
+      const isUi = tab.extension === "ui";
+      const fileLang = langByExtension(tab.extension);
+      const highlightLang = isUi ? "minilang" : (fileLang ? fileLang.id : null);
+      syncFileEditorHighlight(tab.content, highlightLang);
       syncFileEditorScroll();
       markDirty(tab);
       updateStatusBar();
@@ -1829,16 +2084,17 @@
     if (!tab || tab.kind !== "file") return;
     const outPane = document.getElementById("file-run-output");
     const outBody = document.getElementById("file-run-output-body");
+    const fileLang = tab.extension === "ui" ? langInfo("minilang") : (langByExtension(tab.extension) || langInfo("minilang"));
     outPane.classList.remove("hidden");
-    outBody.innerHTML = `<span style="color:var(--text-muted)">Running ${escapeHtml(tab.title)}...</span>`;
+    outBody.innerHTML = `<span style="color:var(--text-muted)">Running ${escapeHtml(tab.title)} (${escapeHtml(fileLang.name)})...</span>`;
     try {
       const kId = `script-${tab.id.slice(0, 8)}`;
       const dir = tab.path && tab.path.includes("/") ? tab.path.slice(0, tab.path.lastIndexOf("/")) : "";
-      await ensureKernel(kId, dir);
+      await ensureKernel(kId, dir, fileLang.id);
       await api(`/api/kernels/${encodeURIComponent(kId)}/restart`, { method: "POST" });
       const resp = await api(`/api/kernels/${encodeURIComponent(kId)}/execute`, {
         method: "POST",
-        body: JSON.stringify({ code: tab.content, source: tab.title }),
+        body: JSON.stringify({ code: tab.content, source: tab.title, language: fileLang.id }),
       });
       outBody.innerHTML = renderOutputHtml(resp, resp.execution_count) || `<span style="color:var(--text-muted)">(no output)</span>`;
       hydrateUiDisplays(outBody, resp);
@@ -1857,13 +2113,18 @@
   document.getElementById("ftb-open-as-nb").onclick = async () => {
     const tab = activeTab();
     if (!tab || tab.kind !== "file") return;
+    const fileLang = langByExtension(tab.extension);
     try {
-      const doc = await api("/api/notebook/from-mini", {
+      const doc = await api("/api/notebook/from-script", {
         method: "POST",
-        body: JSON.stringify({ title: tab.title, content: tab.content }),
+        body: JSON.stringify({
+          title: tab.title,
+          content: tab.content,
+          language: fileLang ? fileLang.id : "minilang",
+        }),
       });
-      const nbTitle = tab.title.replace(/\.mini$/i, "") + ".mnb";
-      await createUntitledNotebook(doc, nbTitle, null);
+      const nbTitle = tab.title.replace(/\.[^.]+$/i, "") + ".mnb";
+      await createUntitledNotebook(doc, nbTitle, null, doc.language);
     } catch (e) {
       toast(e.message, "error");
     }
@@ -1871,13 +2132,19 @@
 
   // Script /invoke panel controls
   function defaultInvokePayloadFor(path) {
-    if (path && path.endsWith("greet.mini")) {
+    if (path && (path.endsWith("greet.mini") || path.endsWith("hello.rs"))) {
       return JSON.stringify({
         params: {
-          name: { type: "string", value: "Minilang" },
+          name: { type: "string", value: path.endsWith(".rs") ? "Rust" : "Minilang" },
           repeat: { type: "integer", value: 3 },
           excited: { type: "boolean", value: true },
         },
+      }, null, 2);
+    }
+    if (path && path.endsWith("fib.rs")) {
+      return JSON.stringify({
+        function: "fib",
+        args: [{ type: "integer", value: 20 }],
       }, null, 2);
     }
     if (path && path.endsWith("stats.mini")) {
@@ -2032,7 +2299,18 @@
     try {
       const info = await api("/api/info");
       state.rootName = info.root_name || "workspace";
+      if (Array.isArray(info.languages) && info.languages.length > 0) {
+        state.languages = info.languages;
+      }
     } catch { /* ignore */ }
+
+    const langSel = document.getElementById("tb-lang-select");
+    if (langSel) {
+      langSel.innerHTML = state.languages
+        .filter((l) => l.supports_notebook)
+        .map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.name)}</option>`)
+        .join("");
+    }
 
     await loadDirectory("");
 

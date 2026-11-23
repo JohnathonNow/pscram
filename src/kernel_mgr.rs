@@ -1,16 +1,15 @@
 use crate::kernel_proc::{
     CompletionItem, EvalError, EvalValue, KernelRequest, KernelResponse, VarInfo,
 };
+use crate::lang::{InvokeScriptRequest, LanguageBackend, LanguageRegistry};
 use crate::tagged::TaggedValue;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 struct KernelIo {
@@ -21,6 +20,8 @@ struct KernelIo {
 
 pub struct KernelSession {
     pub id: String,
+    pub language: String,
+    backend: Arc<dyn LanguageBackend>,
     cwd: Mutex<PathBuf>,
     io: Mutex<Option<KernelIo>>,
     pid: AtomicU32,
@@ -33,6 +34,7 @@ pub struct KernelSession {
 #[derive(Debug, Clone, Serialize)]
 pub struct KernelStatus {
     pub id: String,
+    pub language: String,
     pub alive: bool,
     pub busy: bool,
     pub pid: u32,
@@ -41,9 +43,16 @@ pub struct KernelStatus {
 }
 
 impl KernelSession {
-    async fn spawn_new(id: String, cwd: PathBuf) -> Result<Arc<Self>, String> {
+    async fn spawn_new(
+        id: String,
+        backend: Arc<dyn LanguageBackend>,
+        cwd: PathBuf,
+    ) -> Result<Arc<Self>, String> {
+        let language = backend.info().id;
         let session = Arc::new(Self {
             id,
+            language,
+            backend,
             cwd: Mutex::new(cwd),
             io: Mutex::new(None),
             pid: AtomicU32::new(0),
@@ -57,23 +66,12 @@ impl KernelSession {
     }
 
     async fn start_process(&self) -> Result<(), String> {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("failed to locate executable: {}", e))?;
         let cwd = self.cwd.lock().await.clone();
-
-        let mut cmd = Command::new(exe);
-        cmd.arg("--kernel")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if cwd.exists() {
-            cmd.current_dir(&cwd);
-        }
+        let mut cmd = self.backend.kernel_command(&cwd)?;
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn minilang kernel: {}", e))?;
+            .map_err(|e| format!("failed to spawn {} kernel: {}", self.language, e))?;
 
         let pid = child.id().unwrap_or(0);
         let stdin = child
@@ -107,6 +105,7 @@ impl KernelSession {
         let cwd = self.cwd.lock().await.display().to_string();
         KernelStatus {
             id: self.id.clone(),
+            language: self.language.clone(),
             alive: self.alive.load(Ordering::SeqCst),
             busy: self.busy.load(Ordering::SeqCst),
             pid: self.pid.load(Ordering::SeqCst),
@@ -167,7 +166,7 @@ impl KernelSession {
                         duration_ms: 0.0,
                     });
                 }
-                Err("Kernel exited unexpectedly (e.g. halt() called). Click Restart Kernel to continue.".to_string())
+                Err("Kernel exited unexpectedly. Click Restart Kernel to continue.".to_string())
             }
             Ok(_) => {
                 let parsed: KernelResponse = serde_json::from_str(line.trim())
@@ -191,7 +190,6 @@ impl KernelSession {
         }
         let resp = self.send_request(&KernelRequest::Eval { code, source }).await?;
         if !self.alive.load(Ordering::SeqCst) {
-            // Auto-respawn after interrupt so next cell runs seamlessly
             let _ = self.start_process().await;
         }
         Ok(resp)
@@ -249,7 +247,6 @@ impl KernelSession {
             return false;
         }
         self.interrupted.store(true, Ordering::SeqCst);
-        // Kill the kernel child process immediately via SIGKILL using nix-free libc call
         unsafe {
             extern "C" {
                 fn kill(pid: i32, sig: i32) -> i32;
@@ -261,7 +258,6 @@ impl KernelSession {
 
     pub async fn restart(&self) -> Result<(), String> {
         self.interrupt_now();
-        // Wait briefly for any in-flight eval lock to release
         self.start_process().await
     }
 
@@ -278,13 +274,15 @@ impl KernelSession {
 
 pub struct KernelManager {
     root_dir: PathBuf,
+    languages: Arc<LanguageRegistry>,
     sessions: Mutex<HashMap<String, Arc<KernelSession>>>,
 }
 
 impl KernelManager {
-    pub fn new(root_dir: PathBuf) -> Self {
+    pub fn new(root_dir: PathBuf, languages: Arc<LanguageRegistry>) -> Self {
         Self {
             root_dir,
+            languages,
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -292,15 +290,40 @@ impl KernelManager {
     pub async fn get_or_create(
         &self,
         session_id: Option<String>,
+        language: Option<&str>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<KernelSession>, String> {
         let id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut map = self.sessions.lock().await;
         if let Some(existing) = map.get(&id) {
+            if let Some(req_lang) = language {
+                if existing.language != req_lang {
+                    // Language switched on existing session id: shut down old and respawn new language
+                    let old = map.remove(&id).unwrap();
+                    drop(map);
+                    old.shutdown().await;
+                    let backend = self
+                        .languages
+                        .by_id(req_lang)
+                        .ok_or_else(|| format!("Unsupported language '{}'", req_lang))?;
+                    let target_cwd = cwd.unwrap_or_else(|| self.root_dir.clone());
+                    let session = KernelSession::spawn_new(id.clone(), backend, target_cwd).await?;
+                    self.sessions.lock().await.insert(id, session.clone());
+                    return Ok(session);
+                }
+            }
             return Ok(existing.clone());
         }
+
+        let backend = match language {
+            Some(l) => self
+                .languages
+                .by_id(l)
+                .ok_or_else(|| format!("Unsupported language '{}'", l))?,
+            None => self.languages.default_backend(),
+        };
         let target_cwd = cwd.unwrap_or_else(|| self.root_dir.clone());
-        let session = KernelSession::spawn_new(id.clone(), target_cwd).await?;
+        let session = KernelSession::spawn_new(id.clone(), backend, target_cwd).await?;
         map.insert(id, session.clone());
         Ok(session)
     }
@@ -335,10 +358,11 @@ impl KernelManager {
         }
     }
 
-    /// Run a `.mini` script in a fresh isolated kernel subprocess with tagged JSON parameters.
+    /// Invoke a script in any registered language backend with tagged JSON parameters.
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_script(
         &self,
+        language_id: &str,
         code: String,
         source: String,
         cwd: PathBuf,
@@ -347,77 +371,20 @@ impl KernelManager {
         function: Option<String>,
         timeout_ms: u64,
     ) -> Result<KernelResponse, InvokeExecError> {
-        let exe = std::env::current_exe()
-            .map_err(|e| InvokeExecError::Internal(format!("failed to locate executable: {}", e)))?;
-
-        let mut cmd = Command::new(exe);
-        cmd.arg("--kernel")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if cwd.exists() {
-            cmd.current_dir(&cwd);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| InvokeExecError::Internal(format!("failed to spawn kernel: {}", e)))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| InvokeExecError::Internal("failed to open kernel stdin".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| InvokeExecError::Internal("failed to open kernel stdout".to_string()))?;
-        let mut reader = BufReader::new(stdout);
-
-        let req = KernelRequest::Invoke {
-            code,
-            source,
-            params,
-            args,
-            function,
-        };
-        let mut payload = serde_json::to_string(&req)
-            .map_err(|e| InvokeExecError::Internal(format!("encode error: {}", e)))?;
-        payload.push('\n');
-
-        let run_future = async {
-            stdin
-                .write_all(payload.as_bytes())
-                .await
-                .map_err(|e| InvokeExecError::Internal(format!("kernel write failed: {}", e)))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| InvokeExecError::Internal(format!("kernel flush failed: {}", e)))?;
-            drop(stdin);
-
-            let mut line = String::new();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| InvokeExecError::Internal(format!("kernel read failed: {}", e)))?;
-            if n == 0 {
-                return Err(InvokeExecError::Internal(
-                    "Script kernel exited before returning a result (e.g. halt() called)"
-                        .to_string(),
-                ));
-            }
-            serde_json::from_str::<KernelResponse>(line.trim())
-                .map_err(|e| InvokeExecError::Internal(format!("invalid kernel response: {}", e)))
-        };
-
-        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), run_future).await;
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-
-        match result {
-            Ok(inner) => inner,
-            Err(_) => Err(InvokeExecError::Timeout(timeout_ms)),
-        }
+        let backend = self.languages.by_id(language_id).ok_or_else(|| {
+            InvokeExecError::Internal(format!("Unsupported language '{}'", language_id))
+        })?;
+        backend
+            .invoke_script(InvokeScriptRequest {
+                code,
+                source,
+                cwd,
+                params,
+                args,
+                function,
+                timeout_ms,
+            })
+            .await
     }
 }
 
