@@ -238,7 +238,13 @@
 
         <!-- Text File Viewer/Editor -->
         <div id="file-view" class="file-editor-pane hidden">
-          <textarea id="file-editor-textarea" class="file-editor-textarea" spellcheck="false"></textarea>
+          <div id="file-editor-shell" class="file-editor-shell">
+            <div id="file-editor-gutter" class="file-editor-gutter" aria-hidden="true"></div>
+            <div class="file-editor-surface">
+              <pre id="file-editor-highlight" class="file-editor-highlight" aria-hidden="true"></pre>
+              <textarea id="file-editor-textarea" class="file-editor-textarea" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+            </div>
+          </div>
           <div id="file-invoke-panel" class="file-invoke-panel hidden">
             <div class="file-run-output-header">
               <span>Invoke Script via <code id="invoke-endpoint-label">POST /invoke</code></span>

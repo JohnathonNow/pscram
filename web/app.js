@@ -12,16 +12,16 @@
   ]);
 
   const ML_BUILTINS = new Set([
-    "all", "assign", "backtrace", "batch", "break", "buffered", "call", "callcc",
-    "calldc", "cas", "clock", "console", "copy", "count", "count2", "debugger",
-    "deref", "diffused", "display", "distill", "dup", "exchange", "export",
-    "finalize", "findall", "first", "first2", "fold", "global", "globals", "grid",
-    "halt", "html", "import", "isconstant", "iterate", "key", "last", "last2",
-    "locale", "markcc", "markdown", "max", "max2", "min", "min2", "now", "null",
-    "pair", "parallel", "print", "println", "prod", "raise", "range", "reduce",
-    "reduce2", "replace", "sleep", "some", "sum", "svg", "swap", "swapcc", "top",
-    "top2", "trace", "unfold", "unique", "unique1", "unpack", "visit", "watched",
-    "weave", "zip", "zip2"
+    "Args", "Params", "all", "assign", "backtrace", "batch", "break", "buffered",
+    "call", "callcc", "calldc", "cas", "clock", "console", "copy", "count",
+    "count2", "debugger", "deref", "diffused", "display", "distill", "dup",
+    "exchange", "exec", "export", "finalize", "findall", "first", "first2",
+    "fold", "global", "globals", "grid", "halt", "html", "import", "isconstant",
+    "iterate", "key", "last", "last2", "locale", "markcc", "markdown", "max",
+    "max2", "min", "min2", "now", "null", "pair", "parallel", "print", "println",
+    "prod", "raise", "range", "reduce", "reduce2", "replace", "sleep", "some",
+    "sum", "svg", "swap", "swapcc", "top", "top2", "trace", "ui", "unfold",
+    "unique", "unique1", "unpack", "visit", "watched", "weave", "zip", "zip2"
   ]);
 
   const ML_TYPES = new Set([
@@ -766,9 +766,13 @@
 
       const ta = document.getElementById("file-editor-textarea");
       ta.value = tab.content || "";
-      document.getElementById("ftb-meta").textContent = `${tab.path} (${formatSize(tab.content.length)})`;
       const isMini = tab.extension === "mini";
       const isUi = tab.extension === "ui";
+      syncFileEditorHighlight(tab.content || "", isMini || isUi);
+      ta.scrollTop = 0;
+      ta.scrollLeft = 0;
+      syncFileEditorScroll();
+      document.getElementById("ftb-meta").textContent = `${tab.path} (${formatSize(tab.content.length)})`;
       document.getElementById("ftb-run-mini").classList.toggle("hidden", !(isMini || isUi));
       document.getElementById("ftb-run-mini").querySelector("span").textContent = isUi ? "Preview UI" : "Run in Minilang";
       document.getElementById("ftb-invoke-mini").classList.toggle("hidden", !isMini);
@@ -777,6 +781,31 @@
       document.getElementById("file-run-output").classList.add("hidden");
       document.getElementById("file-invoke-panel").classList.add("hidden");
     }
+  }
+
+  function syncFileEditorHighlight(code, useMinilangHighlight) {
+    const shell = document.getElementById("file-editor-shell");
+    const hl = document.getElementById("file-editor-highlight");
+    const gutter = document.getElementById("file-editor-gutter");
+    shell.classList.toggle("highlighted", !!useMinilangHighlight);
+    if (useMinilangHighlight) {
+      hl.innerHTML = highlightMinilang(code);
+    } else {
+      hl.textContent = "";
+    }
+    const lineCount = Math.max(1, code.split("\n").length);
+    let nums = "";
+    for (let i = 1; i <= lineCount; i++) nums += i + "\n";
+    gutter.textContent = nums;
+  }
+
+  function syncFileEditorScroll() {
+    const ta = document.getElementById("file-editor-textarea");
+    const hl = document.getElementById("file-editor-highlight");
+    const gutter = document.getElementById("file-editor-gutter");
+    hl.scrollTop = ta.scrollTop;
+    hl.scrollLeft = ta.scrollLeft;
+    gutter.scrollTop = ta.scrollTop;
   }
 
   // --- Notebook Cell Rendering ---
@@ -1766,13 +1795,28 @@
   };
   document.getElementById("tb-export-mini").onclick = exportAsMini;
 
-  // Text file editor buttons
-  document.getElementById("file-editor-textarea").addEventListener("input", (e) => {
+  // Text file editor buttons & live syntax highlighting
+  const fileEditorTa = document.getElementById("file-editor-textarea");
+  fileEditorTa.addEventListener("input", (e) => {
     const tab = activeTab();
     if (tab && tab.kind === "file") {
       tab.content = e.target.value;
+      const isMinilangFile = tab.extension === "mini" || tab.extension === "ui";
+      syncFileEditorHighlight(tab.content, isMinilangFile);
+      syncFileEditorScroll();
       markDirty(tab);
       updateStatusBar();
+    }
+  });
+  fileEditorTa.addEventListener("scroll", syncFileEditorScroll);
+  fileEditorTa.addEventListener("keydown", (e) => {
+    if (e.key === "Tab" && !e.shiftKey) {
+      e.preventDefault();
+      const start = fileEditorTa.selectionStart;
+      const end = fileEditorTa.selectionEnd;
+      fileEditorTa.value = fileEditorTa.value.slice(0, start) + "    " + fileEditorTa.value.slice(end);
+      fileEditorTa.selectionStart = fileEditorTa.selectionEnd = start + 4;
+      fileEditorTa.dispatchEvent(new Event("input"));
     }
   });
   document.getElementById("ftb-save").onclick = saveActiveTab;

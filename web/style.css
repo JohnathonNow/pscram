@@ -1032,19 +1032,83 @@ html, body {
   min-height: 0;
 }
 
-.file-editor-textarea {
+.file-editor-shell {
   flex: 1;
+  min-height: 0;
+  display: flex;
+  background: var(--bg-input);
+  position: relative;
+  overflow: hidden;
+}
+
+.file-editor-gutter {
+  width: 52px;
+  min-width: 52px;
+  padding: 16px 10px 16px 6px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-subtle);
+  overflow: hidden;
+  user-select: none;
+  white-space: pre;
+}
+
+.file-editor-surface {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.file-editor-highlight,
+.file-editor-textarea {
+  position: absolute;
+  inset: 0;
   width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 16px 20px;
   border: none;
   outline: none;
-  resize: none;
-  padding: 16px 20px;
-  background: var(--bg-input);
-  color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 13.5px;
   line-height: 1.6;
   tab-size: 4;
+  white-space: pre;
+  letter-spacing: normal;
+  word-spacing: normal;
+}
+
+.file-editor-highlight {
+  pointer-events: none;
+  overflow: hidden;
+  color: var(--text-primary);
+  background: transparent;
+}
+
+.file-editor-textarea {
+  resize: none;
+  overflow: auto;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  caret-color: var(--text-primary);
+}
+
+.file-editor-shell.highlighted .file-editor-textarea {
+  background: transparent;
+  color: transparent;
+}
+
+.file-editor-shell.highlighted .file-editor-textarea::selection {
+  background: rgba(122, 162, 247, 0.3);
+}
+
+.file-editor-shell:not(.highlighted) .file-editor-highlight {
+  display: none;
 }
 
 .file-run-output {
