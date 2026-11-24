@@ -1200,6 +1200,122 @@ ML_FUNCTION(MLHttpRequest) {
 }
 
 /* ============================================================================
+ * Shared JSON HTTP Helper (for internal C modules such as `ml_ai.c`)
+ * ============================================================================ */
+
+ml_value_t *mlio_http_json_raw(
+    const char *Method,
+    const char *Url,
+    const char *const *ExtraHeaders,
+    const char *JsonBody,
+    size_t BodyLen,
+    long TimeoutSecs,
+    long *OutStatus
+) {
+    if (OutStatus) *OutStatus = 0;
+    char ErrBuf[512];
+    if (mlio_load_curl(ErrBuf, sizeof(ErrBuf)) != 0) {
+        return ml_error("HttpError", "%s", ErrBuf);
+    }
+
+    ML_CURL *Curl = g_curl.easy_init();
+    if (!Curl) {
+        return ml_error("HttpError", "curl_easy_init failed");
+    }
+
+    struct ml_curl_slist *CurlHeaders = NULL;
+    int HasContentType = 0;
+    if (ExtraHeaders) {
+        for (int I = 0; ExtraHeaders[I]; ++I) {
+            if (strncasecmp(ExtraHeaders[I], "Content-Type:", 13) == 0) {
+                HasContentType = 1;
+            }
+            CurlHeaders = g_curl.slist_append(CurlHeaders, ExtraHeaders[I]);
+        }
+    }
+    if (JsonBody && !HasContentType) {
+        CurlHeaders = g_curl.slist_append(CurlHeaders, "Content-Type: application/json");
+    }
+    CurlHeaders = g_curl.slist_append(CurlHeaders, "Expect:");
+
+    ml_http_sink_t Sink = {NULL, 0, 0, NULL, 0};
+    long EffTimeout = (TimeoutSecs > 0) ? TimeoutSecs : 60L;
+
+    g_curl.easy_setopt(Curl, ML_CURLOPT_URL, Url);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_FOLLOWLOCATION, 1L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_NOSIGNAL, 1L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_CONNECTTIMEOUT, 15L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_TIMEOUT, EffTimeout);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_USERAGENT, "minilang-notebook/0.1");
+    g_curl.easy_setopt(Curl, ML_CURLOPT_WRITEFUNCTION, mlio_curl_write_cb);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_WRITEDATA, &Sink);
+    if (CurlHeaders) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_HTTPHEADER, CurlHeaders);
+    }
+
+    if (strcmp(Method, "POST") == 0) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POST, 1L);
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDS, JsonBody ? JsonBody : "");
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDSIZE_LARGE, (int64_t)(JsonBody ? BodyLen : 0));
+    } else if (strcmp(Method, "GET") != 0) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_CUSTOMREQUEST, Method);
+        if (JsonBody) {
+            g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDS, JsonBody);
+            g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDSIZE_LARGE, (int64_t)BodyLen);
+        }
+    }
+
+    int Res = g_curl.easy_perform(Curl);
+    long StatusCode = 0;
+    if (Res == ML_CURLE_OK) {
+        g_curl.easy_getinfo(Curl, ML_CURLINFO_RESPONSE_CODE, &StatusCode);
+    }
+    const char *CurlErrStr = (Res != ML_CURLE_OK) ? g_curl.easy_strerror(Res) : NULL;
+
+    g_curl.easy_cleanup(Curl);
+    if (CurlHeaders) g_curl.slist_free_all(CurlHeaders);
+
+    if (OutStatus) *OutStatus = StatusCode;
+
+    if (Res != ML_CURLE_OK || Sink.Failed) {
+        free(Sink.Data);
+        return ml_error("HttpError", "HTTP %s failed: %s", Method, CurlErrStr ? CurlErrStr : "write error");
+    }
+
+    if (!OutStatus && StatusCode >= 400) {
+        char Snippet[512];
+        if (Sink.Data && Sink.Len > 0) {
+            size_t N = Sink.Len < sizeof(Snippet) - 1 ? Sink.Len : sizeof(Snippet) - 1;
+            memcpy(Snippet, Sink.Data, N);
+            Snippet[N] = '\0';
+        } else {
+            Snippet[0] = '\0';
+        }
+        free(Sink.Data);
+        if (Snippet[0] != '\0') {
+            return ml_error("HttpError", "HTTP %ld: %s", StatusCode, Snippet);
+        }
+        return ml_error("HttpError", "HTTP request returned status %ld", StatusCode);
+    }
+
+    ml_value_t *Decoded = ml_json_decode(
+        Sink.Data ? (const char *)Sink.Data : "{}",
+        Sink.Data ? Sink.Len : 2
+    );
+    if (ml_is_error(Decoded)) {
+        ml_value_t *Fallback = ml_map();
+        ml_value_t *RawStr = (Sink.Data && Sink.Len > 0)
+            ? ml_string_copy((const char *)Sink.Data, (int)Sink.Len)
+            : ml_string("", 0);
+        ml_map_insert(Fallback, ml_cstring("raw_text"), RawStr);
+        free(Sink.Data);
+        return Fallback;
+    }
+    free(Sink.Data);
+    return Decoded;
+}
+
+/* ============================================================================
  * Module Registration
  * ============================================================================ */
 

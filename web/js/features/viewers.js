@@ -14,6 +14,7 @@ import { ensureKernel, renderCells, updateKernelPill, refreshKernelList, refresh
 import { syncFileParamsPanelForTab } from "./script_tools.js";
 import { renderFileAgyPanel } from "./agy.js";
 import { debugState, getBreakpointsForSource } from "./debugger.js";
+import { mountClusterGraph } from "../viz/cluster.js";
 
 async function openPathInTab(relPath) {
   const existing = state.tabs.find((t) => t.path === relPath);
@@ -84,6 +85,17 @@ async function openPathInTab(relPath) {
         sqliteSql: "",
         sqliteResult: null,
         sqliteAllowWrite: false,
+        sqliteMode: "table",
+        sqliteCluster: {
+          source: "",
+          xCol: "",
+          yCol: "",
+          colorCol: "",
+          algo: "auto",
+          k: 4,
+          limit: 1000,
+          data: null,
+        },
       };
       state.tabs.push(tab);
       activateTab(tab.id);
@@ -692,9 +704,203 @@ async function loadSqliteSchema(tab) {
   try {
     const schema = await api(`/api/sqlite/schema?path=${encodeURIComponent(tab.path)}`);
     tab.sqliteSchema = schema;
-    if (activeTab()?.id === tab.id) renderSqliteSchema(tab);
+    if (activeTab()?.id === tab.id) {
+      renderSqliteSchema(tab);
+      syncSqliteClusterControls(tab);
+    }
   } catch (err) {
     toast(`Failed to load SQLite schema: ${err.message}`, "error");
+  }
+}
+
+function ensureSqliteClusterState(tab) {
+  if (!tab.sqliteCluster) {
+    tab.sqliteCluster = {
+      source: "",
+      xCol: "",
+      yCol: "",
+      colorCol: "",
+      algo: "auto",
+      k: 4,
+      limit: 1000,
+      data: null,
+    };
+  }
+  return tab.sqliteCluster;
+}
+
+function getSqliteColumnsForSource(tab, source) {
+  if (source === "__sql__") {
+    return (tab.sqliteResult?.columns || []).map((name) => ({ name, col_type: "" }));
+  }
+  const tbl = (tab.sqliteSchema?.tables || []).find((t) => t.name === source);
+  return tbl?.columns || [];
+}
+
+function pickDefaultClusterCols(cols) {
+  if (!cols.length) return { xCol: "", yCol: "__same__", colorCol: "" };
+  const numRe = new RegExp("int|real|floa|doub|num|dec", "i");
+  const textRe = new RegExp("text|char|clob|json|blob|vec", "i");
+  const isNumType = (t) => numRe.test(t || "");
+  const isTextOrBlob = (t) => textRe.test(t || "");
+  const nonPk = cols.filter((c) => !c.pk);
+  const pool = nonPk.length >= 2 ? nonPk : cols;
+  const numCols = pool.filter((c) => isNumType(c.col_type));
+  const textCols = pool.filter((c) => isTextOrBlob(c.col_type));
+
+  let xCol = numCols[0]?.name || pool[0]?.name || cols[0].name;
+  let yCol = numCols[1]?.name || (pool.find((c) => c.name !== xCol)?.name) || "__same__";
+  const colorCand = textCols.find((c) => c.name !== xCol && c.name !== yCol)
+    || pool.find((c) => c.name !== xCol && c.name !== yCol);
+  const colorCol = colorCand ? colorCand.name : "";
+  return { xCol, yCol, colorCol };
+}
+
+function syncSqliteClusterControls(tab) {
+  const cs = ensureSqliteClusterState(tab);
+  const srcSel = document.getElementById("sqlc-source");
+  const xSel = document.getElementById("sqlc-x");
+  const ySel = document.getElementById("sqlc-y");
+  const cSel = document.getElementById("sqlc-color");
+  const algoSel = document.getElementById("sqlc-algo");
+  const kWrap = document.getElementById("sqlc-k-wrap");
+  const kInp = document.getElementById("sqlc-k");
+  const limSel = document.getElementById("sqlc-limit");
+  if (!srcSel || !xSel || !ySel || !cSel) return;
+
+  const tables = tab.sqliteSchema?.tables || [];
+  const hasSqlQuery = !!(tab.sqliteSql && tab.sqliteSql.trim());
+  const srcOpts = tables.map((t) => ({
+    value: t.name,
+    label: `${t.name}${t.row_count != null ? ` (${t.row_count})` : ""}`,
+  }));
+  if (hasSqlQuery) {
+    srcOpts.push({ value: "__sql__", label: "Current SQL Query" });
+  }
+  if (!cs.source || !srcOpts.some((o) => o.value === cs.source)) {
+    cs.source = srcOpts[0]?.value || "";
+    cs.xCol = "";
+    cs.yCol = "";
+    cs.colorCol = "";
+  }
+  srcSel.innerHTML = srcOpts.length
+    ? srcOpts.map((o) => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join("")
+    : `<option value="">(no tables)</option>`;
+  srcSel.value = cs.source;
+
+  const cols = getSqliteColumnsForSource(tab, cs.source);
+  const colNames = cols.map((c) => c.name);
+  if (!cs.xCol || !colNames.includes(cs.xCol)) {
+    const def = pickDefaultClusterCols(cols);
+    cs.xCol = def.xCol;
+    cs.yCol = def.yCol;
+    cs.colorCol = def.colorCol;
+  }
+  if (cs.yCol && cs.yCol !== "__same__" && !colNames.includes(cs.yCol)) {
+    cs.yCol = colNames.find((n) => n !== cs.xCol) || "__same__";
+  }
+  if (cs.colorCol && cs.colorCol !== "__cluster__" && !colNames.includes(cs.colorCol)) {
+    cs.colorCol = "";
+  }
+
+  xSel.innerHTML = cols.map((c) =>
+    `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}${c.col_type ? ` (${escapeHtml(c.col_type)})` : ""}</option>`
+  ).join("");
+  xSel.value = cs.xCol;
+
+  ySel.innerHTML =
+    `<option value="__same__">(Same as X — Multi-dim 2D)</option>` +
+    cols.map((c) =>
+      `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}${c.col_type ? ` (${escapeHtml(c.col_type)})` : ""}</option>`
+    ).join("");
+  ySel.value = cs.yCol || "__same__";
+
+  cSel.innerHTML =
+    `<option value="">(None)</option>` +
+    `<option value="__cluster__">(K-Means Cluster)</option>` +
+    cols.map((c) =>
+      `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}${c.col_type ? ` (${escapeHtml(c.col_type)})` : ""}</option>`
+    ).join("");
+  cSel.value = cs.colorCol || "";
+
+  if (algoSel) algoSel.value = cs.algo || "auto";
+  if (kInp) kInp.value = String(cs.k || 4);
+  if (limSel) limSel.value = String(cs.limit || 1000);
+  if (kWrap) {
+    const showK = cs.algo === "kmeans_pca" || cs.colorCol === "__cluster__";
+    kWrap.classList.toggle("hidden", !showK);
+  }
+}
+
+async function runSqliteClusterPlot(tab) {
+  const cs = ensureSqliteClusterState(tab);
+  const host = document.getElementById("sqlc-graph-host");
+  if (!host) return;
+  if (!cs.source || !cs.xCol) {
+    host.innerHTML = `<div class="log-empty">Select a table and X column to plot a cluster graph.</div>`;
+    return;
+  }
+  host.innerHTML = `<div class="log-empty">Computing cluster projection...</div>`;
+  try {
+    const payload = {
+      path: tab.path,
+      x_col: cs.xCol,
+      y_col: cs.yCol || "__same__",
+      color_col: cs.colorCol || null,
+      algorithm: cs.algo || "auto",
+      k: Math.max(2, Math.min(16, Number(cs.k) || 4)),
+      limit: Math.max(10, Math.min(5000, Number(cs.limit) || 1000)),
+    };
+    if (cs.source === "__sql__") {
+      payload.sql = tab.sqliteSql || "";
+    } else {
+      payload.table = cs.source;
+    }
+    const res = await api("/api/sqlite/cluster", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    cs.data = res;
+    if (activeTab()?.id === tab.id) {
+      renderSqliteClusterResult(tab);
+    }
+  } catch (err) {
+    host.innerHTML = `<div class="output-error"><div class="output-error-title">Cluster Plot Error</div><pre class="output-error-tb">${escapeHtml(err.message)}</pre></div>`;
+  }
+}
+
+function renderSqliteClusterResult(tab) {
+  const host = document.getElementById("sqlc-graph-host");
+  if (!host) return;
+  const cs = ensureSqliteClusterState(tab);
+  host.innerHTML = "";
+  if (!cs.data) {
+    host.innerHTML = `<div class="log-empty">Choose columns above and click Plot to generate a cluster graph.</div>`;
+    return;
+  }
+  mountClusterGraph(host, cs.data);
+}
+
+function setSqliteViewMode(tab, mode) {
+  tab.sqliteMode = mode === "cluster" ? "cluster" : "table";
+  const isCluster = tab.sqliteMode === "cluster";
+  document.getElementById("sqltb-mode-table")?.classList.toggle("active", !isCluster);
+  document.getElementById("sqltb-mode-cluster")?.classList.toggle("active", isCluster);
+  document.getElementById("sqlite-editor-wrap")?.classList.toggle("hidden", isCluster);
+  document.getElementById("sqlite-results-body")?.classList.toggle("hidden", isCluster);
+  document.getElementById("sqlite-cluster-pane")?.classList.toggle("hidden", !isCluster);
+  document.getElementById("sqltb-run")?.classList.toggle("hidden", isCluster);
+
+  if (isCluster) {
+    syncSqliteClusterControls(tab);
+    const cs = ensureSqliteClusterState(tab);
+    if (!cs.data && cs.source && cs.xCol) {
+      runSqliteClusterPlot(tab);
+    } else {
+      renderSqliteClusterResult(tab);
+    }
+  } else {
+    renderSqliteResult(tab);
   }
 }
 
@@ -715,7 +921,10 @@ function renderSqliteSchema(tab) {
     <div class="sqlite-table-item">
       <div class="sqlite-table-head" data-sql-table="${escapeHtml(t.name)}" title="Click to preview rows">
         <span>${escapeHtml(t.name)}</span>
-        <span class="tb-meta">${t.row_count != null ? t.row_count : "view"}</span>
+        <span class="sqlite-table-head-actions">
+          <span class="tb-meta">${t.row_count != null ? t.row_count : "view"}</span>
+          <button type="button" class="sqlite-plot-btn" data-plot-table="${escapeHtml(t.name)}" title="Plot cluster graph for ${escapeHtml(t.name)}">Plot</button>
+        </span>
       </div>
       <div class="sqlite-col-list">
         ${(t.columns || []).map((c) => `
@@ -726,9 +935,34 @@ function renderSqliteSchema(tab) {
       </div>
     </div>`).join("");
 
+  list.querySelectorAll(".sqlite-plot-btn").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const tbl = btn.dataset.plotTable;
+      const cs = ensureSqliteClusterState(tab);
+      cs.source = tbl;
+      cs.xCol = "";
+      cs.yCol = "";
+      cs.colorCol = "";
+      cs.data = null;
+      setSqliteViewMode(tab, "cluster");
+    };
+  });
+
   list.querySelectorAll(".sqlite-table-head").forEach((hdr) => {
     hdr.onclick = () => {
       const tbl = hdr.dataset.sqlTable;
+      if (tab.sqliteMode === "cluster") {
+        const cs = ensureSqliteClusterState(tab);
+        cs.source = tbl;
+        cs.xCol = "";
+        cs.yCol = "";
+        cs.colorCol = "";
+        cs.data = null;
+        syncSqliteClusterControls(tab);
+        runSqliteClusterPlot(tab);
+        return;
+      }
       const quoted = `"${tbl.replace(/"/g, '""')}"`;
       tab.sqliteSql = `SELECT * FROM ${quoted} LIMIT 100;`;
       document.getElementById("sqlite-sql-input").value = tab.sqliteSql;
@@ -783,7 +1017,7 @@ function renderSqliteTabView(tab) {
   document.getElementById("sqltb-allow-write").checked = !!tab.sqliteAllowWrite;
   if (!tab.sqliteSchema) loadSqliteSchema(tab);
   else renderSqliteSchema(tab);
-  renderSqliteResult(tab);
+  setSqliteViewMode(tab, tab.sqliteMode || "table");
 }
 
 function renderDataTabView(tab) {
@@ -796,6 +1030,67 @@ function renderDataTabView(tab) {
 }
 
 export function initViewers() {
+  document.querySelectorAll("#sqlite-toolbar [data-sql-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tab = activeTab();
+      if (tab?.kind === "sqlite") setSqliteViewMode(tab, btn.dataset.sqlMode);
+    });
+  });
+  document.getElementById("sqlc-source")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    const cs = ensureSqliteClusterState(tab);
+    cs.source = e.target.value;
+    cs.xCol = "";
+    cs.yCol = "";
+    cs.colorCol = "";
+    syncSqliteClusterControls(tab);
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-x")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    ensureSqliteClusterState(tab).xCol = e.target.value;
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-y")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    ensureSqliteClusterState(tab).yCol = e.target.value;
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-color")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    const cs = ensureSqliteClusterState(tab);
+    cs.colorCol = e.target.value;
+    syncSqliteClusterControls(tab);
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-algo")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    const cs = ensureSqliteClusterState(tab);
+    cs.algo = e.target.value;
+    syncSqliteClusterControls(tab);
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-k")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    ensureSqliteClusterState(tab).k = Number(e.target.value) || 4;
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-limit")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind !== "sqlite") return;
+    ensureSqliteClusterState(tab).limit = Number(e.target.value) || 1000;
+    runSqliteClusterPlot(tab);
+  });
+  document.getElementById("sqlc-plot-btn")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") runSqliteClusterPlot(tab);
+  });
   document.getElementById("sqltb-run")?.addEventListener("click", () => {
     const tab = activeTab();
     if (tab?.kind === "sqlite") runSqliteTabQuery(tab);
@@ -838,7 +1133,7 @@ export function initViewers() {
 
   document.getElementById("mdtb-save")?.addEventListener("click", () => saveActiveTab());
 
-  document.querySelectorAll(".tb-seg-btn").forEach((btn) => {
+  document.querySelectorAll("#md-toolbar .tb-seg-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const tab = activeTab();
       if (!tab || tab.kind !== "markdown") return;

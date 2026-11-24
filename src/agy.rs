@@ -53,6 +53,27 @@ fn default_lang() -> String {
     "minilang".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AgyPromptRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgyAssistResponse {
     pub ok: bool,
@@ -207,6 +228,143 @@ impl AgyRunner {
         }
 
         let (response_text, conv_id) = parse_agy_output(&stdout_raw, &stderr_raw, output.status.success())?;
+        let (suggested_code, suggested_lang) = extract_primary_code_block(&response_text);
+
+        Ok(AgyAssistResponse {
+            ok: true,
+            response: response_text,
+            suggested_code,
+            suggested_lang,
+            conversation_id: conv_id.or(req.conversation_id),
+            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
+    /// Direct general-purpose prompt to `agy --print` (used by Minilang `agy::prompt` / `ai::prompt`).
+    pub async fn prompt(&self, req: AgyPromptRequest) -> Result<AgyAssistResponse, String> {
+        let start = Instant::now();
+        let bin = self.bin_path.as_ref().ok_or_else(|| {
+            "Google Antigravity CLI (`agy`) was not found. Install `agy` or pass `--agy-bin /path/to/agy`."
+                .to_string()
+        })?;
+
+        let full_prompt = match req.system.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sys) => format!("System instructions:\n{}\n\n{}", sys, req.prompt.trim()),
+            None => req.prompt.trim().to_string(),
+        };
+        let timeout_secs = req
+            .timeout_secs
+            .unwrap_or(self.timeout_secs)
+            .clamp(5, 600);
+        let mode = req
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("plan");
+        let req_id = req
+            .request_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("--print")
+            .arg(full_prompt)
+            .arg("--output-format")
+            .arg("json")
+            .arg("--disable-slash-commands")
+            .arg("--mode")
+            .arg(mode)
+            .arg("--print-timeout")
+            .arg(format!("{}s", timeout_secs))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(conv_id) = req
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cmd.arg("--conversation").arg(conv_id);
+        }
+        if let Some(model) = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(self.default_model.as_deref())
+        {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(effort) = req
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| matches!(*s, "low" | "medium" | "high" | "xhigh" | "max"))
+        {
+            cmd.arg("--effort").arg(effort);
+        }
+
+        let work_dir = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.workspace_root.clone());
+        if work_dir.is_dir() {
+            cmd.current_dir(&work_dir);
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to launch agy ({}): {}", bin.display(), e))?;
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        {
+            let mut map = self.inflight.lock().await;
+            map.insert(req_id.clone(), cancel_tx);
+        }
+
+        let wait_fut = child.wait_with_output();
+        let timeout_dur = Duration::from_secs(timeout_secs + 5);
+
+        let result = tokio::select! {
+            _ = cancel_rx => {
+                Err("Request cancelled by user".to_string())
+            }
+            res = tokio::time::timeout(timeout_dur, wait_fut) => {
+                match res {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(e)) => Err(format!("agy process failed: {}", e)),
+                    Err(_) => Err(format!("agy timed out after {} seconds", timeout_secs)),
+                }
+            }
+        };
+
+        {
+            let mut map = self.inflight.lock().await;
+            map.remove(&req_id);
+        }
+
+        let output = result?;
+        let stdout_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if !output.status.success() && stdout_raw.is_empty() {
+            let msg = if !stderr_raw.is_empty() {
+                stderr_raw
+            } else {
+                format!("agy exited with status {}", output.status)
+            };
+            return Err(msg);
+        }
+
+        let (response_text, conv_id) =
+            parse_agy_output(&stdout_raw, &stderr_raw, output.status.success())?;
         let (suggested_code, suggested_lang) = extract_primary_code_block(&response_text);
 
         Ok(AgyAssistResponse {

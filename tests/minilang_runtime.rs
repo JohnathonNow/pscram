@@ -332,4 +332,120 @@ println("chunk B")
     assert!(txt.contains("application/vnd.minilang.table+json") && txt.contains("Metrics"), "{}", txt);
     assert!(txt.contains("application/vnd.minilang.chart+json") && txt.contains("Trend"), "{}", txt);
     assert!(txt.contains("event:result") && txt.contains("\"done\""), "{}", txt);
+
+    // SQLite Cluster Graph API: scalar 2D + string color grouping, multidimensional JSON & BLOB vectors (PCA, t-SNE, K-Means+PCA, Per-Col PCA), continuous colors, and full row payloads
+    let seed_cluster = r#"
+let cdb := db::open("clusters.sqlite")
+cdb:exec("CREATE TABLE embeddings (id INTEGER PRIMARY KEY, label TEXT, category TEXT, metric REAL, x REAL, y REAL, vec_json TEXT, vec_y TEXT, vec_blob BLOB)")
+cdb:begin
+for i in 1 .. 24 do
+    let grp := if i <= 8 then "alpha" elseif i <= 16 then "beta" else "gamma" end
+    let base := if i <= 8 then 10.0 elseif i <= 16 then 50.0 else 90.0 end
+    let vx := base + (i % 5) * 1.1
+    let vy := base * 0.5 + (i % 4) * 1.3
+    let jv := '[{vx}, {vy}, {vx * 0.3 + 2.0}, {vy * 0.7 - 1.0}, {base * 0.2}]'
+    let jvy := '[{vy}, {vx * 0.4}, {base * 0.1 + i}]'
+    cdb:exec(
+        "INSERT INTO embeddings (id, label, category, metric, x, y, vec_json, vec_y, vec_blob) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [i, 'row-{i}', (if i = 24 then nil else grp end), i * 1.5, vx, vy, jv, jvy, nil]
+    )
+end
+cdb:commit
+cdb:close
+"seeded"
+"#;
+    let sc_res = srv.eval("ml-db", seed_cluster);
+    assert!(sc_res["error"].is_null(), "seed cluster db error: {:?}", sc_res["error"]);
+
+    // 1. Direct 2 scalar columns + arbitrary string color column (with NULL)
+    let cl_direct = srv.post_json(
+        "/api/sqlite/cluster",
+        &json!({
+            "path": "clusters.sqlite",
+            "table": "embeddings",
+            "x_col": "x",
+            "y_col": "y",
+            "color_col": "category",
+            "algorithm": "auto"
+        }),
+    );
+    assert_eq!(cl_direct.status, 200, "{}", cl_direct.text());
+    let jd = cl_direct.json();
+    assert_eq!(jd["algorithm_used"], "direct");
+    assert_eq!(jd["points"].as_array().unwrap().len(), 24);
+    assert_eq!(jd["rows"].as_array().unwrap().len(), 24);
+    assert_eq!(jd["columns"].as_array().unwrap().len(), 9);
+    assert_eq!(jd["color"]["mode"], "categorical");
+    let cats = jd["color"]["categories"].as_array().unwrap();
+    assert!(cats.iter().any(|c| c["label"] == "alpha"));
+    assert!(cats.iter().any(|c| c["label"] == "beta"));
+    assert!(cats.iter().any(|c| c["label"] == "(NULL)"));
+
+    // 2. Multidimensional JSON vectors with Auto -> PCA 2D & continuous numeric color column
+    let cl_pca = srv.post_json(
+        "/api/sqlite/cluster",
+        &json!({
+            "path": "clusters.sqlite",
+            "table": "embeddings",
+            "x_col": "vec_json",
+            "y_col": "vec_y",
+            "color_col": "metric",
+            "algorithm": "auto"
+        }),
+    );
+    assert_eq!(cl_pca.status, 200, "{}", cl_pca.text());
+    let jp = cl_pca.json();
+    assert_eq!(jp["algorithm_used"], "pca");
+    assert_eq!(jp["x_dim"], 5);
+    assert_eq!(jp["y_dim"], 3);
+    assert_eq!(jp["total_dim"], 8);
+    assert_eq!(jp["color"]["mode"], "continuous");
+    assert!(jp["explained_variance"].is_array());
+
+    // 3. K-Means + PCA clustering on single multidimensional embedding column
+    let cl_km = srv.post_json(
+        "/api/sqlite/cluster",
+        &json!({
+            "path": "clusters.sqlite",
+            "table": "embeddings",
+            "x_col": "vec_json",
+            "y_col": "__same__",
+            "color_col": "__cluster__",
+            "algorithm": "kmeans_pca",
+            "k": 3
+        }),
+    );
+    assert_eq!(cl_km.status, 200, "{}", cl_km.text());
+    let jk = cl_km.json();
+    assert_eq!(jk["algorithm_used"], "kmeans_pca");
+    assert_eq!(jk["color"]["mode"], "cluster");
+    assert_eq!(jk["centroids"].as_array().unwrap().len(), 3);
+
+    // 4. t-SNE 2D & Per-Column PCA
+    let cl_tsne = srv.post_json(
+        "/api/sqlite/cluster",
+        &json!({
+            "path": "clusters.sqlite",
+            "table": "embeddings",
+            "x_col": "vec_json",
+            "color_col": "category",
+            "algorithm": "tsne"
+        }),
+    );
+    assert_eq!(cl_tsne.status, 200, "{}", cl_tsne.text());
+    assert_eq!(cl_tsne.json()["algorithm_used"], "tsne");
+
+    let cl_per = srv.post_json(
+        "/api/sqlite/cluster",
+        &json!({
+            "path": "clusters.sqlite",
+            "table": "embeddings",
+            "x_col": "vec_json",
+            "y_col": "vec_y",
+            "color_col": "category",
+            "algorithm": "per_col_pca"
+        }),
+    );
+    assert_eq!(cl_per.status, 200, "{}", cl_per.text());
+    assert_eq!(cl_per.json()["algorithm_used"], "per_col_pca");
 }

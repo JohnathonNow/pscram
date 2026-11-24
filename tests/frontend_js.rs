@@ -6,6 +6,7 @@ use std::process::Command;
 const EXPECTED_JS_MODULES: &[&str] = &[
     "web/js/main.js",
     "web/js/viz/viz.js",
+    "web/js/viz/cluster.js",
     "web/js/minijs/index.js",
     "web/js/minijs/values.js",
     "web/js/minijs/widgets.js",

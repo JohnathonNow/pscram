@@ -403,6 +403,11 @@
         <!-- SQLite Browser Toolbar -->
         <div id="sqlite-toolbar" class="editor-toolbar hidden">
           <div class="toolbar-group">
+            <div class="tb-segmented" role="group" aria-label="SQLite view mode">
+              <button id="sqltb-mode-table" type="button" class="tb-seg-btn active" data-sql-mode="table">Table</button>
+              <button id="sqltb-mode-cluster" type="button" class="tb-seg-btn" data-sql-mode="cluster">Cluster Graph</button>
+            </div>
+            <span class="tb-sep"></span>
             <button id="sqltb-run" class="tb-btn primary" title="Execute SQL Query (Ctrl+Enter)">Run SQL</button>
             <button id="sqltb-refresh" class="tb-btn" title="Reload Schema">Refresh Schema</button>
             <label class="tb-check-label" title="Allow INSERT/UPDATE/DELETE/CREATE statements">
@@ -558,11 +563,59 @@
             <div id="sqlite-schema-list" class="sqlite-schema-list"></div>
           </aside>
           <section class="sqlite-query-pane">
-            <div class="sqlite-editor-wrap">
+            <div id="sqlite-editor-wrap" class="sqlite-editor-wrap">
               <textarea id="sqlite-sql-input" class="sqlite-sql-editor" spellcheck="false" placeholder="SELECT * FROM ... LIMIT 100;  (Ctrl+Enter to execute)"></textarea>
             </div>
             <div id="sqlite-results-body" class="sqlite-results-body">
               <div class="log-empty">Select a table on the left or run a SQL query above.</div>
+            </div>
+            <div id="sqlite-cluster-pane" class="sqlite-cluster-pane hidden">
+              <div class="sqlite-cluster-controls">
+                <label class="sqlc-field">
+                  <span>Source</span>
+                  <select id="sqlc-source" class="tb-lang-select"></select>
+                </label>
+                <label class="sqlc-field">
+                  <span>X Column</span>
+                  <select id="sqlc-x" class="tb-lang-select"></select>
+                </label>
+                <label class="sqlc-field">
+                  <span>Y Column</span>
+                  <select id="sqlc-y" class="tb-lang-select"></select>
+                </label>
+                <label class="sqlc-field">
+                  <span>Color</span>
+                  <select id="sqlc-color" class="tb-lang-select"></select>
+                </label>
+                <label class="sqlc-field">
+                  <span>Algorithm</span>
+                  <select id="sqlc-algo" class="tb-lang-select">
+                    <option value="auto">Auto (Direct / PCA)</option>
+                    <option value="direct">Direct (X vs Y)</option>
+                    <option value="pca">PCA (2D)</option>
+                    <option value="tsne">t-SNE (2D)</option>
+                    <option value="kmeans_pca">K-Means + PCA</option>
+                    <option value="per_col_pca">Per-Column PCA (1D X, 1D Y)</option>
+                  </select>
+                </label>
+                <label id="sqlc-k-wrap" class="sqlc-field hidden">
+                  <span>K</span>
+                  <input id="sqlc-k" type="number" class="sqlc-num-input" min="2" max="16" value="4" />
+                </label>
+                <label class="sqlc-field">
+                  <span>Rows</span>
+                  <select id="sqlc-limit" class="tb-lang-select">
+                    <option value="500">500</option>
+                    <option value="1000" selected>1,000</option>
+                    <option value="2500">2,500</option>
+                    <option value="5000">5,000</option>
+                  </select>
+                </label>
+                <button id="sqlc-plot-btn" type="button" class="tb-btn primary">Plot</button>
+              </div>
+              <div id="sqlc-graph-host" class="sqlite-cluster-host">
+                <div class="log-empty">Choose columns above and click Plot to generate a cluster graph.</div>
+              </div>
             </div>
           </section>
         </div>

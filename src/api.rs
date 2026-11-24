@@ -1,4 +1,4 @@
-use crate::agy::{AgyAssistRequest, AgyRunner};
+use crate::agy::{AgyAssistRequest, AgyPromptRequest, AgyRunner};
 use crate::auth::{self, AuthManager, AuthenticatedUser};
 use crate::debugger::{DebugManager, StartDebugRequest};
 use crate::files::FileStore;
@@ -37,6 +37,7 @@ const EMBED_STYLE_CSS: &str = include_str!("../web/style.css");
 const EMBED_JS_MODULES: &[(&str, &str)] = &[
     ("main.js", include_str!("../web/js/main.js")),
     ("viz/viz.js", include_str!("../web/js/viz/viz.js")),
+    ("viz/cluster.js", include_str!("../web/js/viz/cluster.js")),
     ("minijs/index.js", include_str!("../web/js/minijs/index.js")),
     ("minijs/values.js", include_str!("../web/js/minijs/values.js")),
     ("minijs/widgets.js", include_str!("../web/js/minijs/widgets.js")),
@@ -107,6 +108,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/log", get(api_read_log))
         .route("/api/sqlite/schema", get(api_sqlite_schema))
         .route("/api/sqlite/query", post(api_sqlite_query))
+        .route("/api/sqlite/cluster", post(api_sqlite_cluster))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
         .route("/api/file/copy", post(api_copy_file))
@@ -164,9 +166,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/debug/:id/config", post(api_debug_config))
         .route("/api/debug/:id/locals", get(api_debug_locals))
         .route("/api/debug/:id/eval", post(api_debug_eval))
-        // Google Antigravity (agy) inline assistant API
+        // Google Antigravity (agy) inline assistant & direct prompt API
         .route("/api/agy/status", get(api_agy_status))
         .route("/api/agy/assist", post(api_agy_assist))
+        .route("/api/agy/prompt", post(api_agy_prompt))
         .route("/api/agy/cancel", post(api_agy_cancel))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
@@ -1456,6 +1459,19 @@ async fn api_agy_assist(
     }
 }
 
+async fn api_agy_prompt(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AgyPromptRequest>,
+) -> Response {
+    if req.prompt.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "Prompt cannot be empty");
+    }
+    match st.agy.prompt(req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => api_err(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
 #[derive(Deserialize)]
 struct AgyCancelBody {
     request_id: String,
@@ -1775,6 +1791,25 @@ async fn api_sqlite_query(
         .to_string_lossy()
         .replace('\\', "/");
     match crate::sqlite_reader::run_query(&abs, &rel, &body.sql, body.limit, !body.allow_write) {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_sqlite_cluster(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<crate::cluster::SqliteClusterRequest>,
+) -> Response {
+    let abs = match st.files.resolve_existing(&body.path) {
+        Ok(p) => p,
+        Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+    };
+    let rel = abs
+        .strip_prefix(st.files.root())
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    match crate::sqlite_reader::compute_cluster(&abs, &rel, &body) {
         Ok(res) => Json(res).into_response(),
         Err(e) => api_err(StatusCode::BAD_REQUEST, e),
     }

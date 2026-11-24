@@ -286,6 +286,88 @@ impl DbGuard {
         unsafe { (self.api.finalize)(stmt) };
         Ok((columns, rows, truncated))
     }
+
+    fn query_raw_cells(
+        &self,
+        sql: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, Vec<Vec<crate::cluster::RawCell>>, bool), String> {
+        use crate::cluster::RawCell;
+        let c_sql = CString::new(sql.replace('\0', "")).map_err(|_| "Invalid SQL".to_string())?;
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.api.prepare_v2)(self.db, c_sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+        };
+        if rc != SQLITE_OK || stmt.is_null() {
+            return Err(self.errmsg());
+        }
+
+        let col_count = unsafe { (self.api.column_count)(stmt) };
+        let mut columns = Vec::with_capacity(col_count.max(0) as usize);
+        for i in 0..col_count {
+            let name = unsafe {
+                let p = (self.api.column_name)(stmt, i);
+                if p.is_null() {
+                    format!("col_{}", i + 1)
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            columns.push(name);
+        }
+
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        loop {
+            let step_rc = unsafe { (self.api.step)(stmt) };
+            if step_rc == SQLITE_ROW {
+                if rows.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let mut row = Vec::with_capacity(columns.len());
+                for i in 0..col_count {
+                    let ty = unsafe { (self.api.column_type)(stmt, i) };
+                    let cell = match ty {
+                        SQLITE_NULL => RawCell::Null,
+                        SQLITE_INTEGER => RawCell::Int(unsafe { (self.api.column_int64)(stmt, i) }),
+                        SQLITE_FLOAT => RawCell::Float(unsafe { (self.api.column_double)(stmt, i) }),
+                        SQLITE_TEXT => unsafe {
+                            let ptr = (self.api.column_text)(stmt, i);
+                            let len = (self.api.column_bytes)(stmt, i).max(0) as usize;
+                            if ptr.is_null() || len == 0 {
+                                RawCell::Text(String::new())
+                            } else {
+                                let slice = std::slice::from_raw_parts(ptr, len);
+                                RawCell::Text(String::from_utf8_lossy(slice).into_owned())
+                            }
+                        },
+                        SQLITE_BLOB => unsafe {
+                            let ptr = (self.api.column_blob)(stmt, i);
+                            let len = (self.api.column_bytes)(stmt, i).max(0) as usize;
+                            if ptr.is_null() || len == 0 {
+                                RawCell::Blob(Vec::new())
+                            } else {
+                                let slice = std::slice::from_raw_parts(ptr, len);
+                                RawCell::Blob(slice.to_vec())
+                            }
+                        },
+                        _ => RawCell::Null,
+                    };
+                    row.push(cell);
+                }
+                rows.push(row);
+            } else if step_rc == SQLITE_DONE {
+                break;
+            } else {
+                let err = self.errmsg();
+                unsafe { (self.api.finalize)(stmt) };
+                return Err(err);
+            }
+        }
+        unsafe { (self.api.finalize)(stmt) };
+        Ok((columns, rows, truncated))
+    }
 }
 
 impl Drop for DbGuard {
@@ -388,6 +470,27 @@ pub fn run_query(
         changes,
         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+pub fn compute_cluster(
+    abs: &Path,
+    rel_path: &str,
+    req: &crate::cluster::SqliteClusterRequest,
+) -> Result<crate::cluster::SqliteClusterResponse, String> {
+    let start = Instant::now();
+    let guard = DbGuard::open(abs, true)?;
+    let clamped = req.limit.clamp(1, 5000);
+
+    let (sql, source_label) = if let Some(custom) = req.sql.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        (custom.to_string(), "SQL Query".to_string())
+    } else if let Some(tbl) = req.table.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        (format!("SELECT * FROM {}", quote_ident(tbl)), tbl.to_string())
+    } else {
+        return Err("Either 'table' or 'sql' must be provided".to_string());
+    };
+
+    let (columns, raw_rows, truncated) = guard.query_raw_cells(&sql, clamped)?;
+    crate::cluster::build_cluster_response(rel_path, source_label, columns, raw_rows, truncated, req, start)
 }
 
 #[cfg(test)]

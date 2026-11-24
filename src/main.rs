@@ -1,6 +1,7 @@
 mod agy;
 mod api;
 mod auth;
+mod cluster;
 mod debug_worker;
 mod debugger;
 mod files;

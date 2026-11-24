@@ -1,7 +1,9 @@
 /**
- * Shared Interactive Visualization Engine (Sortable/Filterable Tables, SVG Charts, CSV/TSV Parser).
+ * Shared Interactive Visualization Engine (Sortable/Filterable Tables, SVG Charts, CSV/TSV Parser, Cluster Graphs).
  * Exposed as ES module exports and attached to `window.MlnbViz` for compatibility.
  */
+
+import { mountClusterGraph } from "./cluster.js";
 
 // =========================================================================
 // Shared Interactive Visualization Engine (Tables, Charts, CSV Parser)
@@ -280,6 +282,9 @@ function mountChart(container, inputSpec) {
   }
   spec = spec || {};
   const type = String(spec.type || "line").toLowerCase();
+  if (type === "cluster") {
+    return mountClusterGraph(container, spec, { height: 380 });
+  }
   const colors = Array.isArray(spec.colors) && spec.colors.length ? spec.colors : CHART_PALETTE;
 
   const card = document.createElement("div");
@@ -567,8 +572,8 @@ function mountChart(container, inputSpec) {
   return card;
 }
 
-export { parseCsv, coerceCell, normalizeTablePayload, mountTable, mountChart };
-export const MlnbViz = { parseCsv, normalizeTablePayload, mountTable, mountChart };
+export { parseCsv, coerceCell, normalizeTablePayload, mountTable, mountChart, mountClusterGraph };
+export const MlnbViz = { parseCsv, normalizeTablePayload, mountTable, mountChart, mountClusterGraph };
 
 if (typeof window !== "undefined") {
   window.MlnbViz = MlnbViz;
