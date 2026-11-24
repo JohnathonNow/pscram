@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex};
 
@@ -156,7 +155,7 @@ impl AgyRunner {
             cmd.current_dir(&self.workspace_root);
         }
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to launch agy ({}): {}", bin.display(), e))?;
 

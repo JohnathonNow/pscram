@@ -1492,6 +1492,7 @@
         action: () => copyTextToClipboard(entry.name, `Copied name: ${entry.name}`),
       });
       items.push({ sep: true });
+      items.push({ label: "Download as ZIP", icon: CTX_ICONS.download, action: () => downloadFolderZip(entry.path) });
       items.push({ label: "Rename", icon: CTX_ICONS.rename, action: () => renameFileEntry(entry.path) });
       items.push({ label: "Delete", icon: CTX_ICONS.trash, danger: true, action: () => deleteFileEntry(entry.path) });
     } else if (entry) {
@@ -1511,6 +1512,11 @@
           label: "Open as Notebook",
           icon: CTX_ICONS.open,
           action: () => openEntryAsNotebook(entry),
+        });
+        items.push({
+          label: "Schedule Script...",
+          icon: CTX_ICONS.refresh,
+          action: () => openSchedulesModal(entry.path),
         });
       }
       items.push({ sep: true });
@@ -1574,6 +1580,8 @@
         action: () => copyTextToClipboard(buildAbsolutePath(curDir), "Copied absolute path"),
       });
       items.push({ sep: true });
+      items.push({ label: "Upload Files...", icon: CTX_ICONS.plus, action: () => document.getElementById("file-upload-input")?.click() });
+      items.push({ label: "Download Folder as ZIP", icon: CTX_ICONS.download, action: () => downloadFolderZip(curDir) });
       items.push({ label: "Refresh", icon: CTX_ICONS.refresh, action: () => loadDirectory() });
     }
 
@@ -1708,6 +1716,43 @@
           logLimit: 200,
           logLive: false,
           logData: null,
+        };
+        state.tabs.push(tab);
+        activateTab(tab.id);
+        renderFileList(state.dirEntries, !!state.searchQuery);
+        return;
+      }
+      if (file.is_sqlite) {
+        const tab = {
+          id: uid(),
+          kind: "sqlite",
+          path: file.path,
+          title: file.name,
+          dirty: false,
+          kernelId: null,
+          extension: file.extension,
+          size: file.size,
+          sqliteSchema: null,
+          sqliteSql: "",
+          sqliteResult: null,
+          sqliteAllowWrite: false,
+        };
+        state.tabs.push(tab);
+        activateTab(tab.id);
+        renderFileList(state.dirEntries, !!state.searchQuery);
+        return;
+      }
+      if (file.is_tabular) {
+        const tab = {
+          id: uid(),
+          kind: "data",
+          path: file.path,
+          title: file.name,
+          dirty: false,
+          kernelId: null,
+          extension: file.extension,
+          size: file.size,
+          content: file.content || "",
         };
         state.tabs.push(tab);
         activateTab(tab.id);
@@ -2045,11 +2090,15 @@
     const mediaToolbar = document.getElementById("media-toolbar");
     const mdToolbar = document.getElementById("md-toolbar");
     const logToolbar = document.getElementById("log-toolbar");
+    const sqliteToolbar = document.getElementById("sqlite-toolbar");
+    const dataToolbar = document.getElementById("data-toolbar");
     const nbView = document.getElementById("notebook-view");
     const fileView = document.getElementById("file-view");
     const mediaView = document.getElementById("media-view");
     const mdView = document.getElementById("markdown-view");
     const logView = document.getElementById("log-view");
+    const sqliteView = document.getElementById("sqlite-view");
+    const dataView = document.getElementById("data-view");
 
     if (!tab) return;
     syncLogLiveTimer(tab);
@@ -2059,12 +2108,16 @@
     mediaToolbar.classList.toggle("hidden", tab.kind !== "media");
     mdToolbar.classList.toggle("hidden", tab.kind !== "markdown");
     logToolbar.classList.toggle("hidden", tab.kind !== "log");
+    sqliteToolbar.classList.toggle("hidden", tab.kind !== "sqlite");
+    dataToolbar.classList.toggle("hidden", tab.kind !== "data");
 
     nbView.classList.toggle("hidden", tab.kind !== "notebook");
     fileView.classList.toggle("hidden", tab.kind !== "file");
     mediaView.classList.toggle("hidden", tab.kind !== "media");
     mdView.classList.toggle("hidden", tab.kind !== "markdown");
     logView.classList.toggle("hidden", tab.kind !== "log");
+    sqliteView.classList.toggle("hidden", tab.kind !== "sqlite");
+    dataView.classList.toggle("hidden", tab.kind !== "data");
 
     if (tab.kind === "notebook") {
       const langSel = document.getElementById("tb-lang-select");
@@ -2073,6 +2126,10 @@
       const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
       document.getElementById("tb-export-mini").querySelector("span").textContent = `Export .${ext}`;
       renderCells();
+    } else if (tab.kind === "sqlite") {
+      renderSqliteTabView(tab);
+    } else if (tab.kind === "data") {
+      renderDataTabView(tab);
     } else if (tab.kind === "markdown") {
       renderMarkdownTabView(tab);
     } else if (tab.kind === "log") {
@@ -2184,12 +2241,39 @@
         </div>`;
     }
 
+    // 0. live streaming status indicator (e.g. Compiling with Cargo...)
+    if (output._streamStatus) {
+      rows += `
+        <div class="output-row">
+          <div class="output-gutter"></div>
+          <div class="output-body"><div class="ml-stream-status"><span class="status-dot busy"></span>${escapeHtml(output._streamStatus)}</div></div>
+        </div>`;
+    }
+
     // 2. rich displays
     if (Array.isArray(output.displays)) {
       output.displays.forEach((d, idx) => {
         let rendered = "";
         if (d.mime === "application/vnd.minilang.ui+json") {
           rendered = `<div class="mlui-mount-slot" data-ui-idx="${idx}"></div>`;
+        } else if (d.mime === "application/vnd.minilang.table+json") {
+          rendered = `<div class="ml-table-mount-slot" data-viz-idx="${idx}"></div>`;
+        } else if (d.mime === "application/vnd.minilang.chart+json") {
+          rendered = `<div class="ml-chart-mount-slot" data-viz-idx="${idx}"></div>`;
+        } else if (d.mime === "application/vnd.minilang.progress+json") {
+          try {
+            const p = JSON.parse(d.data);
+            const pct = Math.max(0, Math.min(100, Number(p.percent ?? 0)));
+            const label = p.label ? escapeHtml(p.label) : "Progress";
+            const ratio = p.total != null ? `${p.done ?? 0} / ${p.total}` : `${pct.toFixed(0)}%`;
+            rendered = `
+              <div class="ml-progress-card">
+                <div class="ml-progress-head"><span>${label}</span><span>${escapeHtml(ratio)} (${pct.toFixed(0)}%)</span></div>
+                <div class="ml-progress-track"><div class="ml-progress-fill" style="width:${pct}%"></div></div>
+              </div>`;
+          } catch {
+            rendered = `<pre class="output-stdout">${escapeHtml(d.data)}</pre>`;
+          }
         } else if (d.mime === "application/vnd.minilang.media+json") {
           try {
             const info = JSON.parse(d.data);
@@ -2314,6 +2398,7 @@
   function buildCellElement(tab, cell) {
     const el = document.createElement("div");
     const hasOutput = !!(cell.output && (
+      cell.output._streamStatus ||
       cell.output.stdout ||
       (cell.output.displays && cell.output.displays.length) ||
       (cell.output.results && cell.output.results.length) ||
@@ -2497,14 +2582,32 @@
   }
 
   function hydrateUiDisplays(container, output) {
-    if (!output || !Array.isArray(output.displays) || !window.MinijsUI) return;
-    container.querySelectorAll(".mlui-mount-slot").forEach((slot) => {
-      const idx = Number(slot.dataset.uiIdx);
-      const item = output.displays[idx];
-      if (item && item.mime === "application/vnd.minilang.ui+json") {
-        window.MinijsUI.mount(slot, item.data);
-      }
-    });
+    if (!output || !Array.isArray(output.displays)) return;
+    if (window.MinijsUI) {
+      container.querySelectorAll(".mlui-mount-slot").forEach((slot) => {
+        const idx = Number(slot.dataset.uiIdx);
+        const item = output.displays[idx];
+        if (item && item.mime === "application/vnd.minilang.ui+json") {
+          window.MinijsUI.mount(slot, item.data);
+        }
+      });
+    }
+    if (window.MlnbViz) {
+      container.querySelectorAll(".ml-table-mount-slot").forEach((slot) => {
+        const idx = Number(slot.dataset.vizIdx);
+        const item = output.displays[idx];
+        if (item && item.mime === "application/vnd.minilang.table+json") {
+          window.MlnbViz.mountTable(slot, item.data);
+        }
+      });
+      container.querySelectorAll(".ml-chart-mount-slot").forEach((slot) => {
+        const idx = Number(slot.dataset.vizIdx);
+        const item = output.displays[idx];
+        if (item && item.mime === "application/vnd.minilang.chart+json") {
+          window.MlnbViz.mountChart(slot, item.data);
+        }
+      });
+    }
   }
 
   function updateSingleCellDom(tab, cellId) {
@@ -2778,7 +2881,7 @@
     }
   });
 
-  // --- Execution & Kernel Controls ---
+  // --- Execution & Kernel Controls (SSE Live Streaming) ---
   async function runCell(cellId, advance = false) {
     const tab = activeTab();
     if (!tab || tab.kind !== "notebook") return;
@@ -2798,44 +2901,130 @@
     }
 
     cell._running = true;
+    cell.output = {
+      stdout: "",
+      displays: [],
+      results: [],
+      error: null,
+      _streamStatus: "Running...",
+    };
     updateSingleCellDom(tab, cell.id);
     setKernelIndicator("busy", "Running...");
 
+    const updateLiveProgress = (prog) => {
+      const id = prog.id || "default";
+      const serialized = JSON.stringify(prog);
+      const existing = cell.output.displays.find((d) => {
+        if (d.mime !== "application/vnd.minilang.progress+json") return false;
+        try { return (JSON.parse(d.data).id || "default") === id; } catch { return false; }
+      });
+      if (existing) existing.data = serialized;
+      else cell.output.displays.push({ mime: "application/vnd.minilang.progress+json", data: serialized });
+    };
+
     try {
-      const resp = await api(`/api/kernels/${encodeURIComponent(tab.kernelId)}/execute`, {
+      const res = await authFetch(`/api/kernels/${encodeURIComponent(tab.kernelId)}/execute-stream`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: cell.source }),
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${res.status}`);
+      }
+
+      let finalResp = null;
+      if (res.body && res.body.getReader) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let lastRender = 0;
+
+        const scheduleLiveRender = (force = false) => {
+          const now = performance.now();
+          if (force || now - lastRender >= 60) {
+            lastRender = now;
+            if (activeTab()?.id === tab.id) updateSingleCellDom(tab, cell.id);
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+
+          for (const frame of frames) {
+            let evName = "message";
+            const dataLines = [];
+            for (const line of frame.split("\n")) {
+              if (line.startsWith("event:")) evName = line.slice(6).trim();
+              else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+            }
+            if (!dataLines.length) continue;
+            const raw = dataLines.join("\n");
+            let payload;
+            try { payload = JSON.parse(raw); } catch { continue; }
+
+            if (evName === "stdout" && typeof payload.text === "string") {
+              cell.output._streamStatus = null;
+              cell.output.stdout += payload.text;
+              scheduleLiveRender();
+            } else if (evName === "status" && typeof payload.text === "string") {
+              cell.output._streamStatus = payload.text;
+              setKernelIndicator("busy", payload.text);
+              scheduleLiveRender(true);
+            } else if (evName === "progress") {
+              cell.output._streamStatus = null;
+              updateLiveProgress(payload);
+              scheduleLiveRender(true);
+            } else if (evName === "display" && payload.mime) {
+              cell.output._streamStatus = null;
+              cell.output.displays.push({ mime: payload.mime, data: payload.data || "" });
+              scheduleLiveRender(true);
+            } else if (evName === "result") {
+              finalResp = payload;
+            } else if (evName === "error") {
+              throw new Error(payload.error || "Kernel stream error");
+            }
+          }
+        }
+      }
 
       cell._running = false;
-      if (resp.type === "eval_result") {
-        cell.execution_count = resp.execution_count;
+      if (finalResp && finalResp.type === "eval_result") {
+        cell.execution_count = finalResp.execution_count;
         cell.output = {
-          stdout: resp.stdout || "",
-          displays: resp.displays || [],
-          results: resp.results || [],
-          error: resp.error || null,
-          duration_ms: resp.duration_ms,
+          stdout: finalResp.stdout || "",
+          displays: finalResp.displays || [],
+          results: finalResp.results || [],
+          error: finalResp.error || null,
+          duration_ms: finalResp.duration_ms,
         };
-      } else {
+      } else if (finalResp) {
         cell.output = {
           stdout: "",
           displays: [],
           results: [],
-          error: { error_type: "KernelError", message: resp.message || "Execution failed", traceback: "" },
+          error: { error_type: "KernelError", message: finalResp.message || "Execution failed", traceback: "" },
         };
+      } else {
+        delete cell.output._streamStatus;
       }
+
       markDirty(tab);
       updateSingleCellDom(tab, cell.id);
       if (advance) focusNextCell(tab, cell.id);
-      setKernelIndicator("idle", "Minilang 2.17");
+      const lname = langInfo(tab.doc.language || "minilang").name;
+      setKernelIndicator("idle", lname);
       if (state.varsOpen) refreshVariables();
       refreshKernelList();
     } catch (e) {
       cell._running = false;
       cell.output = {
-        stdout: "",
-        displays: [],
+        stdout: cell.output?.stdout || "",
+        displays: cell.output?.displays || [],
         results: [],
         error: { error_type: "KernelError", message: e.message, traceback: "" },
       };
@@ -3492,14 +3681,30 @@
 
   // Global keyboard shortcuts
   document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    const key = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "p") {
+      e.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "p") {
+      e.preventDefault();
+      openCommandPalette("");
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "f") {
+      e.preventDefault();
+      openGrepModal();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && key === "s") {
       e.preventDefault();
       saveActiveTab();
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
+    } else if ((e.ctrlKey || e.metaKey) && key === "b") {
       e.preventDefault();
       document.getElementById("sidebar").classList.toggle("hidden");
       document.getElementById("sidebar-resizer").classList.toggle("hidden");
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    } else if ((e.ctrlKey || e.metaKey) && key === "k") {
       const tab = activeTab();
       if (!tab) return;
       if (tab.kind === "notebook") {
@@ -3511,6 +3716,654 @@
         openFileAgyPanel(tab);
       }
     }
+  });
+
+  // =========================================================================
+  // Drag-and-Drop File Upload & Folder ZIP Download (#3)
+  // =========================================================================
+  async function uploadFilesToDir(fileList, targetDir = state.currentDir) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    let uploaded = 0;
+    for (const file of files) {
+      try {
+        const qs = new URLSearchParams({ dir: targetDir || "", name: file.name });
+        const res = await authFetch(`/api/file/upload?${qs}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || `HTTP ${res.status}`);
+        }
+        uploaded++;
+      } catch (err) {
+        toast(`Upload '${file.name}' failed: ${err.message}`, "error");
+      }
+    }
+    if (uploaded > 0) {
+      toast(`Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"} to ${targetDir || "/"}`, "success");
+      loadDirectory();
+    }
+  }
+
+  async function downloadFolderZip(relDir) {
+    const url = `/api/file/zip?path=${encodeURIComponent(relDir || "")}`;
+    const fname = `${(relDir ? relDir.split("/").pop() : state.rootName || "workspace")}.zip`;
+    try {
+      if (!authState.required) {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return;
+      }
+      const res = await authFetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+    } catch (err) {
+      toast(`ZIP download failed: ${err.message}`, "error");
+    }
+  }
+
+  document.getElementById("btn-upload-files")?.addEventListener("click", () => {
+    document.getElementById("file-upload-input")?.click();
+  });
+  document.getElementById("file-upload-input")?.addEventListener("change", (e) => {
+    if (e.target.files?.length) {
+      uploadFilesToDir(e.target.files, state.currentDir);
+      e.target.value = "";
+    }
+  });
+
+  const sidebarEl = document.getElementById("sidebar");
+  const dropzoneEl = document.getElementById("sidebar-dropzone");
+  let dragDepth = 0;
+  sidebarEl?.addEventListener("dragenter", (e) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragDepth++;
+    sidebarEl.classList.add("drag-over");
+    dropzoneEl?.classList.remove("hidden");
+    const lbl = document.getElementById("sidebar-dropzone-label");
+    if (lbl) lbl.textContent = `Drop files to upload to ${state.currentDir || "/"}`;
+  });
+  sidebarEl?.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+  });
+  sidebarEl?.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) {
+      sidebarEl.classList.remove("drag-over");
+      dropzoneEl?.classList.add("hidden");
+    }
+  });
+  sidebarEl?.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    dragDepth = 0;
+    sidebarEl.classList.remove("drag-over");
+    dropzoneEl?.classList.add("hidden");
+    const dirRow = e.target.closest?.(".file-row[data-kind='dir']");
+    const dest = dirRow ? dirRow.dataset.path : state.currentDir;
+    uploadFilesToDir(e.dataTransfer.files, dest);
+  });
+
+  // =========================================================================
+  // SQLite Database Browser (#5) & CSV/TSV Tabular Data Viewer (#1)
+  // =========================================================================
+  async function loadSqliteSchema(tab) {
+    try {
+      const schema = await api(`/api/sqlite/schema?path=${encodeURIComponent(tab.path)}`);
+      tab.sqliteSchema = schema;
+      if (activeTab()?.id === tab.id) renderSqliteSchema(tab);
+    } catch (err) {
+      toast(`Failed to load SQLite schema: ${err.message}`, "error");
+    }
+  }
+
+  function renderSqliteSchema(tab) {
+    const list = document.getElementById("sqlite-schema-list");
+    const meta = document.getElementById("sqltb-meta");
+    const schema = tab.sqliteSchema;
+    if (!schema) {
+      list.innerHTML = `<div class="log-empty">Loading schema...</div>`;
+      return;
+    }
+    meta.textContent = `${schema.path} · ${schema.tables.length} table${schema.tables.length === 1 ? "" : "s"} (${formatSize(schema.size)})`;
+    if (!schema.tables.length) {
+      list.innerHTML = `<div class="log-empty">No tables found.</div>`;
+      return;
+    }
+    list.innerHTML = schema.tables.map((t) => `
+      <div class="sqlite-table-item">
+        <div class="sqlite-table-head" data-sql-table="${escapeHtml(t.name)}" title="Click to preview rows">
+          <span>${escapeHtml(t.name)}</span>
+          <span class="tb-meta">${t.row_count != null ? t.row_count : "view"}</span>
+        </div>
+        <div class="sqlite-col-list">
+          ${(t.columns || []).map((c) => `
+            <div class="sqlite-col-row">
+              <span>${c.pk ? "🔑 " : ""}${escapeHtml(c.name)}</span>
+              <span style="color:var(--text-muted)">${escapeHtml(c.col_type || "ANY")}</span>
+            </div>`).join("")}
+        </div>
+      </div>`).join("");
+
+    list.querySelectorAll(".sqlite-table-head").forEach((hdr) => {
+      hdr.onclick = () => {
+        const tbl = hdr.dataset.sqlTable;
+        const quoted = `"${tbl.replace(/"/g, '""')}"`;
+        tab.sqliteSql = `SELECT * FROM ${quoted} LIMIT 100;`;
+        document.getElementById("sqlite-sql-input").value = tab.sqliteSql;
+        runSqliteTabQuery(tab);
+      };
+    });
+  }
+
+  async function runSqliteTabQuery(tab) {
+    const sqlEl = document.getElementById("sqlite-sql-input");
+    const sql = (sqlEl.value || tab.sqliteSql || "").trim();
+    tab.sqliteSql = sql;
+    if (!sql) return;
+    const body = document.getElementById("sqlite-results-body");
+    body.innerHTML = `<div class="log-empty">Running SQL...</div>`;
+    try {
+      const res = await api("/api/sqlite/query", {
+        method: "POST",
+        body: JSON.stringify({
+          path: tab.path,
+          sql,
+          limit: 500,
+          allow_write: !!tab.sqliteAllowWrite,
+        }),
+      });
+      tab.sqliteResult = res;
+      renderSqliteResult(tab);
+      if (tab.sqliteAllowWrite && res.changes > 0) loadSqliteSchema(tab);
+    } catch (err) {
+      body.innerHTML = `<div class="output-error"><div class="output-error-title">SQLite Error</div><pre class="output-error-tb">${escapeHtml(err.message)}</pre></div>`;
+    }
+  }
+
+  function renderSqliteResult(tab) {
+    const body = document.getElementById("sqlite-results-body");
+    const res = tab.sqliteResult;
+    if (!res) {
+      body.innerHTML = `<div class="log-empty">Select a table on the left or run a SQL query above.</div>`;
+      return;
+    }
+    body.innerHTML = "";
+    if (!res.columns.length) {
+      body.innerHTML = `<div class="log-empty">Statement succeeded (${res.changes} row${res.changes === 1 ? "" : "s"} affected · ${res.duration_ms.toFixed(1)} ms)</div>`;
+      return;
+    }
+    const title = `${res.row_count} row${res.row_count === 1 ? "" : "s"}${res.truncated ? " (truncated)" : ""} · ${res.duration_ms.toFixed(1)} ms`;
+    window.MlnbViz?.mountTable(body, { title, columns: res.columns, rows: res.rows });
+  }
+
+  function renderSqliteTabView(tab) {
+    document.getElementById("sqlite-sql-input").value = tab.sqliteSql || "";
+    document.getElementById("sqltb-allow-write").checked = !!tab.sqliteAllowWrite;
+    if (!tab.sqliteSchema) loadSqliteSchema(tab);
+    else renderSqliteSchema(tab);
+    renderSqliteResult(tab);
+  }
+
+  document.getElementById("sqltb-run")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") runSqliteTabQuery(tab);
+  });
+  document.getElementById("sqltb-refresh")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") loadSqliteSchema(tab);
+  });
+  document.getElementById("sqltb-allow-write")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") tab.sqliteAllowWrite = e.target.checked;
+  });
+  document.getElementById("sqltb-download")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") downloadFileEntry(tab.path);
+  });
+  document.getElementById("sqlite-sql-input")?.addEventListener("input", (e) => {
+    const tab = activeTab();
+    if (tab?.kind === "sqlite") tab.sqliteSql = e.target.value;
+  });
+  document.getElementById("sqlite-sql-input")?.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      const tab = activeTab();
+      if (tab?.kind === "sqlite") runSqliteTabQuery(tab);
+    }
+  });
+
+  function renderDataTabView(tab) {
+    const host = document.getElementById("data-table-host");
+    const meta = document.getElementById("dtb-meta");
+    host.innerHTML = "";
+    const parsed = window.MlnbViz?.parseCsv(tab.content || "", tab.extension === "tsv" ? "\t" : null) || { columns: [], rows: [] };
+    meta.textContent = `${tab.path} · ${parsed.rows.length} rows × ${parsed.columns.length} cols (${formatSize(tab.size || 0)})`;
+    window.MlnbViz?.mountTable(host, { title: tab.title, columns: parsed.columns, rows: parsed.rows }, { pageSize: 100 });
+  }
+
+  document.getElementById("dtb-edit-raw")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "data") {
+      tab.kind = "file";
+      renderActiveWorkspace();
+      renderTabs();
+    }
+  });
+  document.getElementById("dtb-download")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab?.kind === "data") downloadFileEntry(tab.path);
+  });
+
+  // =========================================================================
+  // Scheduled Jobs & Webhooks Modal (#2)
+  // =========================================================================
+  async function loadSchedulesList() {
+    const listEl = document.getElementById("schedules-list");
+    listEl.innerHTML = `<div class="log-empty">Loading schedules...</div>`;
+    try {
+      const data = await api("/api/schedules");
+      const jobs = data.schedules || [];
+      if (!jobs.length) {
+        listEl.innerHTML = `<div class="log-empty">No scheduled jobs yet. Add one above or right-click any <code>.mini</code> / <code>.rs</code> script.</div>`;
+        return;
+      }
+      listEl.innerHTML = jobs.map((j) => {
+        const triggerText = j.cron ? `cron: ${j.cron}` : (j.interval_secs ? `every ${j.interval_secs}s` : "webhook / manual only");
+        const pillCls = !j.enabled ? "paused" : (j.last_status === "ok" ? "ok" : (j.last_status ? "err" : "paused"));
+        const pillText = !j.enabled ? "Paused" : (j.last_status ? `${j.last_status} (${j.run_count})` : "Active");
+        return `
+          <div class="manager-item">
+            <div class="manager-item-main">
+              <div class="manager-item-title">
+                <span>${escapeHtml(j.name)}</span>
+                <span class="status-pill ${pillCls}">${escapeHtml(pillText)}</span>
+              </div>
+              <div class="manager-item-sub">${escapeHtml(j.script)} · ${escapeHtml(triggerText)}${j.last_run_at ? ` · last: ${escapeHtml(j.last_run_at.slice(0, 19).replace("T", " "))}` : ""}</div>
+            </div>
+            <div class="manager-item-actions">
+              <button type="button" class="tb-btn sched-act-run" data-id="${escapeHtml(j.id)}">Run Now</button>
+              <button type="button" class="tb-btn sched-act-toggle" data-id="${escapeHtml(j.id)}">${j.enabled ? "Pause" : "Resume"}</button>
+              <button type="button" class="tb-btn sched-act-hook" data-token="${escapeHtml(j.webhook_token)}" title="Copy POST webhook URL">Webhook</button>
+              <button type="button" class="tb-btn sched-act-log" data-log="${escapeHtml(j.log_path)}">Log</button>
+              <button type="button" class="tb-btn danger-hover sched-act-del" data-id="${escapeHtml(j.id)}">Delete</button>
+            </div>
+          </div>`;
+      }).join("");
+
+      listEl.querySelectorAll(".sched-act-run").forEach((b) => {
+        b.onclick = async () => {
+          b.disabled = true;
+          b.textContent = "Running...";
+          try {
+            const res = await api(`/api/schedules/${encodeURIComponent(b.dataset.id)}/run`, { method: "POST" });
+            toast(res.ok ? `Job succeeded (${res.duration_ms.toFixed(0)} ms)` : `Job failed: ${res.error}`, res.ok ? "success" : "error");
+            loadSchedulesList();
+          } catch (err) {
+            toast(err.message, "error");
+            loadSchedulesList();
+          }
+        };
+      });
+      listEl.querySelectorAll(".sched-act-toggle").forEach((b) => {
+        b.onclick = async () => {
+          await api(`/api/schedules/${encodeURIComponent(b.dataset.id)}/toggle`, { method: "POST" });
+          loadSchedulesList();
+        };
+      });
+      listEl.querySelectorAll(".sched-act-hook").forEach((b) => {
+        b.onclick = () => {
+          const url = `${window.location.origin}/api/webhooks/${b.dataset.token}`;
+          copyTextToClipboard(url, "Copied webhook POST URL");
+        };
+      });
+      listEl.querySelectorAll(".sched-act-log").forEach((b) => {
+        b.onclick = () => {
+          closeSchedulesModal();
+          openPathInTab(b.dataset.log);
+        };
+      });
+      listEl.querySelectorAll(".sched-act-del").forEach((b) => {
+        b.onclick = async () => {
+          await api(`/api/schedules/${encodeURIComponent(b.dataset.id)}`, { method: "DELETE" });
+          toast("Deleted schedule", "info");
+          loadSchedulesList();
+        };
+      });
+    } catch (err) {
+      listEl.innerHTML = `<div class="log-empty">Failed to load schedules: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  function openSchedulesModal(prefillScript = "") {
+    const ov = document.getElementById("schedules-modal-overlay");
+    ov?.classList.remove("hidden");
+    if (prefillScript) {
+      const sInp = document.getElementById("sched-script");
+      const nInp = document.getElementById("sched-name");
+      if (sInp) sInp.value = prefillScript;
+      if (nInp && !nInp.value) nInp.value = prefillScript.split("/").pop();
+    }
+    loadSchedulesList();
+  }
+  function closeSchedulesModal() {
+    document.getElementById("schedules-modal-overlay")?.classList.add("hidden");
+  }
+
+  document.getElementById("btn-open-schedules")?.addEventListener("click", () => openSchedulesModal());
+  document.getElementById("schedules-modal-close")?.addEventListener("click", closeSchedulesModal);
+  document.getElementById("schedules-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "schedules-modal-overlay") closeSchedulesModal();
+  });
+  document.getElementById("schedule-create-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = document.getElementById("sched-name").value.trim();
+    const script = document.getElementById("sched-script").value.trim();
+    const cron = document.getElementById("sched-cron").value.trim() || null;
+    const ivRaw = document.getElementById("sched-interval").value.trim();
+    const interval_secs = ivRaw ? Number(ivRaw) : null;
+    try {
+      await api("/api/schedules", {
+        method: "POST",
+        body: JSON.stringify({ name: name || null, script, cron, interval_secs, enabled: true }),
+      });
+      document.getElementById("sched-name").value = "";
+      document.getElementById("sched-script").value = "";
+      document.getElementById("sched-cron").value = "";
+      document.getElementById("sched-interval").value = "";
+      toast("Schedule created", "success");
+      loadSchedulesList();
+    } catch (err) {
+      toast(`Create schedule failed: ${err.message}`, "error");
+    }
+  });
+
+  // =========================================================================
+  // Encrypted Secrets Vault Modal (#8)
+  // =========================================================================
+  async function loadSecretsList() {
+    const listEl = document.getElementById("secrets-list");
+    listEl.innerHTML = `<div class="log-empty">Loading secrets...</div>`;
+    try {
+      const data = await api("/api/secrets");
+      const secrets = data.secrets || [];
+      if (!secrets.length) {
+        listEl.innerHTML = `<div class="log-empty">No secrets stored yet. Add one above to inject it into kernels &amp; /invoke scripts.</div>`;
+        return;
+      }
+      listEl.innerHTML = secrets.map((s) => `
+        <div class="manager-item">
+          <div class="manager-item-main">
+            <div class="manager-item-title">
+              <code>${escapeHtml(s.name)}</code>
+              <span class="tb-meta">${escapeHtml(s.masked)}</span>
+            </div>
+            <div class="manager-item-sub">${escapeHtml(s.description || "No description")} · updated ${escapeHtml((s.updated_at || "").slice(0, 19).replace("T", " "))}</div>
+          </div>
+          <div class="manager-item-actions">
+            <button type="button" class="tb-btn sec-act-copy" data-name="${escapeHtml(s.name)}">Copy Snippet</button>
+            <button type="button" class="tb-btn danger-hover sec-act-del" data-name="${escapeHtml(s.name)}">Delete</button>
+          </div>
+        </div>`).join("");
+
+      listEl.querySelectorAll(".sec-act-copy").forEach((b) => {
+        b.onclick = () => copyTextToClipboard(`secret("${b.dataset.name}")`, `Copied secret("${b.dataset.name}")`);
+      });
+      listEl.querySelectorAll(".sec-act-del").forEach((b) => {
+        b.onclick = async () => {
+          await api(`/api/secrets/${encodeURIComponent(b.dataset.name)}`, { method: "DELETE" });
+          toast(`Deleted secret ${b.dataset.name}`, "info");
+          loadSecretsList();
+        };
+      });
+    } catch (err) {
+      listEl.innerHTML = `<div class="log-empty">Failed to load secrets: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  function openSecretsModal() {
+    document.getElementById("secrets-modal-overlay")?.classList.remove("hidden");
+    loadSecretsList();
+  }
+  function closeSecretsModal() {
+    document.getElementById("secrets-modal-overlay")?.classList.add("hidden");
+  }
+
+  document.getElementById("btn-open-secrets")?.addEventListener("click", openSecretsModal);
+  document.getElementById("secrets-modal-close")?.addEventListener("click", closeSecretsModal);
+  document.getElementById("secrets-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "secrets-modal-overlay") closeSecretsModal();
+  });
+  document.getElementById("secret-create-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = document.getElementById("secret-name").value.trim();
+    const value = document.getElementById("secret-value").value;
+    const description = document.getElementById("secret-desc").value.trim();
+    try {
+      await api(`/api/secrets/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        body: JSON.stringify({ value, description }),
+      });
+      document.getElementById("secret-name").value = "";
+      document.getElementById("secret-value").value = "";
+      document.getElementById("secret-desc").value = "";
+      toast(`Saved encrypted secret ${name}`, "success");
+      loadSecretsList();
+    } catch (err) {
+      toast(`Failed to save secret: ${err.message}`, "error");
+    }
+  });
+
+  // =========================================================================
+  // Command Palette (Ctrl+Shift+P / Ctrl+P) & Find in Files (Ctrl+Shift+F) (#10)
+  // =========================================================================
+  let paletteItems = [];
+  let paletteIdx = 0;
+
+  function buildPaletteCommands() {
+    return [
+      { label: "New Notebook (.mnb)", meta: "Command", run: () => promptNewNotebook() },
+      { label: "New Script / File", meta: "Command", run: () => promptNewFile() },
+      { label: "New Minilang UI (.ui)", meta: "Command", run: () => promptNewUi() },
+      { label: "New Folder", meta: "Command", run: () => promptNewFolder() },
+      { label: "Upload Files...", meta: "Command", run: () => document.getElementById("file-upload-input")?.click() },
+      { label: "Find in Files (Workspace Search)", meta: "Ctrl+Shift+F", run: () => openGrepModal() },
+      { label: "Scheduled Jobs & Webhooks", meta: "Manager", run: () => openSchedulesModal() },
+      { label: "Encrypted Secrets Vault", meta: "Manager", run: () => openSecretsModal() },
+      { label: "Save Active Tab", meta: "Ctrl+S", run: () => saveActiveTab() },
+      { label: "Run All Cells", meta: "Notebook", run: () => runAllCells() },
+      { label: "Restart Active Kernel", meta: "Kernel", run: () => restartKernel() },
+      { label: "Interrupt Active Kernel", meta: "Kernel", run: () => interruptKernel() },
+      { label: "Toggle Variable Inspector", meta: "View", run: () => document.getElementById("btn-toggle-vars")?.click() },
+      { label: "Toggle Sidebar", meta: "Ctrl+B", run: () => document.getElementById("btn-toggle-sidebar")?.click() },
+      { label: "Toggle Light / Dark Theme", meta: "View", run: () => document.getElementById("btn-theme")?.click() },
+      { label: "Refresh File Explorer", meta: "Files", run: () => loadDirectory() },
+    ];
+  }
+
+  let paletteFileTimer = null;
+  async function updatePaletteList(query) {
+    const q = (query || "").trim().toLowerCase();
+    const cmds = buildPaletteCommands().filter((c) => !q || c.label.toLowerCase().includes(q) || c.meta.toLowerCase().includes(q));
+    let fileHits = [];
+    if (q.length >= 1) {
+      try {
+        const res = await api(`/api/files/search?q=${encodeURIComponent(q)}`);
+        fileHits = (res.entries || []).filter((e) => e.kind === "file").slice(0, 15).map((e) => ({
+          label: e.name,
+          meta: e.path,
+          run: () => openPathInTab(e.path),
+        }));
+      } catch { /* ignore */ }
+    } else {
+      fileHits = state.dirEntries.filter((e) => e.kind === "file").slice(0, 8).map((e) => ({
+        label: e.name,
+        meta: e.path,
+        run: () => openPathInTab(e.path),
+      }));
+    }
+    paletteItems = [...cmds, ...fileHits];
+    paletteIdx = 0;
+    renderPaletteItems();
+  }
+
+  function renderPaletteItems() {
+    const listEl = document.getElementById("cmd-palette-list");
+    if (!paletteItems.length) {
+      listEl.innerHTML = `<div class="log-empty">No matching commands or files.</div>`;
+      return;
+    }
+    listEl.innerHTML = paletteItems.map((item, i) => `
+      <button type="button" class="cmd-palette-item${i === paletteIdx ? " selected" : ""}" data-pidx="${i}">
+        <span>${escapeHtml(item.label)}</span>
+        <span class="cmd-palette-meta">${escapeHtml(item.meta)}</span>
+      </button>`).join("");
+    listEl.querySelectorAll(".cmd-palette-item").forEach((btn) => {
+      btn.onclick = () => {
+        const item = paletteItems[Number(btn.dataset.pidx)];
+        closeCommandPalette();
+        item?.run();
+      };
+    });
+  }
+
+  function openCommandPalette(initial = "") {
+    const ov = document.getElementById("cmd-palette-overlay");
+    const inp = document.getElementById("cmd-palette-input");
+    ov?.classList.remove("hidden");
+    if (inp) {
+      inp.value = initial;
+      inp.focus();
+      updatePaletteList(initial);
+    }
+  }
+  function closeCommandPalette() {
+    document.getElementById("cmd-palette-overlay")?.classList.add("hidden");
+  }
+
+  document.getElementById("btn-command-palette")?.addEventListener("click", () => openCommandPalette());
+  document.getElementById("cmd-palette-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "cmd-palette-overlay") closeCommandPalette();
+  });
+  document.getElementById("cmd-palette-input")?.addEventListener("input", (e) => {
+    clearTimeout(paletteFileTimer);
+    paletteFileTimer = setTimeout(() => updatePaletteList(e.target.value), 80);
+  });
+  document.getElementById("cmd-palette-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { closeCommandPalette(); return; }
+    if (e.key === "ArrowDown" && paletteItems.length) {
+      e.preventDefault();
+      paletteIdx = (paletteIdx + 1) % paletteItems.length;
+      renderPaletteItems();
+    } else if (e.key === "ArrowUp" && paletteItems.length) {
+      e.preventDefault();
+      paletteIdx = (paletteIdx - 1 + paletteItems.length) % paletteItems.length;
+      renderPaletteItems();
+    } else if (e.key === "Enter" && paletteItems[paletteIdx]) {
+      e.preventDefault();
+      const item = paletteItems[paletteIdx];
+      closeCommandPalette();
+      item.run();
+    }
+  });
+
+  // Find in Files (Grep) Modal
+  function openGrepModal() {
+    const ov = document.getElementById("grep-modal-overlay");
+    ov?.classList.remove("hidden");
+    document.getElementById("grep-input")?.focus();
+  }
+  function closeGrepModal() {
+    document.getElementById("grep-modal-overlay")?.classList.add("hidden");
+  }
+  async function runWorkspaceGrep() {
+    const q = document.getElementById("grep-input").value.trim();
+    const ext = document.getElementById("grep-ext").value.trim();
+    const cs = document.getElementById("grep-case").checked;
+    const statusEl = document.getElementById("grep-status");
+    const resEl = document.getElementById("grep-results");
+    if (!q) {
+      resEl.innerHTML = `<div class="log-empty">Enter a search term.</div>`;
+      statusEl.textContent = "";
+      return;
+    }
+    statusEl.textContent = "Searching...";
+    try {
+      const qs = new URLSearchParams({ q, case: cs ? "true" : "false" });
+      if (ext) qs.set("ext", ext);
+      const data = await api(`/api/files/grep?${qs}`);
+      const hits = data.matches || [];
+      statusEl.textContent = `${hits.length} match${hits.length === 1 ? "" : "es"}`;
+      if (!hits.length) {
+        resEl.innerHTML = `<div class="log-empty">No matches found for "${escapeHtml(q)}".</div>`;
+        return;
+      }
+      resEl.innerHTML = hits.map((m, idx) => {
+        const pre = escapeHtml(m.text.slice(0, m.match_start));
+        const mid = escapeHtml(m.text.slice(m.match_start, m.match_end));
+        const post = escapeHtml(m.text.slice(m.match_end));
+        const loc = m.cell_index != null
+          ? `${m.path} · Cell ${m.cell_index + 1} · Line ${m.line}`
+          : `${m.path}:${m.line}:${m.col}`;
+        return `
+          <div class="grep-row" data-gidx="${idx}">
+            <div class="grep-row-loc">${escapeHtml(loc)}</div>
+            <div class="grep-row-text">${pre}<span class="grep-highlight">${mid}</span>${post}</div>
+          </div>`;
+      }).join("");
+      resEl.querySelectorAll(".grep-row").forEach((row) => {
+        row.onclick = async () => {
+          const hit = hits[Number(row.dataset.gidx)];
+          closeGrepModal();
+          await openPathInTab(hit.path);
+          const tab = activeTab();
+          if (tab?.kind === "notebook" && hit.cell_id) {
+            selectCell(hit.cell_id, true);
+          } else if (tab?.kind === "file") {
+            const ta = document.getElementById("file-editor-textarea");
+            if (ta) {
+              const lines = (ta.value || "").split("\n");
+              let pos = 0;
+              for (let i = 0; i < Math.min(hit.line - 1, lines.length); i++) pos += lines[i].length + 1;
+              pos += Math.max(0, hit.col - 1);
+              ta.focus();
+              ta.setSelectionRange(pos, pos + q.length);
+            }
+          }
+        };
+      });
+    } catch (err) {
+      statusEl.textContent = "";
+      resEl.innerHTML = `<div class="log-empty">Search failed: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  document.getElementById("btn-find-in-files")?.addEventListener("click", openGrepModal);
+  document.getElementById("grep-modal-close")?.addEventListener("click", closeGrepModal);
+  document.getElementById("grep-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "grep-modal-overlay") closeGrepModal();
+  });
+  document.getElementById("grep-run-btn")?.addEventListener("click", runWorkspaceGrep);
+  document.getElementById("grep-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); runWorkspaceGrep(); }
+    else if (e.key === "Escape") closeGrepModal();
   });
 
   // --- Google Antigravity (agy) Inline Assistant (Cells & Script Files) ---

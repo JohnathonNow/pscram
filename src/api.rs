@@ -5,18 +5,25 @@ use crate::kernel_mgr::{InvokeExecError, KernelManager};
 use crate::kernel_proc::KernelResponse;
 use crate::lang::LanguageRegistry;
 use crate::notebook::NotebookDocument;
+use crate::scheduler::{CreateScheduleRequest, Scheduler, UpdateScheduleRequest};
+use crate::secrets::SecretsVault;
 use crate::tagged::TaggedValue;
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 const EMBED_INDEX_HTML: &str = include_str!("../web/index.html");
 const EMBED_STYLE_CSS: &str = include_str!("../web/style.css");
@@ -24,11 +31,13 @@ const EMBED_APP_JS: &str = include_str!("../web/app.js");
 const EMBED_MINIJS_VM_JS: &str = include_str!("../web/minijs_vm.js");
 
 pub struct AppState {
-    pub files: FileStore,
-    pub kernels: KernelManager,
+    pub files: Arc<FileStore>,
+    pub kernels: Arc<KernelManager>,
     pub languages: Arc<LanguageRegistry>,
     pub auth: Arc<AuthManager>,
     pub agy: Arc<AgyRunner>,
+    pub secrets: Arc<SecretsVault>,
+    pub scheduler: Arc<Scheduler>,
     pub web_dir: Option<PathBuf>,
 }
 
@@ -42,7 +51,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/status", get(api_auth_status))
         .route("/api/auth/login", post(api_auth_login))
         .route("/api/auth/refresh", post(api_auth_refresh))
-        .route("/api/auth/logout", post(api_auth_logout));
+        .route("/api/auth/logout", post(api_auth_logout))
+        // Webhook trigger endpoint (authenticated by unguessable per-schedule webhook token)
+        .route("/api/webhooks/:token", post(api_trigger_webhook));
 
     let protected_routes = Router::new()
         .route("/ui/*script", get(serve_standalone_ui))
@@ -50,12 +61,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout-all", post(api_auth_logout_all))
         .route("/api/info", get(api_info))
         .route("/api/languages", get(api_languages))
-        // File browser API
+        // File browser, upload, ZIP & grep API
         .route("/api/files", get(api_list_files))
         .route("/api/files/search", get(api_search_files))
+        .route("/api/files/grep", get(api_grep_files))
         .route("/api/file", get(api_read_file).put(api_write_file).delete(api_delete_file))
         .route("/api/file/raw", get(api_read_file_raw))
+        .route(
+            "/api/file/upload",
+            post(api_upload_file).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route("/api/file/zip", get(api_zip_folder))
         .route("/api/log", get(api_read_log))
+        .route("/api/sqlite/schema", get(api_sqlite_schema))
+        .route("/api/sqlite/query", post(api_sqlite_query))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
         .route("/api/file/copy", post(api_copy_file))
@@ -73,11 +92,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/kernels/:id", delete(api_delete_kernel))
         .route("/api/kernels/:id/status", get(api_kernel_status))
         .route("/api/kernels/:id/execute", post(api_kernel_execute))
+        .route("/api/kernels/:id/execute-stream", post(api_kernel_execute_stream))
         .route("/api/kernels/:id/interrupt", post(api_kernel_interrupt))
         .route("/api/kernels/:id/restart", post(api_kernel_restart))
         .route("/api/kernels/:id/inspect", get(api_kernel_inspect))
         .route("/api/kernels/:id/complete", post(api_kernel_complete))
         .route("/api/kernels/:id/chdir", post(api_kernel_chdir))
+        // Encrypted Secrets Vault API
+        .route("/api/secrets", get(api_list_secrets))
+        .route("/api/secrets/:name", put(api_set_secret).delete(api_delete_secret))
+        // Scheduled Jobs API
+        .route("/api/schedules", get(api_list_schedules).post(api_create_schedule))
+        .route("/api/schedules/:id", put(api_update_schedule).delete(api_delete_schedule))
+        .route("/api/schedules/:id/run", post(api_run_schedule))
+        .route("/api/schedules/:id/toggle", post(api_toggle_schedule))
         // Google Antigravity (agy) inline assistant API
         .route("/api/agy/status", get(api_agy_status))
         .route("/api/agy/assist", post(api_agy_assist))
@@ -1315,4 +1343,454 @@ async fn api_agy_cancel(
 ) -> Response {
     let cancelled = st.agy.cancel(&body.request_id).await;
     Json(json!({ "ok": true, "cancelled": cancelled })).into_response()
+}
+
+// --- Streaming Kernel Execution (SSE) ---
+
+struct SseReceiverStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<Event, Infallible>>,
+}
+
+impl futures_core::Stream for SseReceiverStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+async fn api_kernel_execute_stream(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ExecuteBody>,
+) -> Response {
+    let session = match st
+        .kernels
+        .get_or_create(Some(id), body.language.as_deref(), None)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let (kern_tx, mut kern_rx) = tokio::sync::mpsc::unbounded_channel::<KernelResponse>();
+
+    let sse_tx_fwd = sse_tx.clone();
+    let fwd_task = tokio::spawn(async move {
+        while let Some(msg) = kern_rx.recv().await {
+            if let KernelResponse::StreamEvent { event, data } = msg {
+                let payload = data.to_string();
+                let _ = sse_tx_fwd.send(Ok(Event::default().event(event).data(payload)));
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let res = session.execute_stream(body.code, body.source, kern_tx).await;
+        let _ = fwd_task.await;
+        match res {
+            Ok(final_resp) => {
+                let data = serde_json::to_string(&final_resp).unwrap_or_else(|_| "{}".to_string());
+                let _ = sse_tx.send(Ok(Event::default().event("result").data(data)));
+            }
+            Err(e) => {
+                let data = json!({ "error": e }).to_string();
+                let _ = sse_tx.send(Ok(Event::default().event("error").data(data)));
+            }
+        }
+    });
+
+    Sse::new(SseReceiverStream { rx: sse_rx })
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// --- Drag-and-Drop File Upload & Folder ZIP Download ---
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn api_upload_file(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if ct.to_lowercase().contains("multipart/form-data") {
+        let Some(boundary) = extract_multipart_boundary(ct) else {
+            return api_err(StatusCode::BAD_REQUEST, "Missing multipart boundary");
+        };
+        let parts = parse_multipart_files(&body, &boundary);
+        if parts.is_empty() {
+            return api_err(StatusCode::BAD_REQUEST, "No files found in multipart upload");
+        }
+        let mut uploaded = Vec::new();
+        for (fname, data) in parts {
+            match st.files.upload_file(&q.dir, &fname, data) {
+                Ok(rel) => uploaded.push(rel),
+                Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+            }
+        }
+        return Json(json!({ "ok": true, "paths": uploaded })).into_response();
+    }
+
+    let Some(name) = q.name.filter(|s| !s.trim().is_empty()) else {
+        return api_err(StatusCode::BAD_REQUEST, "Missing 'name' query parameter for raw upload");
+    };
+    match st.files.upload_file(&q.dir, &name, &body) {
+        Ok(rel) => Json(json!({ "ok": true, "path": rel, "paths": [rel] })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    for part in content_type.split(';') {
+        let p = part.trim();
+        if let Some(rest) = p.strip_prefix("boundary=").or_else(|| p.strip_prefix("BOUNDARY=")) {
+            let clean = rest.trim().trim_matches('"').to_string();
+            if !clean.is_empty() {
+                return Some(clean);
+            }
+        }
+    }
+    None
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn parse_multipart_files<'a>(body: &'a [u8], boundary: &str) -> Vec<(String, &'a [u8])> {
+    let delim = format!("--{}", boundary).into_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while let Some(rel) = find_bytes(&body[pos..], &delim) {
+        let part_start = pos + rel + delim.len();
+        if part_start + 2 <= body.len() && &body[part_start..part_start + 2] == b"--" {
+            break;
+        }
+        let mut cur = part_start;
+        if cur + 2 <= body.len() && &body[cur..cur + 2] == b"\r\n" {
+            cur += 2;
+        } else if cur < body.len() && body[cur] == b'\n' {
+            cur += 1;
+        }
+        let next_delim = match find_bytes(&body[cur..], &delim) {
+            Some(n) => cur + n,
+            None => break,
+        };
+        let part_slice = &body[cur..next_delim];
+        let (hdr_end, sep_len) = if let Some(i) = find_bytes(part_slice, b"\r\n\r\n") {
+            (i, 4)
+        } else if let Some(i) = find_bytes(part_slice, b"\n\n") {
+            (i, 2)
+        } else {
+            pos = next_delim;
+            continue;
+        };
+        let hdr_str = String::from_utf8_lossy(&part_slice[..hdr_end]);
+        let mut data = &part_slice[hdr_end + sep_len..];
+        if data.ends_with(b"\r\n") {
+            data = &data[..data.len() - 2];
+        } else if data.ends_with(b"\n") {
+            data = &data[..data.len() - 1];
+        }
+
+        if let Some(fname) = extract_disposition_filename(&hdr_str) {
+            out.push((fname, data));
+        }
+        pos = next_delim;
+    }
+    out
+}
+
+fn extract_disposition_filename(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-disposition:") {
+            if let Some(idx) = lower.find("filename=") {
+                let rest = &line[idx + "filename=".len()..];
+                let fname = if let Some(stripped) = rest.strip_prefix('"') {
+                    stripped.split('"').next().unwrap_or("")
+                } else {
+                    rest.split(';').next().unwrap_or("").trim()
+                };
+                if !fname.is_empty() {
+                    return Some(fname.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct ZipQuery {
+    #[serde(default)]
+    path: String,
+}
+
+async fn api_zip_folder(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ZipQuery>,
+) -> Response {
+    match st.files.zip_directory(&q.path) {
+        Ok((zip_name, bytes)) => {
+            let safe = zip_name.replace('"', "_");
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/zip".to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}\"", safe),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+// --- Workspace Full-Text Search (Grep) ---
+
+#[derive(Deserialize)]
+struct GrepQuery {
+    q: String,
+    #[serde(default)]
+    case: bool,
+    #[serde(default)]
+    ext: Option<String>,
+    #[serde(default = "default_grep_limit")]
+    limit: usize,
+}
+
+fn default_grep_limit() -> usize {
+    200
+}
+
+async fn api_grep_files(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<GrepQuery>,
+) -> Response {
+    let limit = q.limit.clamp(1, 500);
+    let matches = st
+        .files
+        .grep_workspace(&q.q, q.case, q.ext.as_deref(), limit);
+    Json(json!({ "query": q.q, "count": matches.len(), "matches": matches })).into_response()
+}
+
+// --- SQLite Database Browser API ---
+
+#[derive(Deserialize)]
+struct SqliteSchemaQuery {
+    path: String,
+}
+
+async fn api_sqlite_schema(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<SqliteSchemaQuery>,
+) -> Response {
+    let abs = match st.files.resolve_existing(&q.path) {
+        Ok(p) => p,
+        Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+    };
+    let rel = abs
+        .strip_prefix(st.files.root())
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    match crate::sqlite_reader::inspect_schema(&abs, &rel) {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SqliteQueryBody {
+    path: String,
+    sql: String,
+    #[serde(default = "default_sql_limit")]
+    limit: usize,
+    #[serde(default)]
+    allow_write: bool,
+}
+
+fn default_sql_limit() -> usize {
+    500
+}
+
+async fn api_sqlite_query(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<SqliteQueryBody>,
+) -> Response {
+    let abs = match st.files.resolve_existing(&body.path) {
+        Ok(p) => p,
+        Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+    };
+    let rel = abs
+        .strip_prefix(st.files.root())
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    match crate::sqlite_reader::run_query(&abs, &rel, &body.sql, body.limit, !body.allow_write) {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+// --- Encrypted Secrets Vault API ---
+
+async fn api_list_secrets(State(st): State<Arc<AppState>>) -> Response {
+    Json(json!({ "secrets": st.secrets.list() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SetSecretBody {
+    value: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn api_set_secret(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<SetSecretBody>,
+) -> Response {
+    match st.secrets.set(&name, body.value.clone(), body.description) {
+        Ok(meta) => {
+            let mut vars = BTreeMap::new();
+            vars.insert(meta.name.clone(), Some(body.value));
+            st.kernels.broadcast_env_update(vars).await;
+            Json(json!({ "ok": true, "secret": meta })).into_response()
+        }
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_delete_secret(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match st.secrets.delete(&name) {
+        Ok(removed) => {
+            let mut vars = BTreeMap::new();
+            vars.insert(name.trim().to_string(), None);
+            st.kernels.broadcast_env_update(vars).await;
+            Json(json!({ "ok": true, "removed": removed })).into_response()
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+// --- Scheduled Jobs & Webhook Triggers API ---
+
+async fn api_list_schedules(State(st): State<Arc<AppState>>) -> Response {
+    Json(json!({ "schedules": st.scheduler.list().await })).into_response()
+}
+
+async fn api_create_schedule(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<CreateScheduleRequest>,
+) -> Response {
+    match st.scheduler.create(req).await {
+        Ok(job) => Json(json!({ "ok": true, "schedule": job })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_update_schedule(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateScheduleRequest>,
+) -> Response {
+    match st.scheduler.update(&id, req).await {
+        Ok(job) => Json(json!({ "ok": true, "schedule": job })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_delete_schedule(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.scheduler.delete(&id).await {
+        Ok(removed) => Json(json!({ "ok": true, "removed": removed })).into_response(),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn api_toggle_schedule(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.scheduler.toggle(&id).await {
+        Ok(job) => Json(json!({ "ok": true, "schedule": job })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_run_schedule(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st
+        .scheduler
+        .run_job_by_id(&id, "manual", None, &st.files, &st.kernels, &st.languages)
+        .await
+    {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct WebhookBody {
+    #[serde(default)]
+    params: BTreeMap<String, TaggedValue>,
+}
+
+async fn api_trigger_webhook(
+    State(st): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    raw_body: String,
+) -> Response {
+    let Some(job) = st.scheduler.find_by_webhook(&token).await else {
+        return api_err(StatusCode::NOT_FOUND, "Unknown webhook token");
+    };
+    let extra = if raw_body.trim().is_empty() {
+        None
+    } else {
+        match serde_json::from_str::<WebhookBody>(&raw_body) {
+            Ok(b) if !b.params.is_empty() => Some(b.params),
+            _ => None,
+        }
+    };
+    let res = st
+        .scheduler
+        .execute_job(job, "webhook", extra, &st.files, &st.kernels, &st.languages)
+        .await;
+    let status = if res.ok {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (status, Json(res)).into_response()
 }

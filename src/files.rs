@@ -31,6 +31,22 @@ pub fn is_log_ext(ext: &str) -> bool {
     matches!(ext, "log" | "mlog")
 }
 
+pub fn is_tabular_ext(ext: &str) -> bool {
+    matches!(ext, "csv" | "tsv")
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GrepMatch {
+    pub path: String,
+    pub line: usize,
+    pub col: usize,
+    pub text: String,
+    pub match_start: usize,
+    pub match_end: usize,
+    pub cell_index: Option<usize>,
+    pub cell_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -47,6 +63,8 @@ pub struct FileEntry {
     pub is_pdf: bool,
     pub is_markdown: bool,
     pub is_log: bool,
+    pub is_sqlite: bool,
+    pub is_tabular: bool,
     pub mime_type: Option<String>,
     pub language: Option<String>,
 }
@@ -70,6 +88,8 @@ pub struct FileReadResult {
     pub is_pdf: bool,
     pub is_markdown: bool,
     pub is_log: bool,
+    pub is_sqlite: bool,
+    pub is_tabular: bool,
     pub mime_type: Option<String>,
 }
 
@@ -184,6 +204,8 @@ impl FileStore {
             let is_pdf = !is_dir && ext == "pdf";
             let is_markdown = !is_dir && is_markdown_ext(&ext);
             let is_log = !is_dir && (is_log_ext(&ext) || crate::log_reader::has_mlog_magic(&path));
+            let is_sqlite = !is_dir && (crate::sqlite_reader::is_sqlite_ext(&ext) || crate::sqlite_reader::has_sqlite_magic(&path));
+            let is_tabular = !is_dir && is_tabular_ext(&ext);
             let mime_type = if is_dir {
                 None
             } else {
@@ -204,6 +226,8 @@ impl FileStore {
                 is_pdf,
                 is_markdown,
                 is_log,
+                is_sqlite,
+                is_tabular,
                 mime_type,
                 language,
                 extension: ext,
@@ -284,6 +308,8 @@ impl FileStore {
                     let is_pdf = !is_dir && ext == "pdf";
                     let is_markdown = !is_dir && is_markdown_ext(&ext);
                     let is_log = !is_dir && is_log_ext(&ext);
+                    let is_sqlite = !is_dir && crate::sqlite_reader::is_sqlite_ext(&ext);
+                    let is_tabular = !is_dir && is_tabular_ext(&ext);
                     let mime_type = if is_dir {
                         None
                     } else {
@@ -303,6 +329,8 @@ impl FileStore {
                         is_pdf,
                         is_markdown,
                         is_log,
+                        is_sqlite,
+                        is_tabular,
                         mime_type,
                         language,
                         extension: ext,
@@ -334,10 +362,12 @@ impl FileStore {
         let is_markdown = is_markdown_ext(&ext);
         let is_mlog = crate::log_reader::has_mlog_magic(&abs);
         let is_log = is_log_ext(&ext) || is_mlog;
+        let is_sqlite = crate::sqlite_reader::is_sqlite_ext(&ext) || crate::sqlite_reader::has_sqlite_magic(&abs);
+        let is_tabular = is_tabular_ext(&ext);
         let mime_type = media_mime_for_ext(&ext).map(|s| s.to_string());
 
-        // For binary images, PDFs, or binary MLOG files, return metadata directly without UTF-8 decoding
-        if (is_image && ext != "svg") || is_pdf || is_mlog {
+        // For binary images, PDFs, SQLite DBs, or binary MLOG files, return metadata directly without UTF-8 decoding
+        if (is_image && ext != "svg") || is_pdf || is_mlog || is_sqlite {
             return Ok(FileReadResult {
                 path: self.to_rel_string(&abs),
                 name,
@@ -349,6 +379,8 @@ impl FileStore {
                 is_pdf,
                 is_markdown,
                 is_log,
+                is_sqlite,
+                is_tabular,
                 mime_type,
             });
         }
@@ -370,6 +402,8 @@ impl FileStore {
                 is_pdf,
                 is_markdown,
                 is_log,
+                is_sqlite,
+                is_tabular,
                 mime_type,
             }),
             Err(_) => Ok(FileReadResult {
@@ -383,6 +417,8 @@ impl FileStore {
                 is_pdf,
                 is_markdown,
                 is_log,
+                is_sqlite,
+                is_tabular,
                 mime_type,
             }),
         }
@@ -563,6 +599,306 @@ impl FileStore {
         }
         Ok(())
     }
+
+    pub fn upload_file(&self, dir_rel: &str, file_name: &str, data: &[u8]) -> Result<String, String> {
+        let dir_abs = if dir_rel.trim().is_empty() || dir_rel.trim() == "/" || dir_rel.trim() == "." {
+            self.root.clone()
+        } else {
+            self.resolve_existing(dir_rel)?
+        };
+        if !dir_abs.is_dir() {
+            return Err(format!("Upload destination '{}' is not a directory", dir_rel));
+        }
+        let clean_name = Path::new(file_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .ok_or_else(|| "Invalid upload filename".to_string())?;
+        let dst = dir_abs.join(clean_name);
+        if !dst.starts_with(&self.root) {
+            return Err("Upload outside workspace root is forbidden".to_string());
+        }
+        fs::write(&dst, data).map_err(|e| format!("Failed to save '{}': {}", clean_name, e))?;
+        Ok(self.to_rel_string(&dst))
+    }
+
+    /// Create an uncompressed (STORE) ZIP archive of a workspace directory (pure Rust, CRC-32 verified).
+    pub fn zip_directory(&self, rel: &str) -> Result<(String, Vec<u8>), String> {
+        let abs = if rel.trim().is_empty() || rel.trim() == "/" || rel.trim() == "." {
+            self.root.clone()
+        } else {
+            self.resolve_existing(rel)?
+        };
+        if !abs.is_dir() {
+            return Err(format!("'{}' is not a directory", rel));
+        }
+        let zip_base = abs
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".to_string());
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        collect_zip_files(&abs, &abs, &mut files, &mut total_bytes)?;
+        let bytes = build_zip_archive(&files);
+        Ok((format!("{}.zip", zip_base), bytes))
+    }
+
+    /// Workspace-wide full-text content search across text files and `.mnb` notebook cells.
+    pub fn grep_workspace(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        ext_filter: Option<&str>,
+        max_matches: usize,
+    ) -> Vec<GrepMatch> {
+        let needle_raw = query.trim();
+        if needle_raw.is_empty() {
+            return Vec::new();
+        }
+        let needle_cmp = if case_sensitive {
+            needle_raw.to_string()
+        } else {
+            needle_raw.to_lowercase()
+        };
+        let want_ext = ext_filter
+            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+            .filter(|s| !s.is_empty());
+
+        let mut matches = Vec::new();
+        let mut stack = vec![self.root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            if matches.len() >= max_matches {
+                break;
+            }
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+
+            for entry in entries {
+                if matches.len() >= max_matches {
+                    break;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name == "target" || name == "obj" || name == "node_modules" {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if meta.len() > 2 * 1024 * 1024 {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if let Some(ref we) = want_ext {
+                    if &ext != we {
+                        continue;
+                    }
+                }
+                if is_image_ext(&ext) && ext != "svg"
+                    || ext == "pdf"
+                    || ext == "mlog"
+                    || ext == "cbor"
+                    || crate::sqlite_reader::is_sqlite_ext(&ext)
+                {
+                    continue;
+                }
+
+                let Ok(bytes) = fs::read(&path) else { continue };
+                if bytes.iter().take(512).any(|&b| b == 0) {
+                    continue;
+                }
+                let Ok(content) = String::from_utf8(bytes) else { continue };
+                let rel = self.to_rel_string(&path);
+
+                if ext == "mnb" {
+                    if let Ok(doc) = serde_json::from_str::<NotebookDocument>(&content) {
+                        for (ci, cell) in doc.cells.iter().enumerate() {
+                            for (li, line) in cell.source.lines().enumerate() {
+                                if matches.len() >= max_matches {
+                                    break;
+                                }
+                                let hay = if case_sensitive {
+                                    line.to_string()
+                                } else {
+                                    line.to_lowercase()
+                                };
+                                if let Some(pos) = hay.find(&needle_cmp) {
+                                    matches.push(GrepMatch {
+                                        path: rel.clone(),
+                                        line: li + 1,
+                                        col: pos + 1,
+                                        text: truncate_line(line, 200),
+                                        match_start: pos,
+                                        match_end: pos + needle_raw.len(),
+                                        cell_index: Some(ci),
+                                        cell_id: Some(cell.id.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                for (li, line) in content.lines().enumerate() {
+                    if matches.len() >= max_matches {
+                        break;
+                    }
+                    let hay = if case_sensitive {
+                        line.to_string()
+                    } else {
+                        line.to_lowercase()
+                    };
+                    if let Some(pos) = hay.find(&needle_cmp) {
+                        matches.push(GrepMatch {
+                            path: rel.clone(),
+                            line: li + 1,
+                            col: pos + 1,
+                            text: truncate_line(line, 200),
+                            match_start: pos,
+                            match_end: pos + needle_raw.len(),
+                            cell_index: None,
+                            cell_id: None,
+                        });
+                    }
+                }
+            }
+        }
+        matches
+    }
+}
+
+fn truncate_line(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        let head: String = chars[..max_chars].iter().collect();
+        format!("{}...", head)
+    }
+}
+
+fn collect_zip_files(
+    base: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+    total_bytes: &mut u64,
+) -> Result<(), String> {
+    const MAX_ZIP_BYTES: u64 = 128 * 1024 * 1024;
+    let rd = fs::read_dir(dir).map_err(|e| format!("read_dir failed: {}", e))?;
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "target" || name == ".git" || name == ".minilang-secrets.key" || name == ".minilang-secrets.enc" {
+            continue;
+        }
+        let p = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&p) else { continue };
+        if meta.is_dir() {
+            collect_zip_files(base, &p, out, total_bytes)?;
+        } else if meta.is_file() {
+            *total_bytes = total_bytes.saturating_add(meta.len());
+            if *total_bytes > MAX_ZIP_BYTES {
+                return Err("Folder exceeds 128 MB ZIP export limit".to_string());
+            }
+            let rel = p
+                .strip_prefix(base)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let data = fs::read(&p).map_err(|e| format!("read '{}' failed: {}", rel, e))?;
+            out.push((rel, data));
+        }
+    }
+    Ok(())
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn build_zip_archive(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+
+    for (name, data) in files {
+        let name_bytes = name.as_bytes();
+        let crc = crc32(data);
+        let size = data.len() as u32;
+        let local_offset = out.len() as u32;
+
+        // Local file header (method 0 = STORE, UTF-8 flag bit 11 = 0x0800)
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0800u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(data);
+
+        // Central directory header
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0x0800u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&local_offset.to_le_bytes());
+        central.extend_from_slice(name_bytes);
+    }
+
+    let cd_offset = out.len() as u32;
+    let cd_size = central.len() as u32;
+    let count = files.len() as u16;
+    out.extend_from_slice(&central);
+
+    // End of central directory record
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
 }
 
 fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {

@@ -474,6 +474,22 @@ static ml_value_t *widget_show_fn(void *Data, int Count, ml_value_t **Args) {
     return ui_show_fn(NULL, 1, Args);
 }
 
+static ml_value_t *ui_table_fn(void *Data, int Count, ml_value_t **Args) {
+    ml_ui_widget_t *W = ml_ui_widget_new("table");
+    int Pos = ml_ui_consume_named_args(W, Count, Args);
+    if (Pos >= 1) ml_ui_prop_set(W, "data", Args[0]);
+    if (Pos >= 2 && ml_is(ml_deref(Args[1]), MLStringT)) ml_ui_prop_set(W, "title", Args[1]);
+    return (ml_value_t *)W;
+}
+
+static ml_value_t *ui_chart_fn(void *Data, int Count, ml_value_t **Args) {
+    ml_ui_widget_t *W = ml_ui_widget_new("chart");
+    int Pos = ml_ui_consume_named_args(W, Count, Args);
+    if (Pos >= 1) ml_ui_prop_set(W, "spec", Args[0]);
+    if (Pos >= 2 && ml_is(ml_deref(Args[1]), MLStringT)) ml_ui_prop_set(W, "title", Args[1]);
+    return (ml_value_t *)W;
+}
+
 /* Global `exec` function: encoded as external ["^", "exec"] by minijs for browser execution */
 static ml_value_t *mlk_exec_fn(void *Data, int Count, ml_value_t **Args) {
     return ml_error("RuntimeError", "exec() is executed asynchronously inside a browser Minilang UI (use inside a ui::button / event callback or ui::compile closure)");
@@ -503,6 +519,8 @@ void ml_ui_init(stringmap_t *Globals, ml_ui_emit_fn emit_fn) {
     ml_method_by_name("set_text", "text", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
     ml_method_by_name("html", "html", widget_get_prop_fn, MLUIWidgetT, NULL);
     ml_method_by_name("set_html", "html", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
+    ml_method_by_name("set_data", "data", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
+    ml_method_by_name("set_spec", "spec", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
     ml_method_by_name("set_disabled", "disabled", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
     ml_method_by_name("set_visible", "visible", widget_set_prop_fn, MLUIWidgetT, MLAnyT, NULL);
     ml_method_by_name("set_style", NULL, widget_set_style_fn, MLUIWidgetT, MLAnyT, NULL);
@@ -526,6 +544,8 @@ void ml_ui_init(stringmap_t *Globals, ml_ui_emit_fn emit_fn) {
     ml_value_t *fn_divider  = ml_cfunction(NULL, ui_divider_fn);
     ml_value_t *fn_badge    = ml_cfunction(NULL, ui_badge_fn);
     ml_value_t *fn_code     = ml_cfunction(NULL, ui_code_fn);
+    ml_value_t *fn_table    = ml_cfunction(NULL, ui_table_fn);
+    ml_value_t *fn_chart    = ml_cfunction(NULL, ui_chart_fn);
     ml_value_t *fn_input    = ml_cfunction(NULL, ui_input_fn);
     ml_value_t *fn_password = ml_cfunction(NULL, ui_password_fn);
     ml_value_t *fn_textarea = ml_cfunction(NULL, ui_textarea_fn);
@@ -562,6 +582,8 @@ void ml_ui_init(stringmap_t *Globals, ml_ui_emit_fn emit_fn) {
         "badge",    fn_badge,
         "code",     fn_code,
         "pre",      fn_code,
+        "table",    fn_table,
+        "chart",    fn_chart,
         "input",    fn_input,
         "text_input", fn_input,
         "password", fn_password,
@@ -599,6 +621,8 @@ void ml_ui_init(stringmap_t *Globals, ml_ui_emit_fn emit_fn) {
     ml_externals_default_add("ui::divider", fn_divider);
     ml_externals_default_add("ui::badge", fn_badge);
     ml_externals_default_add("ui::code", fn_code);
+    ml_externals_default_add("ui::table", fn_table);
+    ml_externals_default_add("ui::chart", fn_chart);
     ml_externals_default_add("ui::input", fn_input);
     ml_externals_default_add("ui::password", fn_password);
     ml_externals_default_add("ui::textarea", fn_textarea);

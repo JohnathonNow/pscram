@@ -34,6 +34,7 @@ pub struct InvokeScriptRequest {
     pub args: Vec<TaggedValue>,
     pub function: Option<String>,
     pub timeout_ms: u64,
+    pub env: BTreeMap<String, String>,
 }
 
 /// Extensible backend trait for plugging additional languages into the notebook,

@@ -74,6 +74,10 @@ pub enum KernelRequest {
         code: String,
         source: Option<String>,
     },
+    EvalStream {
+        code: String,
+        source: Option<String>,
+    },
     Invoke {
         code: String,
         source: String,
@@ -90,6 +94,9 @@ pub enum KernelRequest {
     },
     Chdir {
         path: String,
+    },
+    SetEnv {
+        vars: BTreeMap<String, Option<String>>,
     },
     Ping,
 }
@@ -132,6 +139,10 @@ pub struct CompletionItem {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KernelResponse {
+    StreamEvent {
+        event: String,
+        data: serde_json::Value,
+    },
     EvalResult {
         execution_count: u64,
         stdout: String,
@@ -164,11 +175,25 @@ pub enum KernelResponse {
     },
 }
 
-struct EvalCollector {
+struct EvalCollector<'a> {
     stdout: String,
     displays: Vec<DisplayItem>,
     results: Vec<EvalValue>,
     error: Option<EvalError>,
+    stream: Option<&'a mut dyn Write>,
+}
+
+fn emit_stream_line(writer: &mut Option<&mut dyn Write>, event: &str, data: serde_json::Value) {
+    if let Some(w) = writer.as_mut() {
+        let msg = KernelResponse::StreamEvent {
+            event: event.to_string(),
+            data,
+        };
+        if let Ok(encoded) = serde_json::to_string(&msg) {
+            let _ = writeln!(w, "{}", encoded);
+            let _ = w.flush();
+        }
+    }
 }
 
 extern "C" fn on_stdout(data: *const c_char, len: usize, ctx: *mut c_void) {
@@ -176,15 +201,17 @@ extern "C" fn on_stdout(data: *const c_char, len: usize, ctx: *mut c_void) {
         return;
     }
     unsafe {
-        let collector = &mut *(ctx as *mut EvalCollector);
+        let collector = &mut *(ctx as *mut EvalCollector<'_>);
         let bytes = std::slice::from_raw_parts(data as *const u8, len);
-        collector.stdout.push_str(&String::from_utf8_lossy(bytes));
+        let chunk = String::from_utf8_lossy(bytes).into_owned();
+        collector.stdout.push_str(&chunk);
+        emit_stream_line(&mut collector.stream, "stdout", serde_json::json!({ "text": chunk }));
     }
 }
 
 extern "C" fn on_display(mime: *const c_char, data: *const c_char, len: usize, ctx: *mut c_void) {
     unsafe {
-        let collector = &mut *(ctx as *mut EvalCollector);
+        let collector = &mut *(ctx as *mut EvalCollector<'_>);
         let mime_str = if mime.is_null() {
             "text/plain".to_string()
         } else {
@@ -196,6 +223,37 @@ extern "C" fn on_display(mime: *const c_char, data: *const c_char, len: usize, c
             let bytes = std::slice::from_raw_parts(data as *const u8, len);
             String::from_utf8_lossy(bytes).into_owned()
         };
+        if mime_str == "application/vnd.minilang.progress+json" {
+            let parsed = serde_json::from_str::<serde_json::Value>(&data_str)
+                .unwrap_or_else(|_| serde_json::json!({ "percent": 0 }));
+            emit_stream_line(&mut collector.stream, "progress", parsed);
+            // Update/replace existing progress display with same id so final output stays tidy
+            let new_id = serde_json::from_str::<serde_json::Value>(&data_str)
+                .ok()
+                .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_else(|| "default".to_string());
+            if let Some(existing) = collector.displays.iter_mut().find(|d| {
+                d.mime == "application/vnd.minilang.progress+json"
+                    && serde_json::from_str::<serde_json::Value>(&d.data)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
+                        .unwrap_or_else(|| "default".to_string())
+                        == new_id
+            }) {
+                existing.data = data_str;
+            } else {
+                collector.displays.push(DisplayItem {
+                    mime: mime_str,
+                    data: data_str,
+                });
+            }
+            return;
+        }
+        emit_stream_line(
+            &mut collector.stream,
+            "display",
+            serde_json::json!({ "mime": mime_str, "data": data_str }),
+        );
         collector.displays.push(DisplayItem {
             mime: mime_str,
             data: data_str,
@@ -211,7 +269,7 @@ extern "C" fn on_result(
     ctx: *mut c_void,
 ) {
     unsafe {
-        let collector = &mut *(ctx as *mut EvalCollector);
+        let collector = &mut *(ctx as *mut EvalCollector<'_>);
         let t = if type_name.is_null() {
             "any".to_string()
         } else {
@@ -238,7 +296,7 @@ extern "C" fn on_error(
     ctx: *mut c_void,
 ) {
     unsafe {
-        let collector = &mut *(ctx as *mut EvalCollector);
+        let collector = &mut *(ctx as *mut EvalCollector<'_>);
         let et = if err_type.is_null() {
             "Error".to_string()
         } else {
@@ -495,6 +553,7 @@ fn handle_invoke(
         displays: Vec::new(),
         results: Vec::new(),
         error: None,
+        stream: None,
     };
 
     unsafe {
@@ -637,6 +696,23 @@ pub fn run_kernel_process() -> io::Result<()> {
                     message: format!("chdir failed: {}", e),
                 },
             },
+            Ok(KernelRequest::SetEnv { vars }) => {
+                for (k, v) in vars {
+                    match v {
+                        Some(val) => {
+                            std::env::set_var(&k, &val);
+                            std::env::set_var(format!("MLNB_SECRET_{}", k), &val);
+                        }
+                        None => {
+                            std::env::remove_var(&k);
+                            std::env::remove_var(format!("MLNB_SECRET_{}", k));
+                        }
+                    }
+                }
+                KernelResponse::Ok {
+                    message: "environment updated".to_string(),
+                }
+            }
             Ok(KernelRequest::Eval { code, source }) => {
                 exec_count += 1;
                 let source_str = source.unwrap_or_else(|| format!("In[{}]", exec_count));
@@ -648,6 +724,7 @@ pub fn run_kernel_process() -> io::Result<()> {
                     displays: Vec::new(),
                     results: Vec::new(),
                     error: None,
+                    stream: None,
                 };
 
                 let start = Instant::now();
@@ -659,7 +736,44 @@ pub fn run_kernel_process() -> io::Result<()> {
                         on_display,
                         on_result,
                         on_error,
-                        &mut collector as *mut EvalCollector as *mut c_void,
+                        &mut collector as *mut EvalCollector<'_> as *mut c_void,
+                    );
+                }
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                KernelResponse::EvalResult {
+                    execution_count: exec_count,
+                    stdout: collector.stdout,
+                    displays: collector.displays,
+                    results: collector.results,
+                    error: collector.error,
+                    duration_ms,
+                }
+            }
+            Ok(KernelRequest::EvalStream { code, source }) => {
+                exec_count += 1;
+                let source_str = source.unwrap_or_else(|| format!("In[{}]", exec_count));
+                let c_source = CString::new(source_str.replace('\0', "")).unwrap();
+                let c_code = CString::new(code.replace('\0', "")).unwrap();
+
+                let mut collector = EvalCollector {
+                    stdout: String::new(),
+                    displays: Vec::new(),
+                    results: Vec::new(),
+                    error: None,
+                    stream: Some(&mut out),
+                };
+
+                let start = Instant::now();
+                unsafe {
+                    mlk_eval(
+                        c_source.as_ptr(),
+                        c_code.as_ptr(),
+                        on_stdout,
+                        on_display,
+                        on_result,
+                        on_error,
+                        &mut collector as *mut EvalCollector<'_> as *mut c_void,
                     );
                 }
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;

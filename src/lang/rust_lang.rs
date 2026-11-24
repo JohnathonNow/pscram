@@ -208,6 +208,10 @@ impl LanguageBackend for RustBackend {
                 .env("__ML_RESULT_FILE", &result_file)
                 .env("__ML_DISPLAYS_FILE", &displays_file)
                 .kill_on_drop(true);
+            for (k, v) in &req.env {
+                cmd.env(k, v);
+                cmd.env(format!("MLNB_SECRET_{}", k), v);
+            }
             if req.cwd.exists() {
                 cmd.current_dir(&req.cwd);
             }

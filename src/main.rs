@@ -8,6 +8,9 @@ mod lang;
 mod log_reader;
 mod notebook;
 mod rust_kernel_proc;
+mod scheduler;
+mod secrets;
+mod sqlite_reader;
 mod tagged;
 
 use clap::Parser;
@@ -77,6 +80,10 @@ struct Cli {
     /// Timeout in seconds for inline `agy` requests (default: 120)
     #[arg(long, default_value_t = 120)]
     agy_timeout: u64,
+
+    /// Master encryption key for workspace secrets vault (or set MINILANG_SECRETS_KEY)
+    #[arg(long)]
+    secrets_key: Option<String>,
 }
 
 fn main() {
@@ -100,14 +107,28 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     rt.block_on(async move {
-        let files = files::FileStore::new(cli.root.clone()).unwrap_or_else(|e| {
+        let files = Arc::new(files::FileStore::new(cli.root.clone()).unwrap_or_else(|e| {
             eprintln!("Invalid root directory '{}': {}", cli.root.display(), e);
             std::process::exit(1);
-        });
+        }));
         let root_canon = files.root().to_path_buf();
         std::env::set_var("MINILANG_WORKSPACE_ROOT", &root_canon);
         let languages = Arc::new(lang::LanguageRegistry::with_defaults());
-        let kernels = kernel_mgr::KernelManager::new(root_canon.clone(), languages.clone());
+        let secrets = Arc::new(
+            secrets::SecretsVault::open(&root_canon, cli.secrets_key.clone()).unwrap_or_else(|e| {
+                eprintln!("Failed to initialize secrets vault: {}", e);
+                std::process::exit(1);
+            }),
+        );
+        let kernels = Arc::new(kernel_mgr::KernelManager::new(
+            root_canon.clone(),
+            languages.clone(),
+            secrets.clone(),
+        ));
+        let scheduler = Arc::new(scheduler::Scheduler::open(&root_canon));
+        scheduler
+            .clone()
+            .spawn_background(files.clone(), kernels.clone(), languages.clone());
         let auth_config = auth::AuthConfig::new(
             cli.require_login,
             cli.require_group.clone(),
@@ -134,6 +155,8 @@ fn main() {
             languages,
             auth: auth.clone(),
             agy: agy_runner.clone(),
+            secrets: secrets.clone(),
+            scheduler: scheduler.clone(),
             web_dir: cli.web_dir,
         });
 

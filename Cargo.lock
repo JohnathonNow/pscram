@@ -473,6 +473,7 @@ dependencies = [
  "cc",
  "chrono",
  "clap",
+ "futures-core",
  "libc",
  "serde",
  "serde_json",

@@ -54,6 +54,10 @@ impl LanguageBackend for MinilangBackend {
             let mut cmd = self
                 .kernel_command(&req.cwd)
                 .map_err(InvokeExecError::Internal)?;
+            for (k, v) in &req.env {
+                cmd.env(k, v);
+                cmd.env(format!("MLNB_SECRET_{}", k), v);
+            }
 
             let mut child = cmd
                 .spawn()

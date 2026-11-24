@@ -21,6 +21,7 @@
 #include "ml_ui.h"
 #include "ml_io.h"
 #include "ml_log.h"
+#include "ml_db.h"
 #include "stringmap.h"
 
 #include <stdio.h>
@@ -329,6 +330,310 @@ ML_FUNCTION(MLKDisplay) {
     return mlk_emit_display_value(Mime, Args[1]);
 }
 
+/* --- Rich Table, Chart, Progress, Env & Secret Built-ins --- */
+
+static ml_value_t *mlk_to_json_safe(ml_value_t *Val) {
+    Val = ml_deref(Val);
+    if (!Val || Val == MLNil) return MLNil;
+    if (ml_is(Val, MLBooleanT) || ml_is(Val, MLIntegerT) || ml_is(Val, MLRealT) || ml_is(Val, MLStringT)) {
+        return Val;
+    }
+    if (ml_is(Val, MLListT)) {
+        ml_value_t *Out = ml_list();
+        ML_LIST_FOREACH(Val, Node) {
+            ml_list_put(Out, mlk_to_json_safe(Node->Value));
+        }
+        return Out;
+    }
+    if (ml_is(Val, MLTupleT)) {
+        ml_value_t *Out = ml_list();
+        int N = ml_tuple_size(Val);
+        for (int I = 1; I <= N; ++I) {
+            ml_list_put(Out, mlk_to_json_safe(ml_tuple_get(Val, I)));
+        }
+        return Out;
+    }
+    if (ml_is(Val, MLMapT)) {
+        ml_value_t *Out = ml_map();
+        ML_MAP_FOREACH(Val, Node) {
+            ml_value_t *K = ml_deref(Node->Key);
+            ml_value_t *KStr = K;
+            if (!ml_is(K, MLStringT)) {
+                ml_stringbuffer_t KSb[1] = {ML_STRINGBUFFER_INIT};
+                ml_stringbuffer_simple_append(KSb, K);
+                size_t KLen = KSb->Length;
+                const char *S = ml_stringbuffer_get_string(KSb);
+                KStr = ml_string_copy(S ? S : "", (int)KLen);
+            }
+            ml_map_insert(Out, KStr, mlk_to_json_safe(Node->Value));
+        }
+        return Out;
+    }
+    ml_stringbuffer_t Sb[1] = {ML_STRINGBUFFER_INIT};
+    ml_stringbuffer_simple_append(Sb, Val);
+    size_t Len = Sb->Length;
+    const char *S = ml_stringbuffer_get_string(Sb);
+    return ml_string_copy(S ? S : "", (int)Len);
+}
+
+static ml_value_t *mlk_emit_json_display(const char *Mime, ml_value_t *Payload) {
+    ml_stringbuffer_t Sb[1] = {ML_STRINGBUFFER_INIT};
+    ml_value_t *Err = ml_json_encode(Sb, Payload);
+    if (Err) return Err;
+    size_t Len = Sb->Length;
+    const char *Str = ml_stringbuffer_get_string(Sb);
+    if (g_display_cb && Str) {
+        g_display_cb(Mime, Str, Len, g_cb_ctx);
+    }
+    return MLNil;
+}
+
+/* table(data, title?) -> emits application/vnd.minilang.table+json */
+ML_FUNCTION(MLKTable) {
+    ML_CHECK_ARG_COUNT(1);
+    ml_value_t *Input = ml_deref(Args[0]);
+    const char *Title = NULL;
+    if (Count >= 2 && ml_is(ml_deref(Args[1]), MLStringT)) {
+        Title = ml_string_value(ml_deref(Args[1]));
+    }
+
+    ml_value_t *Columns = ml_list();
+    ml_value_t *Rows = ml_list();
+
+    if (ml_is(Input, MLMapT)) {
+        ml_list_put(Columns, ml_cstring("Key"));
+        ml_list_put(Columns, ml_cstring("Value"));
+        ML_MAP_FOREACH(Input, Node) {
+            ml_value_t *Row = ml_list();
+            ml_list_put(Row, mlk_to_json_safe(Node->Key));
+            ml_list_put(Row, mlk_to_json_safe(Node->Value));
+            ml_list_put(Rows, Row);
+        }
+    } else if (ml_is(Input, MLListT)) {
+        /* Inspect elements: list of maps OR list of lists OR list of scalars */
+        int HasMaps = 0;
+        int MaxCols = 0;
+        stringmap_t ColSeen[1] = {STRINGMAP_INIT};
+
+        ML_LIST_FOREACH(Input, Node) {
+            ml_value_t *Item = ml_deref(Node->Value);
+            if (ml_is(Item, MLMapT)) {
+                HasMaps = 1;
+                ML_MAP_FOREACH(Item, MNode) {
+                    ml_value_t *K = ml_deref(MNode->Key);
+                    const char *Ks = NULL;
+                    if (ml_is(K, MLStringT)) {
+                        Ks = ml_string_value(K);
+                    } else {
+                        ml_stringbuffer_t KSb[1] = {ML_STRINGBUFFER_INIT};
+                        ml_stringbuffer_simple_append(KSb, K);
+                        Ks = ml_stringbuffer_get_string(KSb);
+                    }
+                    if (Ks && !stringmap_search(ColSeen, Ks)) {
+                        stringmap_insert(ColSeen, Ks, (void *)1);
+                        ml_list_put(Columns, ml_string_copy(Ks, (int)strlen(Ks)));
+                    }
+                }
+            } else if (ml_is(Item, MLListT)) {
+                int L = ml_list_length(Item);
+                if (L > MaxCols) MaxCols = L;
+            } else if (ml_is(Item, MLTupleT)) {
+                int L = ml_tuple_size(Item);
+                if (L > MaxCols) MaxCols = L;
+            }
+        }
+
+        if (HasMaps) {
+            ML_LIST_FOREACH(Input, Node) {
+                ml_value_t *Item = ml_deref(Node->Value);
+                ml_value_t *Row = ml_list();
+                ML_LIST_FOREACH(Columns, CNode) {
+                    ml_value_t *Val = MLNil;
+                    if (ml_is(Item, MLMapT)) {
+                        ml_value_t *Found = ml_map_search(Item, CNode->Value);
+                        if (Found) Val = Found;
+                    }
+                    ml_list_put(Row, mlk_to_json_safe(Val));
+                }
+                ml_list_put(Rows, Row);
+            }
+        } else if (MaxCols > 0) {
+            for (int I = 1; I <= MaxCols; ++I) {
+                char Buf[32];
+                snprintf(Buf, sizeof(Buf), "Col %d", I);
+                ml_list_put(Columns, ml_string_copy(Buf, (int)strlen(Buf)));
+            }
+            ML_LIST_FOREACH(Input, Node) {
+                ml_value_t *Item = ml_deref(Node->Value);
+                ml_value_t *Row = ml_list();
+                if (ml_is(Item, MLListT)) {
+                    int Col = 0;
+                    ML_LIST_FOREACH(Item, INode) {
+                        ml_list_put(Row, mlk_to_json_safe(INode->Value));
+                        Col++;
+                    }
+                    while (Col++ < MaxCols) ml_list_put(Row, MLNil);
+                } else if (ml_is(Item, MLTupleT)) {
+                    int N = ml_tuple_size(Item);
+                    for (int I = 1; I <= MaxCols; ++I) {
+                        ml_list_put(Row, I <= N ? mlk_to_json_safe(ml_tuple_get(Item, I)) : MLNil);
+                    }
+                } else {
+                    ml_list_put(Row, mlk_to_json_safe(Item));
+                    for (int I = 1; I < MaxCols; ++I) ml_list_put(Row, MLNil);
+                }
+                ml_list_put(Rows, Row);
+            }
+        } else {
+            ml_list_put(Columns, ml_cstring("Index"));
+            ml_list_put(Columns, ml_cstring("Value"));
+            int64_t Idx = 1;
+            ML_LIST_FOREACH(Input, Node) {
+                ml_value_t *Row = ml_list();
+                ml_list_put(Row, ml_integer(Idx++));
+                ml_list_put(Row, mlk_to_json_safe(Node->Value));
+                ml_list_put(Rows, Row);
+            }
+        }
+    } else {
+        ml_list_put(Columns, ml_cstring("Value"));
+        ml_value_t *Row = ml_list();
+        ml_list_put(Row, mlk_to_json_safe(Input));
+        ml_list_put(Rows, Row);
+    }
+
+    ml_value_t *Payload = ml_map();
+    if (Title) ml_map_insert(Payload, ml_cstring("title"), ml_string_copy(Title, (int)strlen(Title)));
+    ml_map_insert(Payload, ml_cstring("columns"), Columns);
+    ml_map_insert(Payload, ml_cstring("rows"), Rows);
+    return mlk_emit_json_display("application/vnd.minilang.table+json", Payload);
+}
+
+/* chart(spec_map) OR chart(type_str, data, title?) -> emits application/vnd.minilang.chart+json */
+ML_FUNCTION(MLKChart) {
+    ML_CHECK_ARG_COUNT(1);
+    ml_value_t *First = ml_deref(Args[0]);
+    ml_value_t *Spec = NULL;
+
+    if (ml_is(First, MLMapT)) {
+        Spec = mlk_to_json_safe(First);
+    } else if (ml_is(First, MLStringT)) {
+        Spec = ml_map();
+        ml_map_insert(Spec, ml_cstring("type"), First);
+        if (Count >= 2) {
+            ml_map_insert(Spec, ml_cstring("data"), mlk_to_json_safe(Args[1]));
+        }
+        if (Count >= 3 && ml_is(ml_deref(Args[2]), MLStringT)) {
+            ml_map_insert(Spec, ml_cstring("title"), ml_deref(Args[2]));
+        }
+    } else if (ml_is(First, MLListT)) {
+        Spec = ml_map();
+        ml_map_insert(Spec, ml_cstring("type"), ml_cstring("line"));
+        ml_map_insert(Spec, ml_cstring("data"), mlk_to_json_safe(First));
+        if (Count >= 2 && ml_is(ml_deref(Args[1]), MLStringT)) {
+            ml_map_insert(Spec, ml_cstring("title"), ml_deref(Args[1]));
+        }
+    } else {
+        return ml_error("TypeError", "chart() expects a spec map, chart type string, or data list");
+    }
+
+    return mlk_emit_json_display("application/vnd.minilang.chart+json", Spec);
+}
+
+/* progress(done, total, label?, id?) -> emits application/vnd.minilang.progress+json */
+ML_FUNCTION(MLKProgress) {
+    ML_CHECK_ARG_COUNT(2);
+    ml_value_t *DoneV = ml_deref(Args[0]);
+    ml_value_t *TotalV = ml_deref(Args[1]);
+    double Done = ml_is(DoneV, MLIntegerT) ? (double)ml_integer_value(DoneV) : (ml_is(DoneV, MLRealT) ? ml_real_value(DoneV) : 0.0);
+    double Total = ml_is(TotalV, MLIntegerT) ? (double)ml_integer_value(TotalV) : (ml_is(TotalV, MLRealT) ? ml_real_value(TotalV) : 100.0);
+    double Pct = Total > 0.0 ? (Done / Total) * 100.0 : 0.0;
+    if (Pct < 0.0) Pct = 0.0;
+    if (Pct > 100.0) Pct = 100.0;
+
+    ml_value_t *Payload = ml_map();
+    ml_map_insert(Payload, ml_cstring("done"), ml_real(Done));
+    ml_map_insert(Payload, ml_cstring("total"), ml_real(Total));
+    ml_map_insert(Payload, ml_cstring("percent"), ml_real(Pct));
+    if (Count >= 3 && ml_is(ml_deref(Args[2]), MLStringT)) {
+        ml_map_insert(Payload, ml_cstring("label"), ml_deref(Args[2]));
+    } else {
+        ml_map_insert(Payload, ml_cstring("label"), ml_cstring(""));
+    }
+    if (Count >= 4 && ml_is(ml_deref(Args[3]), MLStringT)) {
+        ml_map_insert(Payload, ml_cstring("id"), ml_deref(Args[3]));
+    } else {
+        ml_map_insert(Payload, ml_cstring("id"), ml_cstring("default"));
+    }
+    return mlk_emit_json_display("application/vnd.minilang.progress+json", Payload);
+}
+
+/* env::get(key, default?), env::set(key, val), env::has(key), env::all() and secret(key, default?) */
+extern char **environ;
+
+ML_FUNCTION(MLKEnvGet) {
+    ML_CHECK_ARG_COUNT(1);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    const char *Key = ml_string_value(Args[0]);
+    const char *Val = getenv(Key);
+    if (Val) return ml_string_copy(Val, (int)strlen(Val));
+    if (Count >= 2) return ml_deref(Args[1]);
+    return MLNil;
+}
+
+ML_FUNCTION(MLKEnvSet) {
+    ML_CHECK_ARG_COUNT(2);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    const char *Key = ml_string_value(Args[0]);
+    ml_value_t *Val = ml_deref(Args[1]);
+    if (Val == MLNil) {
+        unsetenv(Key);
+        return MLNil;
+    }
+    ML_CHECK_ARG_TYPE(1, MLStringT);
+    setenv(Key, ml_string_value(Val), 1);
+    return Val;
+}
+
+ML_FUNCTION(MLKEnvHas) {
+    ML_CHECK_ARG_COUNT(1);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    return getenv(ml_string_value(Args[0])) ? ml_boolean(1) : MLNil;
+}
+
+ML_FUNCTION(MLKEnvAll) {
+    ml_value_t *Map = ml_map();
+    if (environ) {
+        for (char **E = environ; *E; ++E) {
+            const char *Eq = strchr(*E, '=');
+            if (!Eq) continue;
+            ml_value_t *K = ml_string_copy(*E, (int)(Eq - *E));
+            ml_value_t *V = ml_string_copy(Eq + 1, (int)strlen(Eq + 1));
+            ml_map_insert(Map, K, V);
+        }
+    }
+    return Map;
+}
+
+ML_FUNCTION(MLKSecret) {
+    ML_CHECK_ARG_COUNT(1);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    const char *Key = ml_string_value(Args[0]);
+    size_t Klen = strlen(Key);
+    char *Prefixed = (char *)malloc(Klen + 16);
+    const char *Val = NULL;
+    if (Prefixed) {
+        memcpy(Prefixed, "MLNB_SECRET_", 12);
+        memcpy(Prefixed + 12, Key, Klen + 1);
+        Val = getenv(Prefixed);
+        free(Prefixed);
+    }
+    if (!Val) Val = getenv(Key);
+    if (Val) return ml_string_copy(Val, (int)strlen(Val));
+    if (Count >= 2) return ml_deref(Args[1]);
+    return MLNil;
+}
+
 ML_FUNCTION(MLKLocale) {
     return ml_string(setlocale(LC_ALL, NULL), -1);
 }
@@ -483,7 +788,18 @@ void mlk_init(const char *exec_name) {
     stringmap_insert(MLGlobals, "image", MLKImage);
     stringmap_insert(MLGlobals, "pdf", MLKPdf);
     stringmap_insert(MLGlobals, "preview", MLKPreview);
+    stringmap_insert(MLGlobals, "table", MLKTable);
+    stringmap_insert(MLGlobals, "chart", MLKChart);
+    stringmap_insert(MLGlobals, "progress", MLKProgress);
+    stringmap_insert(MLGlobals, "secret", MLKSecret);
     stringmap_insert(MLGlobals, "display", MLKDisplay);
+    ml_value_t *EnvMod = ml_module("env",
+        "get", MLKEnvGet,
+        "set", MLKEnvSet,
+        "has", MLKEnvHas,
+        "all", MLKEnvAll,
+        NULL);
+    stringmap_insert(MLGlobals, "env", EnvMod);
     stringmap_insert(MLGlobals, "locale", MLKLocale);
     stringmap_insert(MLGlobals, "halt", MLKHalt);
     stringmap_insert(MLGlobals, "break", MLBreak);
@@ -553,6 +869,11 @@ void mlk_init(const char *exec_name) {
     ml_externals_default_add("image", MLKImage);
     ml_externals_default_add("pdf", MLKPdf);
     ml_externals_default_add("preview", MLKPreview);
+    ml_externals_default_add("table", MLKTable);
+    ml_externals_default_add("chart", MLKChart);
+    ml_externals_default_add("progress", MLKProgress);
+    ml_externals_default_add("secret", MLKSecret);
+    ml_externals_default_add("env", EnvMod);
     ml_externals_default_add("json", MLJsonT);
     ml_externals_default_add("time", MLTimeT);
     ml_externals_default_add("uuid", MLUUIDT);
@@ -562,6 +883,7 @@ void mlk_init(const char *exec_name) {
     ml_ui_init(MLGlobals, mlk_emit_ui_display);
     ml_io_init(MLGlobals);
     ml_log_init(MLGlobals);
+    ml_db_init(MLGlobals);
 
     g_compiler = ml_compiler2((ml_getter_t)ml_stringmap_global_get, MLGlobals, 1);
     g_parser = ml_parser(NULL, NULL);

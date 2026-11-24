@@ -31,6 +31,32 @@
           <span id="kernel-dot" class="status-dot idle"></span>
           <span id="kernel-label">Minilang 2.17</span>
         </div>
+        <button id="btn-command-palette" class="toolbar-chip" title="Command Palette (Ctrl+Shift+P)">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="4 17 10 11 4 5"/>
+            <line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+          <span>Commands</span>
+        </button>
+        <button id="btn-find-in-files" class="icon-btn" title="Find in Files (Ctrl+Shift+F)">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+        </button>
+        <button id="btn-open-schedules" class="toolbar-chip" title="Scheduled Jobs & Webhooks">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span>Schedules</span>
+        </button>
+        <button id="btn-open-secrets" class="toolbar-chip" title="Encrypted Workspace Secrets Vault">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+          </svg>
+          <span>Secrets</span>
+        </button>
         <button id="btn-toggle-vars" class="toolbar-chip" title="Toggle Variable Inspector">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
@@ -104,6 +130,14 @@
                 <line x1="9" y1="14" x2="15" y2="14"/>
               </svg>
             </button>
+            <button id="btn-upload-files" class="icon-btn sm" title="Upload Files into Current Folder">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </button>
+            <input id="file-upload-input" type="file" multiple class="hidden" />
             <button id="btn-toggle-hidden" class="icon-btn sm" title="Toggle Hidden Files">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
@@ -131,6 +165,14 @@
         <div id="breadcrumbs" class="breadcrumbs"></div>
 
         <div id="file-list" class="file-list" role="tree"></div>
+        <div id="sidebar-dropzone" class="sidebar-dropzone hidden">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <span id="sidebar-dropzone-label">Drop files to upload</span>
+        </div>
 
         <div class="sidebar-footer">
           <div class="sidebar-section-label">ACTIVE KERNELS</div>
@@ -302,6 +344,29 @@
           <span id="ltb-meta" class="tb-meta"></span>
         </div>
 
+        <!-- SQLite Browser Toolbar -->
+        <div id="sqlite-toolbar" class="editor-toolbar hidden">
+          <div class="toolbar-group">
+            <button id="sqltb-run" class="tb-btn primary" title="Execute SQL Query (Ctrl+Enter)">Run SQL</button>
+            <button id="sqltb-refresh" class="tb-btn" title="Reload Schema">Refresh Schema</button>
+            <label class="tb-check-label" title="Allow INSERT/UPDATE/DELETE/CREATE statements">
+              <input id="sqltb-allow-write" type="checkbox" />
+              <span>Allow writes</span>
+            </label>
+            <button id="sqltb-download" class="tb-btn" title="Download SQLite Database">Download</button>
+          </div>
+          <span id="sqltb-meta" class="tb-meta"></span>
+        </div>
+
+        <!-- Tabular CSV/TSV Data Viewer Toolbar -->
+        <div id="data-toolbar" class="editor-toolbar hidden">
+          <div class="toolbar-group">
+            <button id="dtb-edit-raw" class="tb-btn" title="Open Raw Text in Editor">Edit Raw Text</button>
+            <button id="dtb-download" class="tb-btn" title="Download File">Download</button>
+          </div>
+          <span id="dtb-meta" class="tb-meta"></span>
+        </div>
+
         <!-- Notebook Canvas -->
         <div id="notebook-view" class="notebook-scroll">
           <div id="cells-container" class="cells-container"></div>
@@ -413,6 +478,27 @@
         <div id="log-view" class="log-viewer-pane hidden">
           <div id="log-entries-list" class="log-entries-list"></div>
         </div>
+
+        <!-- SQLite Database Browser -->
+        <div id="sqlite-view" class="sqlite-viewer-pane hidden">
+          <aside class="sqlite-schema-pane">
+            <div class="sidebar-section-label" style="padding:8px 10px 4px">TABLES &amp; VIEWS</div>
+            <div id="sqlite-schema-list" class="sqlite-schema-list"></div>
+          </aside>
+          <section class="sqlite-query-pane">
+            <div class="sqlite-editor-wrap">
+              <textarea id="sqlite-sql-input" class="sqlite-sql-editor" spellcheck="false" placeholder="SELECT * FROM ... LIMIT 100;  (Ctrl+Enter to execute)"></textarea>
+            </div>
+            <div id="sqlite-results-body" class="sqlite-results-body">
+              <div class="log-empty">Select a table on the left or run a SQL query above.</div>
+            </div>
+          </section>
+        </div>
+
+        <!-- CSV / TSV Tabular Data Viewer -->
+        <div id="data-view" class="data-viewer-pane hidden">
+          <div id="data-table-host" class="data-table-host"></div>
+        </div>
       </main>
 
       <!-- Right Variable Inspector Drawer -->
@@ -446,6 +532,7 @@
         <span class="shortcut-hint"><kbd>Shift</kbd>+<kbd>Enter</kbd> Run</span>
         <span class="shortcut-hint"><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</span>
         <span class="shortcut-hint"><kbd>Ctrl</kbd>+<kbd>K</kbd> agy</span>
+        <span class="shortcut-hint"><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> Commands</span>
         <span class="shortcut-hint"><kbd>Tab</kbd> Complete</span>
         <span class="status-sep">|</span>
         <span id="status-kernel">Kernel idle</span>
@@ -517,6 +604,85 @@
 
   <!-- File Explorer Right-Click Context Menu -->
   <div id="file-context-menu" class="context-menu hidden" role="menu"></div>
+
+  <!-- Command Palette (Ctrl+Shift+P / Ctrl+P) -->
+  <div id="cmd-palette-overlay" class="cmd-palette-overlay hidden" role="dialog" aria-modal="true">
+    <div class="cmd-palette-card">
+      <div class="cmd-palette-input-wrap">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input id="cmd-palette-input" class="cmd-palette-input" type="text" placeholder="Type a command or filename..." autocomplete="off" />
+        <span class="cmd-palette-esc">ESC</span>
+      </div>
+      <div id="cmd-palette-list" class="cmd-palette-list"></div>
+    </div>
+  </div>
+
+  <!-- Find in Files Modal (Ctrl+Shift+F) -->
+  <div id="grep-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide-modal-card">
+      <div class="modal-header">
+        <h3>Find in Files</h3>
+        <button id="grep-modal-close" class="icon-btn sm">&times;</button>
+      </div>
+      <div class="modal-body grep-modal-body">
+        <div class="grep-controls">
+          <input id="grep-input" class="modal-input" type="text" placeholder="Search across workspace scripts, notebooks, UIs, Markdown..." autocomplete="off" />
+          <input id="grep-ext" class="modal-input grep-ext-input" type="text" placeholder="ext (e.g. mini)" autocomplete="off" />
+          <label class="tb-check-label"><input id="grep-case" type="checkbox" /><span>Aa</span></label>
+          <button id="grep-run-btn" class="tb-btn primary">Search</button>
+        </div>
+        <div id="grep-status" class="tb-meta" style="margin:6px 0"></div>
+        <div id="grep-results" class="grep-results">
+          <div class="log-empty">Enter a search term to search workspace files and notebook cells.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Schedules & Webhooks Manager Modal -->
+  <div id="schedules-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide-modal-card">
+      <div class="modal-header">
+        <h3>Scheduled Jobs &amp; Webhooks</h3>
+        <button id="schedules-modal-close" class="icon-btn sm">&times;</button>
+      </div>
+      <div class="modal-body manager-modal-body">
+        <form id="schedule-create-form" class="manager-form">
+          <input id="sched-name" class="modal-input" type="text" placeholder="Job name (e.g. Hourly Sync)" />
+          <input id="sched-script" class="modal-input" type="text" placeholder="Script path (e.g. scripts/greet.mini)" required />
+          <input id="sched-cron" class="modal-input" type="text" placeholder="Cron (e.g. */5 * * * *)" />
+          <input id="sched-interval" class="modal-input" type="number" min="5" placeholder="or Interval (sec)" />
+          <button type="submit" class="tb-btn primary">Add Schedule</button>
+        </form>
+        <div id="schedules-list" class="manager-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Encrypted Secrets Vault Modal -->
+  <div id="secrets-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide-modal-card">
+      <div class="modal-header">
+        <h3>Encrypted Workspace Secrets Vault</h3>
+        <button id="secrets-modal-close" class="icon-btn sm">&times;</button>
+      </div>
+      <div class="modal-body manager-modal-body">
+        <p class="vault-hint">
+          Stored encrypted on disk (<code>.minilang-secrets.enc</code>) and injected into all kernels &amp; <code>/invoke</code> scripts.
+          Access in Minilang with <code>secret("KEY")</code> or <code>env::get("KEY")</code>, and in Rust with <code>secret("KEY")</code> or <code>std::env::var("KEY")</code>.
+        </p>
+        <form id="secret-create-form" class="manager-form">
+          <input id="secret-name" class="modal-input" type="text" placeholder="KEY_NAME (e.g. OPENAI_API_KEY)" required />
+          <input id="secret-value" class="modal-input" type="password" placeholder="Secret value" required />
+          <input id="secret-desc" class="modal-input" type="text" placeholder="Optional description" />
+          <button type="submit" class="tb-btn primary">Save Secret</button>
+        </form>
+        <div id="secrets-list" class="manager-list"></div>
+      </div>
+    </div>
+  </div>
 
   <script src="/minijs_vm.js"></script>
   <script src="/app.js"></script>

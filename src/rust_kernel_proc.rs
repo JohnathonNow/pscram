@@ -33,6 +33,10 @@ const RUST_PRELUDE_ITEMS: &[(&str, &str, &str)] = &[
     ("pdf", "function", "fn(&str)"),
     ("pdf_bytes", "function", "fn(&[u8])"),
     ("preview", "function", "fn(&str)"),
+    ("table", "function", "fn(&str)"),
+    ("chart", "function", "fn(&str)"),
+    ("progress", "function", "fn(f64, f64, &str)"),
+    ("secret", "function", "fn(&str) -> Option<String>"),
     ("display", "function", "fn(&str, &str)"),
     ("Vec", "type", "std::vec::Vec"),
     ("String", "type", "std::string::String"),
@@ -84,9 +88,21 @@ impl RustReplState {
         })
     }
 
-    fn eval_cell(&mut self, code: &str) -> KernelResponse {
+    fn eval_cell(&mut self, code: &str, mut stream: Option<&mut dyn Write>) -> KernelResponse {
         self.exec_count += 1;
         let start = Instant::now();
+        let emit = |stream: &mut Option<&mut dyn Write>, event: &str, data: serde_json::Value| {
+            if let Some(w) = stream.as_mut() {
+                let msg = KernelResponse::StreamEvent {
+                    event: event.to_string(),
+                    data,
+                };
+                if let Ok(encoded) = serde_json::to_string(&msg) {
+                    let _ = writeln!(w, "{}", encoded);
+                    let _ = w.flush();
+                }
+            }
+        };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let extracted = extract_rust_dependencies(code, &cwd);
         let split = split_rust_source(&extracted.code);
@@ -145,6 +161,7 @@ impl RustReplState {
         let used_cargo = !merged_deps.is_empty();
 
         if !used_cargo {
+            emit(&mut stream, "status", serde_json::json!({ "text": "Compiling with rustc..." }));
             if let Err(e) = std::fs::write(&src_path, &harness) {
                 return KernelResponse::EvalResult {
                     execution_count: self.exec_count,
@@ -204,6 +221,7 @@ impl RustReplState {
                 };
             }
         } else {
+            emit(&mut stream, "status", serde_json::json!({ "text": "Building with Cargo..." }));
             let crate_dir = self.session_dir.join("crate");
             let mut candidate_toml = self.last_cargo_toml.clone();
             match build_cargo_project_sync(
@@ -238,41 +256,184 @@ impl RustReplState {
             }
         }
 
-        let run = Command::new(&bin_path)
-            .env("__ML_RES_FILE", &res_path)
-            .env("__ML_VARS_FILE", &vars_path)
-            .env("__ML_DISPLAYS_FILE", &disp_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
+        emit(&mut stream, "status", serde_json::json!({ "text": "Running..." }));
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let exit_status;
+
+        if stream.is_some() {
+            let mut child = match Command::new(&bin_path)
+                .env("__ML_RES_FILE", &res_path)
+                .env("__ML_VARS_FILE", &vars_path)
+                .env("__ML_DISPLAYS_FILE", &disp_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    if !used_cargo {
+                        let _ = std::fs::remove_file(&bin_path);
+                        let _ = std::fs::remove_file(&src_path);
+                    }
+                    return KernelResponse::EvalResult {
+                        execution_count: self.exec_count,
+                        stdout: String::new(),
+                        displays: Vec::new(),
+                        results: Vec::new(),
+                        error: Some(EvalError {
+                            error_type: "RuntimeError".to_string(),
+                            message: format!("Failed to execute compiled cell: {}", e),
+                            traceback: String::new(),
+                        }),
+                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    };
+                }
+            };
+
+            let child_stdout = child.stdout.take();
+            let child_stderr = child.stderr.take();
+
+            let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+            let tx_err = tx.clone();
+            let stdout_handle = std::thread::spawn(move || {
+                if let Some(mut s) = child_stdout {
+                    use std::io::Read;
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                let _ = tx.send((true, chunk));
+                            }
+                        }
+                    }
+                }
+            });
+            let stderr_handle = std::thread::spawn(move || {
+                if let Some(mut s) = child_stderr {
+                    use std::io::Read;
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                let _ = tx_err.send((false, chunk));
+                            }
+                        }
+                    }
+                }
+            });
+
+            let mut disp_lines_emitted = 0usize;
+            loop {
+                while let Ok((is_out, chunk)) = rx.try_recv() {
+                    if is_out {
+                        stdout.push_str(&chunk);
+                        emit(&mut stream, "stdout", serde_json::json!({ "text": chunk }));
+                    } else {
+                        stderr.push_str(&chunk);
+                    }
+                }
+                if let Ok(content) = std::fs::read_to_string(&disp_path) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    while disp_lines_emitted < lines.len() {
+                        if let Ok(item) = serde_json::from_str::<crate::kernel_proc::DisplayItem>(lines[disp_lines_emitted]) {
+                            if item.mime == "application/vnd.minilang.progress+json" {
+                                let parsed = serde_json::from_str::<serde_json::Value>(&item.data)
+                                    .unwrap_or_else(|_| serde_json::json!({ "percent": 0 }));
+                                emit(&mut stream, "progress", parsed);
+                            } else {
+                                emit(&mut stream, "display", serde_json::json!({ "mime": item.mime, "data": item.data }));
+                            }
+                        }
+                        disp_lines_emitted += 1;
+                    }
+                }
+                if let Ok(Some(st)) = child.try_wait() {
+                    exit_status = st;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            while let Ok((is_out, chunk)) = rx.try_recv() {
+                if is_out {
+                    stdout.push_str(&chunk);
+                    emit(&mut stream, "stdout", serde_json::json!({ "text": chunk }));
+                } else {
+                    stderr.push_str(&chunk);
+                }
+            }
+        } else {
+            let run = Command::new(&bin_path)
+                .env("__ML_RES_FILE", &res_path)
+                .env("__ML_VARS_FILE", &vars_path)
+                .env("__ML_DISPLAYS_FILE", &disp_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            match run {
+                Ok(o) => {
+                    stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+                    stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                    exit_status = o.status;
+                }
+                Err(e) => {
+                    if !used_cargo {
+                        let _ = std::fs::remove_file(&bin_path);
+                        let _ = std::fs::remove_file(&src_path);
+                    }
+                    return KernelResponse::EvalResult {
+                        execution_count: self.exec_count,
+                        stdout: String::new(),
+                        displays: Vec::new(),
+                        results: Vec::new(),
+                        error: Some(EvalError {
+                            error_type: "RuntimeError".to_string(),
+                            message: format!("Failed to execute compiled cell: {}", e),
+                            traceback: String::new(),
+                        }),
+                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    };
+                }
+            }
+        }
 
         if !used_cargo {
             let _ = std::fs::remove_file(&bin_path);
             let _ = std::fs::remove_file(&src_path);
         }
 
-        let run_out = match run {
-            Ok(o) => o,
-            Err(e) => {
-                return KernelResponse::EvalResult {
-                    execution_count: self.exec_count,
-                    stdout: String::new(),
-                    displays: Vec::new(),
-                    results: Vec::new(),
-                    error: Some(EvalError {
-                        error_type: "RuntimeError".to_string(),
-                        message: format!("Failed to execute compiled cell: {}", e),
-                        traceback: String::new(),
-                    }),
-                    duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                };
+        let raw_displays = read_displays_file(&disp_path);
+        // Deduplicate progress displays by id (keeping latest)
+        let mut displays: Vec<crate::kernel_proc::DisplayItem> = Vec::new();
+        for item in raw_displays {
+            if item.mime == "application/vnd.minilang.progress+json" {
+                let id = serde_json::from_str::<serde_json::Value>(&item.data)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
+                    .unwrap_or_else(|| "default".to_string());
+                if let Some(existing) = displays.iter_mut().find(|d| {
+                    d.mime == "application/vnd.minilang.progress+json"
+                        && serde_json::from_str::<serde_json::Value>(&d.data)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
+                            .unwrap_or_else(|| "default".to_string())
+                            == id
+                }) {
+                    existing.data = item.data;
+                    continue;
+                }
             }
-        };
-
-        let mut stdout = String::from_utf8_lossy(&run_out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&run_out.stderr).into_owned();
-        let displays = read_displays_file(&disp_path);
+            displays.push(item);
+        }
         let res_raw = std::fs::read_to_string(&res_path).ok();
         let vars_raw = std::fs::read_to_string(&vars_path).ok();
 
@@ -282,7 +443,7 @@ impl RustReplState {
 
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        if !run_out.status.success() {
+        if !exit_status.success() {
             return KernelResponse::EvalResult {
                 execution_count: self.exec_count,
                 stdout,
@@ -291,7 +452,7 @@ impl RustReplState {
                 error: Some(EvalError {
                     error_type: "PanicError".to_string(),
                     message: if stderr.trim().is_empty() {
-                        format!("Exited with status {}", run_out.status)
+                        format!("Exited with status {}", exit_status)
                     } else {
                         stderr.lines().next().unwrap_or("Runtime panic").to_string()
                     },
@@ -545,7 +706,25 @@ pub fn run_rust_kernel_process() -> io::Result<()> {
                     message: format!("chdir failed: {}", e),
                 },
             },
-            Ok(KernelRequest::Eval { code, .. }) => state.eval_cell(&code),
+            Ok(KernelRequest::SetEnv { vars }) => {
+                for (k, v) in vars {
+                    match v {
+                        Some(val) => {
+                            std::env::set_var(&k, &val);
+                            std::env::set_var(format!("MLNB_SECRET_{}", k), &val);
+                        }
+                        None => {
+                            std::env::remove_var(&k);
+                            std::env::remove_var(format!("MLNB_SECRET_{}", k));
+                        }
+                    }
+                }
+                KernelResponse::Ok {
+                    message: "environment updated".to_string(),
+                }
+            }
+            Ok(KernelRequest::Eval { code, .. }) => state.eval_cell(&code, None),
+            Ok(KernelRequest::EvalStream { code, .. }) => state.eval_cell(&code, Some(&mut out)),
             Ok(KernelRequest::Inspect) => KernelResponse::InspectResult {
                 variables: state.last_vars.clone(),
                 globals_count: RUST_PRELUDE_ITEMS.len(),
@@ -767,4 +946,19 @@ fn image_bytes(bytes: &[u8], mime: &str) { __ml_repl::media_bytes(bytes, mime); 
 fn pdf(path: impl AsRef<str>) { __ml_repl::media_path(path.as_ref(), Some("pdf")); }
 fn pdf_bytes(bytes: &[u8]) { __ml_repl::media_bytes(bytes, "application/pdf"); }
 fn preview(path: impl AsRef<str>) { __ml_repl::media_path(path.as_ref(), None); }
+fn table(json: impl AsRef<str>) { __ml_repl::display("application/vnd.minilang.table+json", json); }
+fn chart(json: impl AsRef<str>) { __ml_repl::display("application/vnd.minilang.chart+json", json); }
+fn progress(done: f64, total: f64, label: impl AsRef<str>) {
+    let pct = if total > 0.0 { ((done / total) * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+    let payload = format!(
+        "{{\"done\":{},\"total\":{},\"percent\":{},\"label\":{},\"id\":\"default\"}}",
+        done, total, pct, __ml_repl::esc(label.as_ref())
+    );
+    __ml_repl::display("application/vnd.minilang.progress+json", &payload);
+}
+fn secret(key: impl AsRef<str>) -> Option<String> {
+    std::env::var(format!("MLNB_SECRET_{}", key.as_ref()))
+        .ok()
+        .or_else(|| std::env::var(key.as_ref()).ok())
+}
 "#;
