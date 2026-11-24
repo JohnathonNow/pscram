@@ -68,6 +68,12 @@ static mlk_stdout_cb g_stdout_cb = NULL;
 static mlk_display_cb g_display_cb = NULL;
 static void *g_cb_ctx = NULL;
 
+void mlk_set_output_cbs(mlk_stdout_cb stdout_cb, mlk_display_cb display_cb, void *ctx) {
+    g_stdout_cb = stdout_cb;
+    g_display_cb = display_cb;
+    g_cb_ctx = ctx;
+}
+
 static void mlk_emit_ui_display(const char *mime, const char *data, size_t len) {
     if (g_display_cb) {
         g_display_cb(mime, data, len, g_cb_ctx);

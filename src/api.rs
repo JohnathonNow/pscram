@@ -1,5 +1,6 @@
 use crate::agy::{AgyAssistRequest, AgyRunner};
 use crate::auth::{self, AuthManager, AuthenticatedUser};
+use crate::debugger::{DebugManager, StartDebugRequest};
 use crate::files::FileStore;
 use crate::jobs::{JobManager, StartJobRequest};
 use crate::kernel_mgr::{InvokeExecError, KernelManager};
@@ -40,6 +41,7 @@ pub struct AppState {
     pub secrets: Arc<SecretsVault>,
     pub scheduler: Arc<Scheduler>,
     pub jobs: Arc<JobManager>,
+    pub debugger: Arc<DebugManager>,
     pub internal_token: String,
     pub web_dir: Option<PathBuf>,
 }
@@ -115,6 +117,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/:id", get(api_get_job).delete(api_delete_job))
         .route("/api/jobs/:id/wait", post(api_wait_job))
         .route("/api/jobs/:id/stop", post(api_stop_job))
+        // Interactive Minilang Debugger API
+        .route("/api/debug/sessions", get(api_debug_list))
+        .route("/api/debug/start", post(api_debug_start))
+        .route("/api/debug/:id", get(api_debug_get).delete(api_debug_terminate))
+        .route("/api/debug/:id/step", post(api_debug_step))
+        .route("/api/debug/:id/breakpoints", post(api_debug_breakpoints))
+        .route("/api/debug/:id/config", post(api_debug_config))
+        .route("/api/debug/:id/locals", get(api_debug_locals))
+        .route("/api/debug/:id/eval", post(api_debug_eval))
         // Google Antigravity (agy) inline assistant API
         .route("/api/agy/status", get(api_agy_status))
         .route("/api/agy/assist", post(api_agy_assist))
@@ -1904,4 +1915,135 @@ async fn api_delete_job(
 async fn api_clear_jobs(State(st): State<Arc<AppState>>) -> Response {
     let cleared = st.jobs.clear_finished().await;
     Json(json!({ "ok": true, "cleared": cleared })).into_response()
+}
+
+// --- Interactive Minilang Debugger API ---
+
+async fn api_debug_list(State(st): State<Arc<AppState>>) -> Response {
+    let sessions = st.debugger.list().await;
+    let active = sessions
+        .iter()
+        .filter(|s| s.status == "paused" || s.status == "running")
+        .count();
+    Json(json!({
+        "sessions": sessions,
+        "active": active,
+        "total": sessions.len(),
+    }))
+    .into_response()
+}
+
+async fn api_debug_start(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<StartDebugRequest>,
+) -> Response {
+    match st.debugger.start(req, &st.files).await {
+        Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_debug_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.debugger.get(&id).await {
+        Some(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        None => api_err(StatusCode::NOT_FOUND, format!("Debug session '{}' not found", id)),
+    }
+}
+
+#[derive(Deserialize)]
+struct DebugStepBody {
+    action: String,
+}
+
+async fn api_debug_step(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DebugStepBody>,
+) -> Response {
+    match st.debugger.step(&id, &body.action).await {
+        Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DebugBreakpointsBody {
+    source: String,
+    #[serde(default)]
+    lines: Vec<u32>,
+}
+
+async fn api_debug_breakpoints(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DebugBreakpointsBody>,
+) -> Response {
+    match st.debugger.set_breakpoints(&id, body.source, body.lines).await {
+        Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DebugConfigBody {
+    break_on_error: bool,
+}
+
+async fn api_debug_config(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DebugConfigBody>,
+) -> Response {
+    match st.debugger.set_config(&id, body.break_on_error).await {
+        Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DebugLocalsQuery {
+    #[serde(default)]
+    depth: usize,
+}
+
+async fn api_debug_locals(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<DebugLocalsQuery>,
+) -> Response {
+    match st.debugger.locals(&id, q.depth).await {
+        Ok(locals) => Json(json!({ "ok": true, "depth": q.depth, "locals": locals })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DebugEvalBody {
+    expr: String,
+    #[serde(default)]
+    depth: usize,
+}
+
+async fn api_debug_eval(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<DebugEvalBody>,
+) -> Response {
+    match st.debugger.eval_in_frame(&id, body.expr, body.depth).await {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_debug_terminate(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.debugger.terminate(&id).await {
+        Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
 }

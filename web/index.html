@@ -24,8 +24,6 @@
         </div>
       </div>
 
-      <div id="tab-bar" class="tab-bar" role="tablist"></div>
-
       <div class="topbar-right">
         <div id="kernel-pill" class="kernel-pill" title="Active Minilang Kernel">
           <span id="kernel-dot" class="status-dot idle"></span>
@@ -64,6 +62,18 @@
           </svg>
           <span>Secrets</span>
         </button>
+        <button id="btn-toggle-debug" class="toolbar-chip" title="Toggle Minilang Debugger">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="8" y="6" width="8" height="14" rx="4"/>
+            <path d="M10 6V4a2 2 0 1 1 4 0v2"/>
+            <line x1="3" y1="10" x2="8" y2="10"/>
+            <line x1="16" y1="10" x2="21" y2="10"/>
+            <line x1="3" y1="15" x2="8" y2="15"/>
+            <line x1="16" y1="15" x2="21" y2="15"/>
+          </svg>
+          <span>Debug</span>
+          <span id="debug-active-dot" class="debug-active-dot hidden"></span>
+        </button>
         <button id="btn-toggle-vars" class="toolbar-chip" title="Toggle Variable Inspector">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
@@ -101,6 +111,9 @@
         </div>
       </div>
     </header>
+
+    <!-- Open Files Tab Bar -->
+    <nav id="tab-bar" class="tab-bar" role="tablist" aria-label="Open files"></nav>
 
     <!-- Main Workspace Body -->
     <div class="workspace-body">
@@ -279,6 +292,17 @@
                 <polygon points="5 3 19 12 5 21 5 3"/>
               </svg>
               <span>Run in Minilang</span>
+            </button>
+            <button id="ftb-debug" class="tb-btn hidden" title="Start Interactive Minilang Debugger">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="8" y="6" width="8" height="14" rx="4"/>
+                <path d="M10 6V4a2 2 0 1 1 4 0v2"/>
+                <line x1="3" y1="10" x2="8" y2="10"/>
+                <line x1="16" y1="10" x2="21" y2="10"/>
+                <line x1="3" y1="15" x2="8" y2="15"/>
+                <line x1="16" y1="15" x2="21" y2="15"/>
+              </svg>
+              <span>Debug</span>
             </button>
             <button id="ftb-invoke-mini" class="tb-btn" title="Invoke via POST /invoke with tagged JSON parameters">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
@@ -510,6 +534,111 @@
           <div id="data-table-host" class="data-table-host"></div>
         </div>
       </main>
+
+      <!-- Right Debugger Drawer -->
+      <aside id="debug-drawer" class="debug-drawer hidden">
+        <div class="sidebar-header">
+          <div class="dbg-head-left">
+            <span class="sidebar-title">DEBUGGER</span>
+            <span id="dbg-status-badge" class="dbg-status-badge idle">Idle</span>
+          </div>
+          <div class="sidebar-actions">
+            <button id="btn-close-debug" class="icon-btn sm" title="Close Debugger">&times;</button>
+          </div>
+        </div>
+        <div class="dbg-transport">
+          <button id="dbg-btn-start" class="tb-btn primary dbg-tbtn" title="Start Debugging Active Script or Cell">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <span>Start</span>
+          </button>
+          <button id="dbg-btn-continue" class="tb-btn dbg-tbtn" title="Continue (F5)" disabled>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><polygon points="6 4 18 12 6 20 6 4"/><rect x="18" y="4" width="2.5" height="16"/></svg>
+            <span>Cont</span>
+          </button>
+          <button id="dbg-btn-step-over" class="tb-btn dbg-tbtn" title="Step Over (F10)" disabled>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 13a7 7 0 0 1 14 0"/><polyline points="16 10 19 13 16 16"/><circle cx="12" cy="18" r="2" fill="currentColor"/></svg>
+            <span>Over</span>
+          </button>
+          <button id="dbg-btn-step-in" class="tb-btn dbg-tbtn" title="Step In (F11)" disabled>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="3" x2="12" y2="15"/><polyline points="8 11 12 15 16 11"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg>
+            <span>In</span>
+          </button>
+          <button id="dbg-btn-step-out" class="tb-btn dbg-tbtn" title="Step Out (Shift+F11)" disabled>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="15" x2="12" y2="3"/><polyline points="8 7 12 3 16 7"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg>
+            <span>Out</span>
+          </button>
+          <button id="dbg-btn-stop" class="tb-btn danger-hover dbg-tbtn" title="Stop Debugging (Shift+F5)" disabled>
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+            <span>Stop</span>
+          </button>
+        </div>
+        <div class="dbg-options-bar">
+          <label class="dbg-check"><input id="dbg-opt-stop-entry" type="checkbox" checked /><span>Stop on entry</span></label>
+          <label class="dbg-check"><input id="dbg-opt-break-error" type="checkbox" checked /><span>Break on error</span></label>
+        </div>
+        <div id="dbg-loc-banner" class="dbg-loc-banner hidden"></div>
+        <div class="dbg-body">
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">SOURCE</span>
+              <span id="dbg-source-name" class="dbg-section-meta"></span>
+            </div>
+            <div id="dbg-source-lines" class="dbg-source-lines">
+              <div class="dbg-empty">Click <strong>Debug</strong> on any <code>.mini</code> script or Minilang notebook cell, or click line numbers in the gutter to set breakpoints.</div>
+            </div>
+          </section>
+
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">LOCALS</span>
+              <span id="dbg-locals-meta" class="dbg-section-meta"></span>
+            </div>
+            <div id="dbg-locals-list" class="dbg-list">
+              <div class="dbg-empty">No active frame.</div>
+            </div>
+          </section>
+
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">CALL STACK</span>
+              <span id="dbg-frames-meta" class="dbg-section-meta"></span>
+            </div>
+            <div id="dbg-frames-list" class="dbg-list">
+              <div class="dbg-empty">Not paused.</div>
+            </div>
+          </section>
+
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">DEBUG CONSOLE (FRAME EVAL)</span>
+            </div>
+            <form id="dbg-eval-form" class="dbg-eval-form">
+              <input id="dbg-eval-input" class="dbg-eval-input" type="text" placeholder="Evaluate expression in paused frame (e.g. x + 1)..." autocomplete="off" disabled />
+              <button id="dbg-eval-btn" type="submit" class="tb-btn primary" style="height:26px;font-size:11.5px;padding:0 10px" disabled>Eval</button>
+            </form>
+            <div id="dbg-eval-history" class="dbg-eval-history"></div>
+          </section>
+
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">BREAKPOINTS</span>
+              <button id="dbg-btn-clear-bps" type="button" class="sidebar-manage-link" title="Clear all breakpoints">Clear All</button>
+            </div>
+            <div id="dbg-bp-list" class="dbg-list">
+              <div class="dbg-empty">No breakpoints set. Click a gutter line number to add one.</div>
+            </div>
+          </section>
+
+          <section class="dbg-section">
+            <div class="dbg-section-head">
+              <span class="dbg-section-title">OUTPUT</span>
+            </div>
+            <div id="dbg-output-box" class="dbg-output-box">
+              <div class="dbg-empty">No output yet.</div>
+            </div>
+          </section>
+        </div>
+      </aside>
 
       <!-- Right Variable Inspector Drawer -->
       <aside id="vars-drawer" class="vars-drawer hidden">

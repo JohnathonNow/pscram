@@ -1,6 +1,8 @@
 mod agy;
 mod api;
 mod auth;
+mod debug_worker;
+mod debugger;
 mod files;
 mod jobs;
 mod kernel_mgr;
@@ -25,6 +27,10 @@ struct Cli {
     /// Internal mode: run as an isolated REPL kernel worker over stdio
     #[arg(long, hide = true)]
     kernel: bool,
+
+    /// Internal mode: run as an isolated Minilang bytecode debugger worker over stdio
+    #[arg(long, hide = true)]
+    debug_worker: bool,
 
     /// Internal mode: language id for `--kernel` (default: minilang)
     #[arg(long, hide = true, default_value = "minilang")]
@@ -89,6 +95,14 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.debug_worker {
+        if let Err(e) = debug_worker::run_debug_worker_process() {
+            eprintln!("debug worker error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if cli.kernel {
         let res = match cli.lang.as_str() {
@@ -168,6 +182,10 @@ fn main() {
         std::env::set_var("MINILANG_INTERNAL_TOKEN", &internal_token);
 
         let job_mgr = Arc::new(jobs::JobManager::new(root_canon.clone()));
+        let debug_mgr = Arc::new(debugger::DebugManager::new(
+            root_canon.clone(),
+            secrets.clone(),
+        ));
 
         let state = Arc::new(api::AppState {
             files,
@@ -178,6 +196,7 @@ fn main() {
             secrets: secrets.clone(),
             scheduler: scheduler.clone(),
             jobs: job_mgr,
+            debugger: debug_mgr,
             internal_token,
             web_dir: cli.web_dir,
         });
