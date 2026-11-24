@@ -96,10 +96,26 @@ function parseRunParamsJson(rawText) {
 
 function detectParamsTemplateFromCode(code) {
   const found = {};
-  const re = /\bParams\s*\[\s*["']([^"']+)["']\s*\]/g;
+  const src = code || "";
+  // Minilang: Params["key"] or Params['key']
+  const mlRe = /\bParams\s*\[\s*["']([^"']+)["']\s*\]/g;
   let m;
-  while ((m = re.exec(code || "")) !== null) {
+  while ((m = mlRe.exec(src)) !== null) {
     if (!(m[1] in found)) found[m[1]] = "";
+  }
+  // Rust: params.get_str/get_int/get_real/get_bool/get_list/get_map/get("key")
+  const rsRe = /\bparams\s*\.\s*(get_str|get_int|get_real|get_bool|get_list|get_map|get)\s*\(\s*"([^"]+)"\s*\)/g;
+  while ((m = rsRe.exec(src)) !== null) {
+    const fnName = m[1];
+    const key = m[2];
+    if (!(key in found)) {
+      if (fnName === "get_int") found[key] = 0;
+      else if (fnName === "get_real") found[key] = 0.0;
+      else if (fnName === "get_bool") found[key] = false;
+      else if (fnName === "get_list") found[key] = [];
+      else if (fnName === "get_map") found[key] = {};
+      else found[key] = "";
+    }
   }
   return found;
 }
@@ -133,15 +149,24 @@ function updateParamsBadgesAndStatus(rawText) {
     dbgBadge.textContent = parsed.ok ? String(parsed.count) : "!";
     dbgBadge.classList.toggle("hidden", parsed.ok && parsed.count === 0);
   }
+  const tab = activeTab();
+  const fileLang = tab && tab.kind === "file"
+    ? (tab.extension === "ui" ? langInfo("minilang") : langByExtension(tab.extension))
+    : null;
+  const isRust = !!(fileLang && fileLang.id === "rust");
   if (fileStatus) {
     if (!parsed.ok) {
       fileStatus.textContent = `Invalid JSON: ${parsed.error}`;
       fileStatus.style.color = "var(--accent-red)";
     } else if (parsed.count > 0) {
-      fileStatus.textContent = `${parsed.count} parameter${parsed.count === 1 ? "" : "s"} active for Run & Debug`;
+      fileStatus.textContent = isRust
+        ? `${parsed.count} parameter${parsed.count === 1 ? "" : "s"} active for Run`
+        : `${parsed.count} parameter${parsed.count === 1 ? "" : "s"} active for Run & Debug`;
       fileStatus.style.color = "";
     } else {
-      fileStatus.innerHTML = "Bound as <code>Params</code> map &amp; top-level identifiers for Run &amp; Debug";
+      fileStatus.innerHTML = isRust
+        ? "Available via <code>params.get_str/get_int/get_real/get_bool(...)</code> for Run"
+        : "Bound as <code>Params</code> map &amp; top-level identifiers for Run &amp; Debug";
       fileStatus.style.color = "";
     }
   }
@@ -160,9 +185,15 @@ function syncFileParamsPanelForTab(tab) {
   const fileTa = document.getElementById("file-params-textarea");
   const dbgTa = document.getElementById("dbg-params-textarea");
   const btn = document.getElementById("ftb-params");
+  const dbgBtn = document.getElementById("btn-file-params-debug");
   const txt = (tab && tab._paramsText) || "";
+  const fileLang = tab && tab.kind === "file"
+    ? (tab.extension === "ui" ? langInfo("minilang") : langByExtension(tab.extension))
+    : null;
+  const canDebug = !!(tab && tab.kind === "file" && tab.extension !== "ui" && fileLang && fileLang.id === "minilang");
   if (panel) panel.classList.toggle("hidden", !(tab && tab._paramsOpen));
   if (btn) btn.classList.toggle("active", !!(tab && tab._paramsOpen));
+  if (dbgBtn) dbgBtn.classList.toggle("hidden", !canDebug);
   if (fileTa && fileTa.value !== txt) fileTa.value = txt;
   if (dbgTa && dbgTa.value !== txt) dbgTa.value = txt;
   updateParamsBadgesAndStatus(txt);
@@ -232,7 +263,7 @@ export function initScriptTools() {
     const outBody = document.getElementById("file-run-output-body");
     const fileLang = tab.extension === "ui" ? langInfo("minilang") : (langByExtension(tab.extension) || langInfo("minilang"));
     let runParams = undefined;
-    if (fileLang.id === "minilang") {
+    if (fileLang.id === "minilang" || fileLang.id === "rust") {
       const parsed = parseRunParamsJson(tab._paramsText || "");
       if (!parsed.ok) {
         toast(`Invalid Params JSON: ${parsed.error}`, "error");
@@ -395,7 +426,7 @@ export function initScriptTools() {
     const detected = detectParamsTemplateFromCode(tab.content || "");
     const keys = Object.keys(detected);
     if (!keys.length) {
-      toast('No Params["..."] references found in script', "info");
+      toast('No Params["..."] or params.get_*("...") references found in script', "info");
       if (!tab._paramsText) setRunParamsText("{\n  \n}");
       return;
     }

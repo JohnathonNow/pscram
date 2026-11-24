@@ -741,7 +741,7 @@ fn generate_invoke_harness(code: &str, function: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str("#![allow(unused_imports, unused_variables, dead_code, unused_mut)]\n");
     out.push_str(RUST_TAGGED_PRELUDE);
-    out.push_str("\nuse __ml_rt::{Value, Params, html, svg, markdown, display};\n\n");
+    out.push_str("\nuse __ml_rt::{Value, Params, html, svg, markdown, table, chart, display};\n\n");
 
     if split.has_fn_main && function.is_none() {
         // User provided their own `fn main()`. Expose `params()` and `args()` helpers.
@@ -1072,6 +1072,8 @@ mod __ml_rt {
     pub fn html(s: impl AsRef<str>) { display("text/html", s); }
     pub fn svg(s: impl AsRef<str>) { display("image/svg+xml", s); }
     pub fn markdown(s: impl AsRef<str>) { display("text/markdown", s); }
+    pub fn table(json: impl AsRef<str>) { display("application/vnd.minilang.table+json", json); }
+    pub fn chart(json: impl AsRef<str>) { display("application/vnd.minilang.chart+json", json); }
 
     pub fn write_result_json(json: &str) {
         if let Ok(path) = std::env::var("__ML_RESULT_FILE") {
@@ -1304,9 +1306,7 @@ mod __ml_rt {
         }
     }
 
-    pub fn read_stdin_envelope() -> (Params, Vec<Value>) {
-        let mut raw = String::new();
-        let _ = std::io::stdin().read_to_string(&mut raw);
+    pub fn read_envelope_str(raw: &str) -> (Params, Vec<Value>) {
         let mut p = JParser { b: raw.as_bytes(), i: 0 };
         let root = match p.parse() { Some(JVal::Obj(e)) => e, _ => return (Params::default(), Vec::new()) };
         let mut params = Params::default();
@@ -1322,6 +1322,21 @@ mod __ml_rt {
             }
         }
         (params, args)
+    }
+
+    pub fn read_stdin_envelope() -> (Params, Vec<Value>) {
+        let mut raw = String::new();
+        let _ = std::io::stdin().read_to_string(&mut raw);
+        read_envelope_str(&raw)
+    }
+
+    pub fn read_env_params_file() -> (Params, Vec<Value>) {
+        if let Ok(path) = std::env::var("__ML_PARAMS_FILE") {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                return read_envelope_str(&raw);
+            }
+        }
+        (Params::default(), Vec::new())
     }
 }
 "#;

@@ -151,8 +151,12 @@ end):show
 "#;
     write_ws_file(srv, "ui/counter.ui", counter_ui);
 
-    // 5. Markdown & CSV fixtures
-    write_ws_file(srv, "README.md", "# E2E Workspace\n\nAutomated test fixture.\n");
+    // 5. Markdown & CSV fixtures (including anchor, external, workspace, and inline-code links)
+    write_ws_file(
+        srv,
+        "README.md",
+        "# E2E Workspace\n\nSee [Details](#details), [Docs](https://example.com/docs?a=1&b=2 \"Docs\"), [Greet](scripts/greet.mini), and `[not-a-link](https://nope.test)`.\n\n## Details\n\nAutomated test fixture.\n",
+    );
     write_ws_file(srv, "data.csv", "name,score\nAlice,99\nBob,87\n");
 }
 

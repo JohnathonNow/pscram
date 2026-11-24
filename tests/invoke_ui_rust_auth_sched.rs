@@ -246,3 +246,106 @@ fn test_standalone_ui_secrets_schedules_webhooks_and_auth() {
     let bad_login = auth_srv.post_json("/api/auth/login", &json!({"username": "__no_user__", "password": "wrong"}));
     assert_eq!(bad_login.status, 401);
 }
+
+#[test]
+fn test_rust_script_execute_with_params_and_table_chart_example_notebooks() {
+    let srv = TestServer::start(&[]);
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. Execute sample_workspace/scripts/hello.rs via /api/kernels/:id/execute with plain JSON params
+    let hello_rs = std::fs::read_to_string(repo_root.join("sample_workspace/scripts/hello.rs")).unwrap();
+    srv.create_kernel("rs-params-hello", "rust");
+    let res_hello = srv.post_json(
+        "/api/kernels/rs-params-hello/execute",
+        &json!({
+            "code": hello_rs,
+            "source": "hello.rs",
+            "language": "rust",
+            "params": {
+                "name": "Ada",
+                "repeat": 2,
+                "excited": true
+            }
+        }),
+    );
+    assert_eq!(res_hello.status, 200, "{}", res_hello.text());
+    let j_hello = res_hello.json();
+    assert!(j_hello["error"].is_null(), "hello.rs error: {:?}", j_hello["error"]);
+    let stdout_hello = j_hello["stdout"].as_str().unwrap_or("");
+    assert!(stdout_hello.contains("[1] Hello from Rust, Ada!"), "stdout={}", stdout_hello);
+    assert!(stdout_hello.contains("[2] Hello from Rust, Ada!"), "stdout={}", stdout_hello);
+    let repr_hello = j_hello["results"][0]["repr"].as_str().unwrap_or("");
+    assert!(repr_hello.contains("Hello from Rust, Ada!"), "repr={}", repr_hello);
+
+    // 2. Execute sample_workspace/scripts/fib.rs via /api/kernels/:id/execute with tagged JSON params
+    let fib_rs = std::fs::read_to_string(repo_root.join("sample_workspace/scripts/fib.rs")).unwrap();
+    srv.create_kernel("rs-params-fib", "rust");
+    let res_fib = srv.post_json(
+        "/api/kernels/rs-params-fib/execute",
+        &json!({
+            "code": fib_rs,
+            "source": "fib.rs",
+            "language": "rust",
+            "params": {
+                "n": { "type": "integer", "value": 10 }
+            }
+        }),
+    );
+    assert_eq!(res_fib.status, 200, "{}", res_fib.text());
+    let j_fib = res_fib.json();
+    assert!(j_fib["error"].is_null(), "fib.rs error: {:?}", j_fib["error"]);
+    let repr_fib = j_fib["results"][0]["repr"].as_str().unwrap_or("");
+    assert!(repr_fib.contains("Int(55)"), "repr={}", repr_fib);
+
+    // 3. Verify sample_workspace/notebooks/tables.mnb executes cleanly & emits table + UI displays
+    let tables_nb: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root.join("sample_workspace/notebooks/tables.mnb")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tables_nb["format"], "minilang-notebook");
+    srv.create_kernel("nb-tables", "minilang");
+    let mut table_displays = 0usize;
+    let mut table_ui_displays = 0usize;
+    for cell in tables_nb["cells"].as_array().unwrap() {
+        if cell["cell_type"] == "code" {
+            let code = cell["source"].as_str().unwrap();
+            let ev = srv.eval("nb-tables", code);
+            assert!(ev["error"].is_null(), "tables.mnb cell {} failed: {:?}", cell["id"], ev["error"]);
+            for d in ev["displays"].as_array().unwrap() {
+                match d["mime"].as_str().unwrap_or("") {
+                    "application/vnd.minilang.table+json" => table_displays += 1,
+                    "application/vnd.minilang.ui+json" => table_ui_displays += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(table_displays >= 4, "expected >= 4 table displays, got {}", table_displays);
+    assert!(table_ui_displays >= 1, "expected >= 1 ui::table display, got {}", table_ui_displays);
+
+    // 4. Verify sample_workspace/notebooks/charts.mnb executes cleanly & emits chart + UI displays
+    let charts_nb: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root.join("sample_workspace/notebooks/charts.mnb")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(charts_nb["format"], "minilang-notebook");
+    srv.create_kernel("nb-charts", "minilang");
+    let mut chart_displays = 0usize;
+    let mut chart_ui_displays = 0usize;
+    for cell in charts_nb["cells"].as_array().unwrap() {
+        if cell["cell_type"] == "code" {
+            let code = cell["source"].as_str().unwrap();
+            let ev = srv.eval("nb-charts", code);
+            assert!(ev["error"].is_null(), "charts.mnb cell {} failed: {:?}", cell["id"], ev["error"]);
+            for d in ev["displays"].as_array().unwrap() {
+                match d["mime"].as_str().unwrap_or("") {
+                    "application/vnd.minilang.chart+json" => chart_displays += 1,
+                    "application/vnd.minilang.ui+json" => chart_ui_displays += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(chart_displays >= 6, "expected >= 6 chart displays, got {}", chart_displays);
+    assert!(chart_ui_displays >= 1, "expected >= 1 ui::chart display, got {}", chart_ui_displays);
+}

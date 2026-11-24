@@ -77,7 +77,10 @@ class MinijsVM {
         if (!(w instanceof MLUIWidget)) return;
         const mh = w.handlers.get("mount");
         if (!isNil(mh)) this.safeCall(mh, [w]);
-        for (const ch of w.children) fireMounts(ch);
+        const kids = w.children instanceof MLList
+          ? w.children.items
+          : (Array.isArray(w.children) ? w.children : []);
+        for (const ch of kids) fireMounts(ch);
       };
       fireMounts(widget);
     } else {

@@ -1,0 +1,49 @@
+{
+  "format": "minilang-notebook",
+  "version": 1,
+  "title": "charts.mnb",
+  "cells": [
+    {
+      "id": "ch-intro",
+      "cell_type": "markdown",
+      "source": "# Interactive Charts (`chart` & `ui::chart`)\n\nMinilang Notebook includes a zero-dependency interactive SVG charting engine triggered by **`chart(type, data, title?)`** or **`chart(spec_map)`** (and **`ui::chart(spec, title?)`** inside custom UIs).\n\n### Supported Chart Types\n- **`line`** — single-series or multi-series trend lines with hover tooltips\n- **`area`** — filled trend curves for volume / cumulative metrics\n- **`bar`** — categorical single-series or grouped multi-series bars\n- **`scatter`** — `(x, y)` correlation plots with per-point labels\n- **`histogram`** — automatic binning of numeric distributions\n- **`pie`** — proportional breakdown with interactive percentage tooltips & legend\n\n> **Tip (Rust notebooks):** In a Rust kernel, call `chart(r#\"{\"type\":\"line\",\"title\":\"...\",\"data\":[1,4,9,16]}\"#);` with a JSON string.",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ch-line-area",
+      "cell_type": "code",
+      "source": ":> 1. Quick line chart from a list of numbers & multi-series area chart\nlet weekly_signups := [142, 168, 195, 224, 210, 265, 312, 348, 390, 425]\nchart(\"line\", weekly_signups, \"Weekly Signups (Quick Line Chart)\")\n\nchart({\n    \"type\" is \"area\",\n    \"title\" is \"Monthly Traffic: Organic vs Paid (k visits)\",\n    \"labels\" is [\"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\", \"Jul\", \"Aug\"],\n    \"series\" is [\n        {\"name\" is \"Organic\", \"data\" is [18, 22, 27, 31, 38, 44, 51, 59]},\n        {\"name\" is \"Paid\",    \"data\" is [12, 14, 15, 19, 21, 20, 24, 28]},\n        {\"name\" is \"Referral\",\"data\" is [5,  7,  9,  11, 14, 16, 19, 23]}\n    ]\n})",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ch-bar",
+      "cell_type": "code",
+      "source": ":> 2. Categorical bar chart (map) & grouped multi-series bar chart (list of maps)\nchart(\"bar\", {\n    \"Rust\" is 94,\n    \"Minilang\" is 89,\n    \"C\" is 86,\n    \"Go\" is 78,\n    \"Python\" is 64\n}, \"Throughput Score by Runtime\")\n\nlet quarterly := [\n    {\"quarter\" is \"Q1\", \"actual\" is 420, \"target\" is 400},\n    {\"quarter\" is \"Q2\", \"actual\" is 485, \"target\" is 460},\n    {\"quarter\" is \"Q3\", \"actual\" is 510, \"target\" is 530},\n    {\"quarter\" is \"Q4\", \"actual\" is 640, \"target\" is 590}\n]\n\nchart({\n    \"type\" is \"bar\",\n    \"title\" is \"Quarterly Revenue: Actual vs Target ($k)\",\n    \"data\" is quarterly,\n    \"x\" is \"quarter\",\n    \"y\" is [\"actual\", \"target\"]\n})",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ch-scatter-hist",
+      "cell_type": "code",
+      "source": ":> 3. Scatter plot (multi-series x/y coordinates) & Histogram (numeric distribution)\nchart({\n    \"type\" is \"scatter\",\n    \"title\" is \"Cache Hit Rate (%) vs P95 Latency (ms)\",\n    \"series\" is [\n        {\n            \"name\" is \"Cluster A\",\n            \"data\" is [\n                {\"x\" is 62, \"y\" is 84, \"label\" is \"a-1\"},\n                {\"x\" is 70, \"y\" is 68, \"label\" is \"a-2\"},\n                {\"x\" is 78, \"y\" is 52, \"label\" is \"a-3\"},\n                {\"x\" is 85, \"y\" is 39, \"label\" is \"a-4\"},\n                {\"x\" is 92, \"y\" is 24, \"label\" is \"a-5\"},\n                {\"x\" is 97, \"y\" is 14, \"label\" is \"a-6\"}\n            ]\n        },\n        {\n            \"name\" is \"Cluster B\",\n            \"data\" is [\n                {\"x\" is 65, \"y\" is 95, \"label\" is \"b-1\"},\n                {\"x\" is 74, \"y\" is 77, \"label\" is \"b-2\"},\n                {\"x\" is 81, \"y\" is 61, \"label\" is \"b-3\"},\n                {\"x\" is 89, \"y\" is 42, \"label\" is \"b-4\"},\n                {\"x\" is 95, \"y\" is 29, \"label\" is \"b-5\"}\n            ]\n        }\n    ]\n})\n\nlet response_times := [\n    12, 14, 15, 16, 17, 18, 18, 19, 20, 21,\n    22, 22, 23, 24, 24, 25, 25, 26, 27, 28,\n    29, 30, 31, 33, 35, 38, 41, 45, 52, 64\n]\nchart({\n    \"type\" is \"histogram\",\n    \"title\" is \"API Response Time Distribution (ms)\",\n    \"bins\" is 8,\n    \"y_label\" is \"Requests\",\n    \"data\" is response_times\n})",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ch-pie",
+      "cell_type": "code",
+      "source": ":> 4. Pie chart — hover over slices to inspect exact values and percentages\nchart(\"pie\", {\n    \"Compute\" is 42,\n    \"Storage\" is 23,\n    \"Networking\" is 18,\n    \"Observability\" is 11,\n    \"Other\" is 6\n}, \"Cloud Infrastructure Spend (%)\")",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "ch-interactive-ui",
+      "cell_type": "code",
+      "source": ":> 5. Reactive ui::chart — switch chart type live inside a custom Minilang UI\nlet monthly_data := {\n    \"Jan\" is 34,\n    \"Feb\" is 48,\n    \"Mar\" is 41,\n    \"Apr\" is 62,\n    \"May\" is 75,\n    \"Jun\" is 88\n}\n\nlet chart_widget := ui::chart({\n    \"type\" is \"bar\",\n    \"title\" is \"H1 Active Projects (bar)\",\n    \"data\" is monthly_data\n})\n\nlet type_picker := ui::select([\"bar\", \"line\", \"area\", \"pie\"], \"bar\"; kind) do\n    chart_widget:set_spec({\n        \"type\" is kind,\n        \"title\" is 'H1 Active Projects ({kind})',\n        \"data\" is monthly_data\n    })\nend\n\nui::show(ui::card(\"Interactive Chart Widget (ui::chart)\",\n    ui::vbox(\n        ui::hbox(ui::label(\"Chart Type:\"), type_picker),\n        chart_widget\n    )\n))",
+      "execution_count": null,
+      "output": null
+    }
+  ]
+}

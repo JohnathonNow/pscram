@@ -163,13 +163,39 @@ function hydrateMediaPreviews(container) {
       };
     }
   });
+  container.querySelectorAll(".md-anchor-link").forEach((a) => {
+    if (a.dataset.anchorBound) return;
+    a.dataset.anchorBound = "1";
+    a.onclick = (e) => {
+      e.preventDefault();
+      const anchor = a.dataset.mdAnchor;
+      if (!anchor) return;
+      const target =
+        container.querySelector(`[id="${anchor.replace(/"/g, '\\"')}"]`) ||
+        document.getElementById(anchor);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    };
+  });
   container.querySelectorAll(".md-ws-link").forEach((a) => {
     if (a.dataset.wsBound) return;
     a.dataset.wsBound = "1";
-    a.onclick = (e) => {
+    a.onclick = async (e) => {
       e.preventDefault();
       const p = a.dataset.wsPath;
-      if (p) openPathInTab(p);
+      const anchor = a.dataset.wsAnchor;
+      if (!p) return;
+      await openPathInTab(p);
+      if (anchor) {
+        setTimeout(() => {
+          const preview = document.getElementById("md-preview-content");
+          const target =
+            preview?.querySelector(`[id="${anchor.replace(/"/g, '\\"')}"]`) ||
+            document.getElementById(anchor);
+          if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 60);
+      }
     };
   });
 }

@@ -901,6 +901,11 @@ html, body {
 }
 .md-rendered a {
   color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md-rendered a:hover {
+  opacity: 0.85;
 }
 .md-placeholder {
   color: var(--text-muted);

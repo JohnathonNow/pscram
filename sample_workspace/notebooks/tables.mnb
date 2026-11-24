@@ -1,0 +1,42 @@
+{
+  "format": "minilang-notebook",
+  "version": 1,
+  "title": "tables.mnb",
+  "cells": [
+    {
+      "id": "tbl-intro",
+      "cell_type": "markdown",
+      "source": "# Interactive Tables (`table` & `ui::table`)\n\nMinilang Notebook includes a built-in interactive table renderer triggered by **`table(data, title?)`** in notebook cells (or **`ui::table(data, title?)`** inside custom UIs).\n\n### Features\n- **Click any column header** to sort ascending / descending (numeric-aware)\n- **Live search filter** across all columns\n- **Automatic pagination** (50 rows per page)\n- **One-click CSV download** respecting active sort & filter state\n- **Flexible inputs**: list of maps, list of lists/tuples, key-value map, or list of scalars\n\n> **Tip (Rust notebooks):** In a Rust kernel, call `table(r#\"{\"title\":\"...\",\"columns\":[...],\"rows\":[[...]]}\"#);` with a JSON string.",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "tbl-list-of-maps",
+      "cell_type": "code",
+      "source": ":> 1. List of maps — columns are inferred automatically (including missing/nil keys)\nlet employees := [\n    {\"id\" is 101, \"name\" is \"Ada Lovelace\",   \"dept\" is \"Core\",  \"role\" is \"Principal Engineer\", \"salary\" is 215000, \"remote\" is true},\n    {\"id\" is 102, \"name\" is \"Grace Hopper\",   \"dept\" is \"Infra\", \"role\" is \"Compiler Architect\", \"salary\" is 225000, \"remote\" is false},\n    {\"id\" is 103, \"name\" is \"Alan Turing\",    \"dept\" is \"ML\",    \"role\" is \"Research Lead\",      \"salary\" is 230000, \"remote\" is true},\n    {\"id\" is 104, \"name\" is \"Katherine Johnson\", \"dept\" is \"Core\", \"role\" is \"Systems Analyst\",  \"salary\" is 198000, \"remote\" is true},\n    {\"id\" is 105, \"name\" is \"Donald Knuth\",   \"dept\" is \"Infra\", \"role\" is \"Algorithms Fellow\",  \"salary\" is 210000, \"remote\" is false, \"notes\" is \"TeX author\"},\n    {\"id\" is 106, \"name\" is \"Barbara Liskov\", \"dept\" is \"Core\",  \"role\" is \"Distributed Systems\", \"salary\" is 220000, \"remote\" is true},\n    {\"id\" is 107, \"name\" is \"Ken Thompson\",   \"dept\" is \"Infra\", \"role\" is \"Kernel Engineer\",    \"salary\" is 205000, \"remote\" is false},\n    {\"id\" is 108, \"name\" is \"Fei-Fei Li\",     \"dept\" is \"ML\",    \"role\" is \"Vision Director\",    \"salary\" is 235000, \"remote\" is true}\n]\n\ntable(employees, \"Engineering Team Directory\")",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "tbl-lists-and-map",
+      "cell_type": "code",
+      "source": ":> 2. List of lists (auto-labeled Col 1..N) and Key-Value map summary\nlet powers := list(1 .. 10; n) [n, n * n, n * n * n, 1 << n]\ntable(powers, \"Powers Table (n, n², n³, 2ⁿ)\")\n\nvar total_salary := 0\nvar remote_count := 0\nfor e in employees do\n    total_salary := total_salary + e[\"salary\"]\n    if e[\"remote\"] then\n        remote_count := remote_count + 1\n    end\nend\n\nlet summary := {\n    \"Total Employees\" is employees:count,\n    \"Remote Employees\" is remote_count,\n    \"Total Payroll ($)\" is total_salary,\n    \"Average Salary ($)\" is total_salary / employees:count\n}\ntable(summary, \"Payroll Summary (Key / Value Map)\")",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "tbl-large-paginated",
+      "cell_type": "code",
+      "source": ":> 3. Larger dataset (75 rows) to test live search filtering, sorting, pagination & CSV export\nlet services := [\"auth-api\", \"billing-svc\", \"search-idx\", \"edge-proxy\", \"ml-scorer\"]\nlet regions := [\"us-east-1\", \"us-west-2\", \"eu-central-1\", \"ap-northeast-1\"]\n\nlet metrics := list(1 .. 75; i) do\n    let svc := services[(i % services:count) + 1]\n    let reg := regions[(i % regions:count) + 1]\n    let latency := 8.5 + ((i * 17) % 140) * 0.75\n    let status := if latency > 90 then \"degraded\" elseif latency > 55 then \"elevated\" else \"healthy\" end\n    {\n        \"sample_id\" is i,\n        \"service\" is svc,\n        \"region\" is reg,\n        \"p95_ms\" is latency,\n        \"rps\" is 120 + ((i * 53) % 880),\n        \"status\" is status\n    }\nend\n\ntable(metrics, \"Service Telemetry (75 Rows — Try Filter, Sort & CSV)\")",
+      "execution_count": null,
+      "output": null
+    },
+    {
+      "id": "tbl-interactive-ui",
+      "cell_type": "code",
+      "source": ":> 4. Reactive ui::table updated dynamically inside a custom Minilang UI\nlet tbl_widget := ui::table(employees, \"Live Department View\")\nlet count_badge := ui::badge('Showing {employees:count} engineers')\n\nlet dept_picker := ui::select([\"All\", \"Core\", \"Infra\", \"ML\"], \"All\"; dept) do\n    let filtered := []\n    for e in employees do\n        if dept = \"All\" then\n            filtered:put(e)\n        elseif e[\"dept\"] = dept then\n            filtered:put(e)\n        end\n    end\n    tbl_widget:set_data(filtered)\n    count_badge:set_text('Showing {filtered:count} engineers ({dept})')\nend\n\nui::show(ui::card(\"Interactive Table Widget (ui::table)\",\n    ui::vbox(\n        ui::hbox(ui::label(\"Department:\"), dept_picker, count_badge),\n        tbl_widget\n    )\n))",
+      "execution_count": null,
+      "output": null
+    }
+  ]
+}

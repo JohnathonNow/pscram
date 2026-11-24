@@ -207,6 +207,11 @@ def run_suite(base_url: str) -> None:
         page.locator('#file-list .file-row[data-path="README.md"]').click()
         page.wait_for_selector("#markdown-view:not(.hidden)", timeout=5000)
         assert "E2E Workspace" in page.locator("#md-preview-content").inner_text()
+        # Verify anchor link, external link, workspace link, and inline code link protection!
+        assert page.locator('#md-preview-content a.md-anchor-link[data-md-anchor="details"]').count() == 1
+        assert page.locator('#md-preview-content a[href="https://example.com/docs?a=1&b=2"]').count() == 1
+        assert page.locator('#md-preview-content a.md-ws-link[data-ws-path="scripts/greet.mini"]').count() == 1
+        assert page.locator('#md-preview-content code:has-text("[not-a-link](https://nope.test)")').count() == 1
 
         page.locator('#file-list .file-row[data-path="data.csv"]').click()
         page.wait_for_selector("#data-view:not(.hidden) table", timeout=5000)

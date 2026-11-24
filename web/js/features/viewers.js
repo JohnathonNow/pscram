@@ -522,7 +522,7 @@ function renderActiveWorkspace() {
     }
     const ftbParams = document.getElementById("ftb-params");
     if (ftbParams) {
-      ftbParams.classList.toggle("hidden", !(isMiniScript || isUi));
+      ftbParams.classList.toggle("hidden", !(isScript || isUi));
     }
     const ftbService = document.getElementById("ftb-service");
     if (ftbService) {

@@ -3,7 +3,9 @@ use crate::kernel_proc::{
 };
 use crate::lang::rust_lang::{
     build_cargo_project_sync, extract_rust_dependencies, read_displays_file, split_rust_source,
+    RUST_TAGGED_PRELUDE,
 };
+use crate::tagged::TaggedValue;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -38,6 +40,10 @@ const RUST_PRELUDE_ITEMS: &[(&str, &str, &str)] = &[
     ("progress", "function", "fn(f64, f64, &str)"),
     ("secret", "function", "fn(&str) -> Option<String>"),
     ("display", "function", "fn(&str, &str)"),
+    ("params", "variable", "Params (script input parameters)"),
+    ("args", "variable", "Vec<Value> (positional arguments)"),
+    ("Params", "type", "Script input parameters map"),
+    ("Value", "type", "Tagged JSON value"),
     ("Vec", "type", "std::vec::Vec"),
     ("String", "type", "std::string::String"),
     ("Option", "type", "std::option::Option"),
@@ -66,6 +72,8 @@ struct RustReplState {
     last_cargo_toml: String,
     /// Last inspected variable snapshot (updated automatically after each successful cell!)
     last_vars: Vec<VarInfo>,
+    /// Active script/cell parameters passed via `KernelRequest::Eval { params, .. }`
+    active_params: BTreeMap<String, TaggedValue>,
     exec_count: u64,
 }
 
@@ -84,12 +92,21 @@ impl RustReplState {
             dependencies: BTreeMap::new(),
             last_cargo_toml: String::new(),
             last_vars: Vec::new(),
+            active_params: BTreeMap::new(),
             exec_count: 0,
         })
     }
 
-    fn eval_cell(&mut self, code: &str, mut stream: Option<&mut dyn Write>) -> KernelResponse {
+    fn eval_cell(
+        &mut self,
+        code: &str,
+        params: Option<&BTreeMap<String, TaggedValue>>,
+        mut stream: Option<&mut dyn Write>,
+    ) -> KernelResponse {
         self.exec_count += 1;
+        if let Some(p) = params {
+            self.active_params = p.clone();
+        }
         let start = Instant::now();
         let emit = |stream: &mut Option<&mut dyn Write>, event: &str, data: serde_json::Value| {
             if let Some(w) = stream.as_mut() {
@@ -158,6 +175,12 @@ impl RustReplState {
         let res_path = self.session_dir.join(format!("cell_{}_res.json", self.exec_count));
         let vars_path = self.session_dir.join(format!("cell_{}_vars.jsonl", self.exec_count));
         let disp_path = self.session_dir.join(format!("cell_{}_disp.jsonl", self.exec_count));
+        let params_path = self.session_dir.join(format!("cell_{}_params.json", self.exec_count));
+        let params_payload = serde_json::json!({
+            "params": &self.active_params,
+            "args": [],
+        });
+        let _ = std::fs::write(&params_path, params_payload.to_string());
         let used_cargo = !merged_deps.is_empty();
 
         if !used_cargo {
@@ -267,6 +290,7 @@ impl RustReplState {
                 .env("__ML_RES_FILE", &res_path)
                 .env("__ML_VARS_FILE", &vars_path)
                 .env("__ML_DISPLAYS_FILE", &disp_path)
+                .env("__ML_PARAMS_FILE", &params_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -375,6 +399,7 @@ impl RustReplState {
                 .env("__ML_RES_FILE", &res_path)
                 .env("__ML_VARS_FILE", &vars_path)
                 .env("__ML_DISPLAYS_FILE", &disp_path)
+                .env("__ML_PARAMS_FILE", &params_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -440,6 +465,7 @@ impl RustReplState {
         let _ = std::fs::remove_file(&res_path);
         let _ = std::fs::remove_file(&vars_path);
         let _ = std::fs::remove_file(&disp_path);
+        let _ = std::fs::remove_file(&params_path);
 
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -519,6 +545,8 @@ impl RustReplState {
     ) -> String {
         let mut s = String::new();
         s.push_str("#![allow(unused_imports, unused_variables, unused_mut, dead_code, unused_assignments)]\n");
+        s.push_str(RUST_TAGGED_PRELUDE);
+        s.push_str("\nuse __ml_rt::{Params, Value};\n");
         s.push_str(RUST_REPL_PRELUDE);
         s.push('\n');
 
@@ -535,6 +563,7 @@ impl RustReplState {
         }
 
         s.push_str("\nfn main() {\n");
+        s.push_str("    let (params, args) = __ml_rt::read_env_params_file();\n");
         // Replay prior cells with stdout & display capture muted
         if !self.past_statements.is_empty() {
             s.push_str("    let __ml_saved_fd = __ml_repl::mute_stdout();\n");
@@ -554,19 +583,8 @@ impl RustReplState {
             s.push('\n');
         }
 
-        // Evaluate current cell's trailing expression if present
-        if let Some(expr) = &current.trailing_expr {
-            s.push_str("    {\n");
-            s.push_str(&format!("        let __cell_val = {{\n            {}\n        }};\n", expr));
-            s.push_str("        use __ml_repl::{__MlDebugFmt as _, __MlFallback as _};\n");
-            s.push_str("        let __tname = std::any::type_name_of_val(&__cell_val);\n");
-            s.push_str("        let __is_unit = __tname == \"()\";\n");
-            s.push_str("        let __repr = (&&__ml_repl::__MlWrap(&__cell_val)).__ml_fmt();\n");
-            s.push_str("        __ml_repl::write_eval_result(__tname, &__repr, __is_unit);\n");
-            s.push_str("    }\n");
-        }
-
-        // Snapshot tracked variables for the Variable Inspector
+        // Snapshot tracked variables for the Variable Inspector BEFORE trailing_expr
+        // so trailing expressions that move local variables (e.g. `Value::list(lines)`) compile cleanly.
         if !all_vars.is_empty() {
             s.push_str("    {\n");
             s.push_str("        use __ml_repl::{__MlDebugFmt as _, __MlFallback as _};\n");
@@ -578,6 +596,18 @@ impl RustReplState {
                 ));
             }
             s.push_str("        __ml_repl::write_vars(&__snap);\n");
+            s.push_str("    }\n");
+        }
+
+        // Evaluate current cell's trailing expression if present
+        if let Some(expr) = &current.trailing_expr {
+            s.push_str("    {\n");
+            s.push_str(&format!("        let __cell_val = {{\n            {}\n        }};\n", expr));
+            s.push_str("        use __ml_repl::{__MlDebugFmt as _, __MlFallback as _};\n");
+            s.push_str("        let __tname = std::any::type_name_of_val(&__cell_val);\n");
+            s.push_str("        let __is_unit = __tname == \"()\";\n");
+            s.push_str("        let __repr = (&&__ml_repl::__MlWrap(&__cell_val)).__ml_fmt();\n");
+            s.push_str("        __ml_repl::write_eval_result(__tname, &__repr, __is_unit);\n");
             s.push_str("    }\n");
         }
 
@@ -723,8 +753,8 @@ pub fn run_rust_kernel_process() -> io::Result<()> {
                     message: "environment updated".to_string(),
                 }
             }
-            Ok(KernelRequest::Eval { code, .. }) => state.eval_cell(&code, None),
-            Ok(KernelRequest::EvalStream { code, .. }) => state.eval_cell(&code, Some(&mut out)),
+            Ok(KernelRequest::Eval { code, params, .. }) => state.eval_cell(&code, params.as_ref(), None),
+            Ok(KernelRequest::EvalStream { code, .. }) => state.eval_cell(&code, None, Some(&mut out)),
             Ok(KernelRequest::Inspect) => KernelResponse::InspectResult {
                 variables: state.last_vars.clone(),
                 globals_count: RUST_PRELUDE_ITEMS.len(),

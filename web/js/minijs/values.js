@@ -29,12 +29,15 @@ class MLMethod {
 }
 class MLList {
   constructor(items = []) { this.__ml = "list"; this.items = items; }
+  [Symbol.iterator]() { return this.items[Symbol.iterator](); }
 }
 class MLTuple {
   constructor(items = []) { this.__ml = "tuple"; this.items = items; }
+  [Symbol.iterator]() { return this.items[Symbol.iterator](); }
 }
 class MLSet {
   constructor(items = []) { this.__ml = "set"; this.items = items; }
+  [Symbol.iterator]() { return this.items[Symbol.iterator](); }
 }
 class MLMap {
   constructor(entries = []) { this.__ml = "map"; this.entries = entries; } // [[k, v], ...]
