@@ -1,3 +1,4 @@
+mod agy;
 mod api;
 mod auth;
 mod files;
@@ -64,6 +65,18 @@ struct Cli {
     /// HMAC signing secret for access tokens (or set MINILANG_AUTH_SECRET env var; random if omitted)
     #[arg(long)]
     auth_secret: Option<String>,
+
+    /// Path to the Google Antigravity CLI (`agy`) binary (auto-detected from PATH / ~/.local/bin/agy)
+    #[arg(long)]
+    agy_bin: Option<PathBuf>,
+
+    /// Default model name passed to `agy --model` for inline AI assistance
+    #[arg(long)]
+    agy_model: Option<String>,
+
+    /// Timeout in seconds for inline `agy` requests (default: 120)
+    #[arg(long, default_value_t = 120)]
+    agy_timeout: u64,
 }
 
 fn main() {
@@ -108,12 +121,19 @@ fn main() {
             std::process::exit(1);
         });
         let auth = Arc::new(auth::AuthManager::new(auth_config));
+        let agy_runner = Arc::new(agy::AgyRunner::new(
+            cli.agy_bin.clone(),
+            cli.agy_model.clone(),
+            cli.agy_timeout,
+            root_canon.clone(),
+        ));
 
         let state = Arc::new(api::AppState {
             files,
             kernels,
             languages,
             auth: auth.clone(),
+            agy: agy_runner.clone(),
             web_dir: cli.web_dir,
         });
 
@@ -125,6 +145,12 @@ fn main() {
         println!("Minilang Notebook Server v{}", env!("CARGO_PKG_VERSION"));
         println!("  Workspace: {}", root_canon.display());
         println!("  URL:       http://{}", addr);
+        let agy_st = agy_runner.status();
+        if agy_st.available {
+            println!("  AGY:       ENABLED ({})", agy_st.bin.as_deref().unwrap_or("agy"));
+        } else {
+            println!("  AGY:       not found (install `agy` or pass --agy-bin to enable)");
+        }
         if auth.is_enabled() {
             println!(
                 "  Auth:      ENABLED (PAM service '{}', group: {}, access TTL: {}s, refresh TTL: {}s)",

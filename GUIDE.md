@@ -1,75 +1,132 @@
-# Minilang Notebook — Complete Guide to `.mini` Scripts and `.ui` Interfaces
+# Minilang Notebook — Complete Guide
 
-This guide covers everything you need to write, test, invoke, and deploy server-side **`.mini` scripts** and interactive browser-side **`.ui` user interfaces** in **Minilang Notebook**.
+This guide covers everything you need to write, test, invoke, and deploy **polyglot notebooks (`.mnb` — Minilang & Rust)**, server-side **`.mini` and `.rs` scripts**, interactive browser-side **`.ui` user interfaces**, built-in **I/O (`store`, `http`, `log`, `import`)**, **workspace viewers**, **inline Google Antigravity (`agy`) assistance**, and **local PAM authentication** in **Minilang Notebook**.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
+1. [Architecture Overview & Server CLI](#1-architecture-overview--server-cli)
+   - [Supported File Types & Workflows](#supported-file-types--workflows)
+   - [Server CLI Flags & Environment Variables](#server-cli-flags--environment-variables)
 2. [Quick Minilang Syntax Primer](#2-quick-minilang-syntax-primer)
-3. [Writing `.mini` Scripts](#3-writing-mini-scripts)
+3. [Writing `.mini` Scripts, Modules & I/O](#3-writing-mini-scripts-modules--io)
    - [How `.mini` Scripts Execute](#how-mini-scripts-execute)
    - [Receiving Parameters (`Params`, `Args`, and Direct Variables)](#receiving-parameters-params-args-and-direct-variables)
    - [Returning Values](#returning-values)
+   - [Modules & Imports (`import` / `export`)](#modules--imports-import--export)
+   - [Persistent Storage (`store` Module)](#persistent-storage-store-module)
+   - [HTTP Client (`http` Module)](#http-client-http-module)
+   - [First-Class `log` Type](#first-class-log-type)
+   - [Rich Outputs & Media Previews (`image`, `pdf`, `preview`)](#rich-outputs--media-previews-image-pdf-preview)
    - [Available Standard Modules & Helpers](#available-standard-modules--helpers)
    - [Using `.mini` Scripts in the Web UI](#using-mini-scripts-in-the-web-ui)
-4. [The `/invoke` HTTP Endpoint & Tagged JSON Format](#4-the-invoke-http-endpoint--tagged-json-format)
+4. [Rust Notebooks & `.rs` Scripts](#4-rust-notebooks--rs-scripts)
+   - [Interactive Rust Notebooks](#interactive-rust-notebooks)
+   - [Specifying Cargo Dependencies](#specifying-cargo-dependencies)
+   - [Invocable `.rs` Scripts](#invocable-rs-scripts)
+5. [The `/invoke` HTTP Endpoint & Tagged JSON Format](#5-the-invoke-http-endpoint--tagged-json-format)
    - [Endpoints & Path Resolution](#endpoints--path-resolution)
    - [Request Schema](#request-schema)
    - [Response Schema & Status Codes](#response-schema--status-codes)
    - [Tagged JSON Type Reference](#tagged-json-type-reference)
-   - [Calling Specific Functions in a `.mini` File](#calling-specific-functions-in-a-mini-file)
+   - [Calling Specific Functions in a Script](#calling-specific-functions-in-a-script)
    - [Timeouts, Isolation & Security](#timeouts-isolation--security)
-5. [Writing `.ui` Files (Custom Minilang User Interfaces)](#5-writing-ui-files-custom-minilang-user-interfaces)
+6. [Writing `.ui` Files (Custom Minilang User Interfaces)](#6-writing-ui-files-custom-minilang-user-interfaces)
    - [How `.ui` Files Work (MiniJS Bytecode Compilation)](#how-ui-files-work-minijs-bytecode-compilation)
    - [Serving `.ui` Files from `/ui/{path}`](#serving-ui-files-from-uipath)
    - [Two Authoring Styles: Direct `ui::show` vs `ui::compile`](#two-authoring-styles-direct-uishow-vs-uicompile)
    - [Pre-Compiled `.ui` Files](#pre-compiled-ui-files)
-6. [Complete `ui` Widget Reference](#6-complete-ui-widget-reference)
+7. [Complete `ui` Widget Reference](#7-complete-ui-widget-reference)
    - [Container Widgets](#container-widgets)
    - [Form Element Widgets](#form-element-widgets)
    - [Display & Raw HTML Widgets (`ui::html`)](#display--raw-html-widgets-uihtml)
    - [Widget Methods](#widget-methods)
    - [Common Styling & Layout Props](#common-styling--layout-props)
    - [Event Handling & Reactive State](#event-handling--reactive-state)
-7. [Calling `.mini` Endpoints from `.ui` Files with `exec()`](#7-calling-mini-endpoints-from-ui-files-with-exec)
+8. [Calling Scripts from `.ui` Files with `exec()`](#8-calling-scripts-from-ui-files-with-exec)
    - [Signatures](#signatures)
    - [Callback Arguments (`result`, `err`, `meta`)](#callback-arguments-result-err-meta)
    - [Automatic Tagged JSON Marshaling](#automatic-tagged-json-marshaling)
-8. [End-to-End Cookbook Examples](#8-end-to-end-cookbook-examples)
-   - [Example 1: Parameterized API Script (`scripts/greet.mini`)](#example-1-parameterized-api-script-scriptsgreetmini)
-   - [Example 2: Multi-Function Data Script (`scripts/stats.mini`)](#example-2-multi-function-data-script-scriptsstatsmini)
-   - [Example 3: Interactive Form UI (`uis/greeter.ui`)](#example-3-interactive-form-ui-uisgreeterui)
-   - [Example 4: Tabbed Dashboard Calling Multiple Modes (`uis/stats.ui`)](#example-4-tabbed-dashboard-calling-multiple-modes-uisstatsui)
-   - [Example 5: Dynamic List Builder with Raw HTML & Local State](#example-5-dynamic-list-builder-with-raw-html--local-state)
-9. [Troubleshooting & Minilang Gotchas](#9-troubleshooting--minilang-gotchas)
+9. [Workspace Viewers, File Explorer & Inline `agy` Assistant](#9-workspace-viewers-file-explorer--inline-agy-assistant)
+   - [File Explorer & Right-Click Context Menu](#file-explorer--right-click-context-menu)
+   - [Image & PDF Viewer Tabs & Lightbox](#image--pdf-viewer-tabs--lightbox)
+   - [Log File Viewer (`MLOG` & Plain-Text `.log`)](#log-file-viewer-mlog--plain-text-log)
+   - [Markdown Document Viewer](#markdown-document-viewer)
+   - [Inline Google Antigravity (`agy`) Assistant](#inline-google-antigravity-agy-assistant)
+10. [Local Machine Authentication (PAM + Refreshable Tokens)](#10-local-machine-authentication-pam--refreshable-tokens)
+    - [Enabling Login & Unix Group Restrictions](#enabling-login--unix-group-restrictions)
+    - [Token Lifecycle & API Endpoints](#token-lifecycle--api-endpoints)
+    - [Using Authenticated Requests with `curl`](#using-authenticated-requests-with-curl)
+11. [End-to-End Cookbook Examples](#11-end-to-end-cookbook-examples)
+    - [Example 1: Parameterized API Script (`scripts/greet.mini`)](#example-1-parameterized-api-script-scriptsgreetmini)
+    - [Example 2: Multi-Function Data Script (`scripts/stats.mini`)](#example-2-multi-function-data-script-scriptsstatsmini)
+    - [Example 3: Interactive Form UI (`uis/greeter.ui`)](#example-3-interactive-form-ui-uisgreeterui)
+    - [Example 4: Tabbed Dashboard Calling Multiple Modes (`uis/stats.ui`)](#example-4-tabbed-dashboard-calling-multiple-modes-uisstatsui)
+    - [Example 5: Dynamic List Builder with Raw HTML & Local State](#example-5-dynamic-list-builder-with-raw-html--local-state)
+    - [Example 6: Cached HTTP Pipeline with `store`, `http`, and `log`](#example-6-cached-http-pipeline-with-store-http-and-log)
+    - [Example 7: Reusable Minilang Module (`import` / `export`)](#example-7-reusable-minilang-module-import--export)
+    - [Example 8: Invocable Rust Script with Cargo Dependencies](#example-8-invocable-rust-script-with-cargo-dependencies)
+12. [Troubleshooting & Gotchas](#12-troubleshooting--gotchas)
 
 ---
 
-## 1. Architecture Overview
+## 1. Architecture Overview & Server CLI
 
-Minilang Notebook unifies three workflows in a single Rust binary:
+### Supported File Types & Workflows
 
-| File Type | Extension | Where It Runs | How It Is Used |
+Minilang Notebook unifies polyglot notebooks, invocable backend scripts, browser UIs, rich file viewers, and inline AI assistance in a single Rust binary:
+
+| File Type | Extension(s) | Where It Runs | How It Is Used |
 |---|---|---|---|
-| **Notebook** | `.mnb` | Isolated persistent Minilang kernel per open tab | Interactive REPL cells, Markdown notes, rich HTML/SVG/UI outputs |
-| **User Script** | `.mini` | Fresh isolated Minilang kernel on the server per request | Backend logic callable via `POST /invoke/{path}` with tagged JSON parameters |
-| **User Interface** | `.ui` | Compiled on the server via `minijs`, executed live in the browser | Custom interactive web apps served at `GET /ui/{path}`, calling `.mini` endpoints via `exec()` |
+| **Polyglot Notebook** | `.mnb` | Isolated persistent kernel per open tab (**Minilang** or **Rust**) | Interactive REPL cells, Markdown notes, Variable Inspector, rich HTML/SVG/UI/image/PDF outputs |
+| **User Script** | `.mini`, `.rs` | Isolated server-side execution per request (Minilang worker or cached compiled Rust binary) | Backend logic callable via `POST /invoke/{path}` with tagged JSON parameters |
+| **User Interface** | `.ui` | Compiled on the server via `minijs`, executed live in the browser | Custom interactive web apps served at `GET /ui/{path}`, calling `.mini` or `.rs` endpoints via `exec()` |
+| **Structured / Text Logs** | `.log`, `.mlog` (or any `MLOG` binary file) | Parsed on the server via `GET /api/log` | Interactive Log Viewer tab with live tail, search, type filtering, and structured value inspection |
+| **Markdown Documents** | `.md`, `.markdown` | Rendered in the browser | Dedicated Markdown viewer with Preview, Split, and Edit modes, GFM tables, syntax highlighting, and media thumbnails |
+| **Images & PDFs** | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, `.avif`, `.pdf` | Streamed via `GET /api/file/raw` | Dedicated viewer tabs (zoom/fit/rotate/download) and inline thumbnail previews with Lightbox inside notebooks |
 
 ```text
-Browser (.ui running in MiniJS Bytecode VM)
-  ├── Live DOM Widgets (ui::card, ui::vbox, ui::input, ui::button, ui::html, ...)
-  ├── Event Handlers (Minilang closures compiled to MiniJS bytecode)
-  └── exec("scripts/foo.mini", params; result, err, meta) do ... end
+Browser Workspace / Standalone /ui/{path}
+  ├── Polyglot Notebooks (.mnb: Minilang & Rust kernels)
+  ├── Live UI Apps (.ui running in MiniJS Bytecode VM)
+  │     └── exec("scripts/foo.mini" | "scripts/bar.rs", params; result, err, meta)
+  ├── File Explorer (right-click context menu: copy/cut/paste, paths, duplicate, ...)
+  ├── Built-in Viewers (Images, PDFs, Logs, Markdown)
+  └── Inline Google Antigravity (`agy`) Assistant (cells & script files)
           │
-          ▼  POST /invoke/scripts/foo.mini  (Tagged JSON)
+          ▼  HTTP / JSON (optional PAM + Bearer JWT auth)
 Rust Server (Axum)
-  └── Spawns isolated `minilang-notebook --kernel` subprocess
-          ├── Decodes Tagged JSON -> native Minilang values (Params, Args, vars)
-          ├── Executes scripts/foo.mini (with timeout)
-          └── Encodes return value -> Tagged JSON response
+  ├── Minilang Kernels (`--kernel --lang minilang`) — store, http, log, import/export, ui
+  ├── Rust Kernels (`--kernel --lang rust`) — rustc + Cargo dependency builds + binary cache
+  ├── File & Viewer APIs (`/api/files`, `/api/file/copy`, `/api/file/raw`, `/api/log`)
+  └── `agy` Runner (`/api/agy/status`, `/api/agy/assist`, `/api/agy/cancel`)
 ```
+
+### Server CLI Flags & Environment Variables
+
+Run `minilang-notebook --help` to see all options. Common startup flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host <HOST>` | `127.0.0.1` | Host interface to bind to |
+| `-p, --port <PORT>` | `8888` | Port to listen on |
+| `-r, --root <DIR>` | `.` | Root workspace directory exposed in the file explorer and `/invoke` |
+| `--web-dir <DIR>` | *(embedded)* | Serve frontend assets (`index.html`, `style.css`, `app.js`, `minijs_vm.js`) from disk for live editing |
+| `--require-login` | `false` | Require local Unix login via PAM + Bearer access tokens for `/api/*`, `/invoke/*`, and `/ui/*` |
+| `--require-group <GROUP>` | *(none)* | Restrict login to members of Unix group `<GROUP>` (implies `--require-login`) |
+| `--pam-service <NAME>` | `login` | PAM service name under `/etc/pam.d/<service>` |
+| `--access-token-ttl <SECS>` | `900` | Access JWT lifetime in seconds (15 minutes) |
+| `--refresh-token-ttl <SECS>` | `604800` | Rotating refresh token lifetime in seconds (7 days) |
+| `--auth-secret <SECRET>` | *(random)* | HMAC-SHA256 signing secret (can also be set via `MINILANG_AUTH_SECRET`) |
+| `--agy-bin <PATH>` | *(auto-detected)* | Explicit path to the `agy` CLI binary (can also be set via `MINILANG_AGY_BIN`) |
+| `--agy-model <MODEL>` | *(agy default)* | Default `--model` passed to `agy` for inline AI assistance |
+| `--agy-timeout <SECS>` | `120` | Timeout in seconds for inline `agy` requests (`10`–`600`) |
+
+Additional environment variables:
+- `MINILANG_AUTH_SECRET`: HMAC signing secret when `--auth-secret` is omitted.
+- `MINILANG_AGY_BIN`: Path to `agy` binary when `--agy-bin` is omitted.
+- `MINILANG_RUST_OFFLINE=1`: Prevent Cargo from retrying online if a crate is not already cached locally.
 
 ---
 
@@ -134,16 +191,16 @@ If you are new to Minilang, keep these core idioms in mind when writing `.mini` 
 
 ---
 
-## 3. Writing `.mini` Scripts
+## 3. Writing `.mini` Scripts, Modules & I/O
 
-`.mini` files are standard Minilang scripts stored anywhere inside the workspace (conventionally under `scripts/`). They can be run interactively in the editor, converted to notebooks, or invoked programmatically via the `/invoke` HTTP API.
+`.mini` files are standard Minilang scripts stored anywhere inside the workspace (conventionally under `scripts/`). They can be run interactively in the editor, imported as modules, converted to notebooks, or invoked programmatically via `/invoke`.
 
 ### How `.mini` Scripts Execute
 
 When a `.mini` script is called through `/invoke`:
 
-1. The Rust server validates that the target file exists inside the workspace root and has a `.mini` extension.
-2. It spawns a **fresh, isolated Minilang kernel subprocess** with its working directory set to the script's parent folder (so relative `file(...)` paths work relative to the script).
+1. The Rust server validates that the target file exists inside the workspace root and has a `.mini` (or `.rs`) extension.
+2. It spawns a **fresh, isolated Minilang kernel subprocess** with its working directory set to the script's parent folder (so relative `file(...)`, `store::*(...)`, `log(...)`, and `import("./...")` paths resolve relative to the script).
 3. All tagged JSON parameters are converted to native Minilang values and injected into the script's scope.
 4. All top-level expressions in the `.mini` file are evaluated in order.
 5. If a `function` name was requested, that function is then called.
@@ -184,6 +241,230 @@ println('Computing {a} + {b}')   :> Goes to `stdout`, does NOT overwrite final r
 
 If you return a `map`, `list`, `tuple`, `set`, `integer`, `real`, `string`, `boolean`, `symbol`, `time`, `uuid`, `bytes`, or `nil`, it is faithfully encoded in the response's tagged JSON `result` field.
 
+### Modules & Imports (`import` / `export`)
+
+Minilang's native module/library loader (`ML_MODULES` + `ML_LIBRARY`) is enabled in both **`.mini` scripts** and **Minilang notebooks**.
+
+#### Exporting Symbols from a `.mini` Module
+
+Use `export:` to publish functions, constants, or values from a `.mini` file (e.g. `scripts/math.mini`):
+
+```minilang
+export: let VERSION := "1.0"
+export: fun square(X) X * X
+export: fun cube(X) X * X * X
+```
+
+*(A top-level fallback `export` is also defined so modules using `export:` can still be executed directly with the editor's Run button or `/invoke` without failing.)*
+
+#### Importing `.mini` Modules
+
+You can import with or without the `.mini` extension using either Minilang's `import:` syntax or direct `import(...)` calls:
+
+```minilang
+:> Relative to the current script or notebook directory
+import: math("./math")
+import: math2("./math.mini")
+import: helper("../scripts/helper.mini")
+
+:> Bare module name (searches workspace root & `scripts/` library paths)
+import: math("math")
+
+:> Expression form
+let m := import("./math")
+m::square(7)            :> 49
+math::VERSION           :> "1.0"
+```
+
+#### Stringifying `import` (Current Script / Notebook Directory)
+
+Stringifying `import` itself evaluates to the directory path of the current script or notebook (matching Minilang's built-in importer convention):
+
+```minilang
+string(import)                          :> "/path/to/workspace/scripts"
+let data := store::get('{import}/cache.cbor')
+let events := log('{import}/events.log')
+```
+
+### Persistent Storage (`store` Module)
+
+The built-in `store` module makes saving and caching values on disk effortless. All writes create missing parent directories automatically and write **atomically** (temporary file + rename) so concurrent readers never see partial files.
+
+#### CBOR Value Storage (Arbitrary Minilang Values)
+
+| Function | Behavior |
+|---|---|
+| `store::get(path)` | Read and decode a CBOR-encoded Minilang value (`map`, `list`, `integer`, `real`, `string`, `boolean`, `bytes`, `time`, etc.) from `path`. |
+| `store::put(path, value)` | CBOR-encode `value` and write it atomically to `path`. Returns `value`. |
+| `store::create(path, fn)` | If `path` already exists, read and return its CBOR value; otherwise call `fn(path)`, store the returned value as CBOR, and return it. |
+
+#### Raw Bytes Storage (`address` / `buffer`)
+
+| Function | Aliases | Behavior |
+|---|---|---|
+| `store::get_raw(path)` | `store::get_bytes(path)` | Read raw bytes from `path` as a Minilang byte buffer (`address`). |
+| `store::put_raw(path, bytes)` | `store::put_bytes(path, bytes)` | Write an `address`/buffer or `string` as raw bytes atomically to `path`. Returns `bytes`. |
+| `store::create_raw(path, fn)` | `store::create_bytes(path, fn)` | Read raw bytes if `path` exists; otherwise call `fn(path)`, store raw bytes, and return them. |
+
+#### Plain String Storage
+
+| Function | Aliases | Behavior |
+|---|---|---|
+| `store::get_string(path)` | `store::get_text(path)` | Read UTF-8 text from `path` as a `string`. |
+| `store::put_string(path, val)` | `store::put_text(path, val)` | Write a `string` (or stringified value) atomically to `path`. Returns `val`. |
+| `store::create_string(path, fn)` | `store::create_text(path, fn)` | Read text if `path` exists; otherwise call `fn(path)`, store as text, and return it. |
+
+#### Utility Helpers
+
+| Function | Behavior |
+|---|---|
+| `store::exists(path)` | Returns `path` (truthy) if `path` is an existing regular file, or `nil` otherwise. |
+| `store::delete(path)` | Deletes `path`. Returns `true` if deleted, `nil` if the file did not exist. |
+
+```minilang
+:> Cache an expensive computation to CBOR on disk
+let table := store::create("cache/primes.cbor"; p) do
+    println('Computing cache for {p}...')
+    list(2 .. 100) ->? fun(n) not (2 .. (n - 1) ->? fun(d) n % d = 0):first
+end
+
+:> Save & read plain text or raw bytes
+store::put_string("notes/summary.txt", "All systems nominal")
+let raw := store::get_raw("assets/chart.png")
+```
+
+### HTTP Client (`http` Module)
+
+The built-in `http` module (powered by dynamically loaded `libcurl.so.4`, following redirects by default) supports all standard HTTP verbs:
+
+```minilang
+http::get(url, mode?, query?, headers?)
+http::post(url, mode?, query?, headers?, body?)
+http::put(url, mode?, query?, headers?, body?)
+http::patch(url, mode?, query?, headers?, body?)
+http::delete(url, mode?, query?, headers?, body?)
+http::request(method, url, mode?, query?, headers?, body?)
+```
+
+#### Response Modes (`mode`)
+
+| Mode | Return Value |
+|---|---|
+| `"text"` *(default)* | Response body as a Minilang `string` |
+| `"json"` | JSON-decoded Minilang value (`map`, `list`, primitives) |
+| `"raw"` | Raw response bytes as a Minilang `address` buffer |
+| `"file"` | Open `file` handle rewound to byte 0 (written to a temp file, or to disk if `file := "path"` is passed) |
+| `"response"` | Full response `map`: `{"status" is <int>, "headers" is <lowercase-key map>, "body" is <string>}` (does **not** throw on HTTP 4xx/5xx) |
+
+For `"json"`, `"text"`, `"raw"`, and `"file"` modes, HTTP status codes `>= 400` raise an `HttpError` with the status code and body snippet.
+
+#### Arguments & Named Options
+
+- **`query`**: A `map` of key-value pairs (URL-encoded automatically; list values repeat the key), a pre-formatted query `string`, or `nil`.
+- **`headers`**: A `map` (`{"Authorization" is "Bearer ..."}`), a `list` of `"Header: value"` strings, or `nil`.
+- **`body`**:
+  - `string` → sent as-is (default `Content-Type: text/plain; charset=utf-8`).
+  - `address` (raw bytes) → sent as-is (default `Content-Type: application/octet-stream`).
+  - Any other Minilang value (`map`, `list`, etc.) → automatically JSON-encoded (default `Content-Type: application/json`).
+- **Named keyword options**: Any argument can also be passed by name:
+  - `mode :=` / `as :=`
+  - `query :=` / `params :=`
+  - `headers :=`
+  - `body :=` / `data :=` / `json :=`
+  - `file :=` / `path :=` / `dest :=` (destination path when `mode` is `"file"`)
+  - `timeout := 60` (request timeout in seconds; default `30`)
+
+```minilang
+:> GET parsed JSON with query params and headers
+let data := http::get(
+    "https://api.example.com/items",
+    "json",
+    {"limit" is 25, "tag" is ["rust", "minilang"]},
+    {"Accept" is "application/json"}
+)
+
+:> POST a Minilang map (auto-encoded as JSON) and inspect status + headers
+let resp := http::post(
+    "https://api.example.com/jobs",
+    "response",
+    nil,
+    {"Authorization" is "Bearer secret"},
+    {"task" is "reindex", "priority" is 1},
+    timeout := 60
+)
+println('Status: {resp["status"]}')
+
+:> Download binary asset directly to disk
+let f := http::get("https://example.com/report.pdf", "file", file := "downloads/report.pdf")
+f:close
+```
+
+### First-Class `log` Type
+
+Minilang includes a built-in **`log`** type (`MLLogT`, inheriting `MLSequenceT`) for recording arbitrary timestamped values either **in memory** or **persistently on disk** using a crash-safe framed-CBOR format (`MLOG` magic + nanosecond UTC timestamps + length-prefixed CBOR payloads).
+
+#### Constructors
+
+| Constructor | Behavior |
+|---|---|
+| `log()` | Create an in-memory log (stores any Minilang value, including closures/handles). |
+| `log(path)` or `log(path, "a")` | Open or create a persistent file-backed log in append/read-write mode (also accepts `"a+"`, `"rw"`). Loads existing entries automatically. |
+| `log(path, "r")` | Open an existing file-backed log read-only. |
+| `log(path, "w")` | Create or truncate a file-backed log to empty. |
+
+#### Appending, Querying & Lifecycle Methods
+
+| Operation | Description |
+|---|---|
+| `L(val)` / `L(v1, v2, ...)` | Calling a log directly appends one or more values and returns `L`. |
+| `L:put(val)` | Append `val` and return `L` (aliases: `:push`, `:write`, `:add`, `:append`). |
+| `L:count` | Number of entries (aliases: `:length`, `:size`). |
+| `L[i]` | 1-based index (negative indices count from the end: `L[-1]` is the latest value). |
+| `L[start, end]` | Slice returning a `list` of values from `start` (inclusive) to `end` (exclusive). |
+| `L:first` / `L:last` | First or last logged value (`nil` if empty). |
+| `L:head(n?)` / `L:tail(n?)` | First or last `n` values as a `list` (default `n = 10`). |
+| `L:entry(i)` | Full entry `map`: `{"index" is i, "time" is <time>, "value" is <val>}`. |
+| `L:time(i)` | Timestamp (`time`) of entry `i`. |
+| `L:entries` / `L:values` | All entries (as `{index, time, value}` maps) or all raw values as a `list`. |
+| `L:since(t)` | All entry maps recorded at or after `t` (`time`, integer epoch seconds, or real seconds). |
+| `for v in L do ... end` | Iterate values directly (`log` is a `sequence`, so `list(L)`, `L -> fn`, `L ->? pred`, etc. all work). |
+| `for ts, v in L do ... end` | Iterate `(timestamp, value)` pairs. |
+| `L:path` | Backing file path (`nil` for in-memory logs). |
+| `L:flush` / `L:sync` | Flush and `fsync` the backing file. |
+| `L:reload` | Read any new frames appended externally to the backing file; returns count of newly loaded entries. |
+| `L:clear` | Clear all entries (and truncate the backing file). |
+| `L:close` | Flush and close the backing file handle. |
+
+```minilang
+let events := log("logs/pipeline.log")
+events({"level" is "info", "step" is "fetch", "rows" is 1420})
+events:put({"level" is "warn", "step" is "parse", "skipped" is 3})
+
+println('Total entries: {events:count}')
+println('Latest entry: {events:entry(-1)}')
+
+:> Filter directly with Minilang sequence operators
+let warnings := list(events ->? fun(e) e["level"] = "warn")
+```
+
+File-backed logs can be opened directly in the built-in [Log File Viewer](#log-file-viewer-mlog--plain-text-log) from the file explorer sidebar.
+
+### Rich Outputs & Media Previews (`image`, `pdf`, `preview`)
+
+Both notebooks and scripts can emit rich display outputs alongside return values and `stdout`:
+
+| Helper | Description |
+|---|---|
+| `html(str)` | Render raw HTML in cell output |
+| `svg(str)` | Render inline SVG |
+| `markdown(str)` | Render Markdown (with syntax highlighting, GFM tables, and auto image/PDF thumbnails) |
+| `image(path_or_bytes, mime?)` | Display an image thumbnail preview from a file path or raw byte buffer (`address`). Auto-detects PNG/JPEG/GIF/WebP/SVG/BMP/AVIF. |
+| `pdf(path_or_bytes)` | Display an interactive PDF thumbnail preview from a file path or raw byte buffer. |
+| `preview(path_or_bytes)` | Auto-detect image vs. PDF from a file path or raw bytes and emit the appropriate thumbnail preview. |
+| `display(mime, data)` | Emit an arbitrary MIME-typed display payload. |
+
+Clicking any image or PDF thumbnail in a notebook output expands it in the **Media Lightbox** (with **Open in Tab** and **Download** buttons).
+
 ### Available Standard Modules & Helpers
 
 Every `.mini` kernel initializes the full built-in Minilang runtime:
@@ -191,45 +472,130 @@ Every `.mini` kernel initializes the full built-in Minilang runtime:
 | Global / Module | Description |
 |---|---|
 | `print(...)`, `println(...)` | Writes formatted output to the captured `stdout` stream |
-| `html(s)`, `svg(s)`, `markdown(s)`, `display(mime, s)` | Emits rich display payloads in `displays` |
+| `html`, `svg`, `markdown`, `image`, `pdf`, `preview`, `display` | Rich display and media thumbnail helpers |
+| `import`, `export`, `library` | Native Minilang module/library loader (`import("./mod")`, `string(import)` → current dir) |
+| `store` | Atomic CBOR (`get`/`put`/`create`), raw bytes (`*_raw`/`*_bytes`), string (`*_string`/`*_text`), `exists`, `delete` |
+| `http` | `http::get/post/put/patch/delete/request` via `libcurl.so.4` |
+| `log` | First-class timestamped in-memory & crash-safe CBOR-framed persistent logs |
 | `now()`, `clock()`, `time` | Current epoch time, high-resolution clock, ISO-8601 time parsing/formatting |
 | `file`, `dir`, `popen`, `stream` | Filesystem & stream I/O (relative to the script's directory) |
 | `socket` | TCP/UDP sockets |
-| `json` | `json::encode(val)`, `json::decode(str)` |
-| `cbor` | CBOR binary serialization |
-| `uuid` | UUID generation and parsing |
-| `base16`, `base64` | Hex and Base64 encoding/decoding |
-| `minijs` | `minijs::encode(val)`, `minijs::decode(val)` |
-| `ui` | Widget constructors, `ui::compile`, `ui::show` |
+| `json`, `cbor` | JSON and CBOR binary serialization |
+| `uuid`, `base16`, `base64` | UUID generation/parsing, Hex and Base64 encoding/decoding |
+| `minijs`, `ui` | Browser UI widget constructors, `ui::compile`, `ui::show` |
 | `memory` | Boehm GC inspection (`memory::usage`, `memory::collect`, etc.) |
 | Core types & functions | `list`, `map`, `set`, `tuple`, `string`, `integer`, `real`, `boolean`, `regex`, `sum`, `min`, `max`, `count`, `range`, `zip`, `reduce`, `fold`, `unique`, etc. |
 
 ### Using `.mini` Scripts in the Web UI
 
-When you open any `.mini` file from the left file browser sidebar, the editor toolbar provides:
+When you open any `.mini` (or `.rs`) file from the left file browser sidebar, the editor toolbar provides:
 
 - **Save (`Ctrl+S`)**: Saves changes to disk.
-- **Run in Minilang**: Executes the script immediately in a fresh kernel and renders `stdout`, `Out[N]`, rich HTML/SVG, or live UI outputs below the editor.
+- **Run in Minilang / Rust**: Executes the script immediately in a fresh kernel and renders `stdout`, `Out[N]`, rich HTML/SVG/media, or live UI outputs below the editor.
 - **Invoke (`/invoke`)**: Opens an interactive JSON tester panel wired directly to `POST /invoke/{script}`, complete with an optional function input, formatted JSON response viewer, and a **Copy curl** button.
-- **Launch UI**: Opens `/ui/{script}` in a new browser tab if the script calls `ui::show(...)`.
-- **Open as Notebook**: Converts the `.mini` script into an interactive `.mnb` notebook tab. (Use `:> %%` or `# %%` comment lines in a `.mini` file to split it into multiple cells automatically.)
+- **Launch UI** (`.mini`/`.ui`): Opens `/ui/{script}` in a new browser tab.
+- **Open as Notebook**: Converts the script into an interactive `.mnb` notebook tab. (Use `:> %%` or `# %%` in `.mini`, or `// %%` in `.rs`, to split a script into multiple cells automatically.)
+- **✦ Ask agy (`Ctrl+K`)**: Opens the inline Google Antigravity assistant for the file or currently selected lines.
 
 ---
 
-## 4. The `/invoke` HTTP Endpoint & Tagged JSON Format
+## 4. Rust Notebooks & `.rs` Scripts
+
+Minilang Notebook includes a full **Rust** backend (`LanguageBackend`) alongside Minilang, supporting interactive Rust notebooks, external Cargo crates, and invocable `.rs` HTTP endpoints.
+
+### Interactive Rust Notebooks
+
+- Create a Rust notebook from **New Notebook** (choose **Rust** in the language kernel dropdown) or switch an existing notebook's kernel using the **Kernel** selector in the notebook toolbar.
+- Each Rust cell is compiled with `rustc` (or `cargo` once dependencies are declared) and replayed seamlessly across cells while suppressing duplicate prior `stdout`.
+- Top-level items (`fn`, `struct`, `enum`, `impl`, `use`, `const`, `type`) and `let` bindings persist across cells and appear in the **Variable Inspector** drawer.
+- Autocompletion (`Tab`) suggests Rust keywords, prelude helpers, and your cell-defined symbols.
+- **Rich display helpers** are automatically available in Rust cells:
+  - `html(&str)`, `svg(&str)`, `markdown(&str)`
+  - `image(&str)`, `image_bytes(&[u8], &str)`
+  - `pdf(&str)`, `pdf_bytes(&[u8])`
+  - `preview(&str)`, `display(mime, data)`
+
+See [notebooks/rust_intro.mnb](notebooks/rust_intro.mnb) for a ready-to-run walkthrough.
+
+### Specifying Cargo Dependencies
+
+Both **Rust notebook cells** and **`.rs` scripts** support specifying Cargo crates using any of three syntaxes:
+
+#### 1. Evcxr-style `:dep` Directives (Notebook Cells & Scripts)
+
+```rust
+:dep serde_json = "1.0"
+//:dep chrono = { version = "0.4", features = ["serde"] }
+//! :dep mylib = { path = "../crates/mylib" }
+
+let v = serde_json::json!({ "ok": true, "items": [1, 2, 3] });
+v
+```
+
+Run `:deps` alone in a Rust notebook cell to print all currently loaded Cargo dependencies for that kernel.
+
+#### 2. Cargo Script Frontmatter (`---cargo`)
+
+```rust
+---cargo
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+---
+
+let id = uuid::Uuid::new_v4();
+id.to_string()
+```
+
+#### 3. Doc-Comment Fenced Block (`//! ```cargo`)
+
+```rust
+//! ```cargo
+//! [dependencies]
+//! rand = "0.8"
+//! ```
+
+let x: u8 = rand::random();
+x
+```
+
+**How builds & caching work:**
+- Relative `path = "..."` crate dependencies are automatically resolved against the script or notebook directory.
+- Cargo shares a single persistent target directory (`/tmp/minilang-notebook-rust-cache/cargo-target`) across cells and scripts so incremental builds stay fast.
+- Builds run with `cargo build --offline` first (zero network overhead for cached crates), and automatically retry online if a crate isn't cached yet. Set `MINILANG_RUST_OFFLINE=1` to strictly stay offline.
+
+### Invocable `.rs` Scripts
+
+Any `.rs` file in your workspace can be invoked via `POST /invoke/{path}` using the exact same Tagged JSON protocol as `.mini` scripts:
+
+- Compiled binaries are **content-hashed** (source + Cargo dependencies) and cached on disk so repeated `/invoke` calls skip compilation and run in a few milliseconds.
+- Inside a `.rs` script, `params` (`ParamMap`), `args` (`Vec<Value>`), and `Value` constructors (`Value::map`, `Value::list`, `Value::string`, `Value::int`, `Value::real`, `Value::bool`, `Value::nil`, `Value::bytes`, etc.) are injected automatically:
+  ```rust
+  let name = params.get_str("name").unwrap_or("World");
+  let repeat = params.get_int("repeat").unwrap_or(1);
+  Value::map([
+      ("greeting", Value::string(format!("Hello from Rust, {}!", name))),
+      ("count", Value::int(repeat)),
+  ])
+  ```
+- You can also call a specific typed Rust function via `"function"` (see [scripts/fib.rs](scripts/fib.rs) and [scripts/hello.rs](scripts/hello.rs)).
+
+---
+
+## 5. The `/invoke` HTTP Endpoint & Tagged JSON Format
 
 ### Endpoints & Path Resolution
 
 | Method & Path | Description |
 |---|---|
-| `POST /invoke` | Invoke a script specified in the JSON body's `"script"` field |
-| `POST /invoke/{path}` | Invoke a script specified in the URL path |
-| `GET /api/scripts` | List all `.mini` scripts in the workspace (prioritizing `scripts/`) |
+| `POST /invoke` | Invoke a `.mini` or `.rs` script specified in the JSON body's `"script"` field |
+| `POST /invoke/{path}` | Invoke a `.mini` or `.rs` script specified in the URL path |
+| `GET /api/scripts` | List all invocable `.mini` and `.rs` scripts in the workspace (prioritizing `scripts/`) |
 
 Path resolution rules for `{path}` (or `"script"`):
 
-1. If `{path}` ends with `.mini`, the server checks `{path}`, then `scripts/{path}`.
-2. If `{path}` has no extension (e.g., `POST /invoke/greet`), the server checks `{path}.mini`, then `scripts/{path}.mini`.
+1. If `{path}` ends with `.mini` or `.rs`, the server checks `{path}`, then `scripts/{path}`.
+2. If `{path}` has no extension (e.g., `POST /invoke/greet` or `POST /invoke/hello`), the server checks `{path}.mini`, `scripts/{path}.mini`, `{path}.rs`, and `scripts/{path}.rs`.
 3. Any other file extension (e.g. `Cargo.toml`) is rejected with `400 Bad Request`.
 4. Paths escaping the workspace root (`..`) are rejected with `404 Not Found`.
 
@@ -253,9 +619,9 @@ Path resolution rules for `{path}` (or `"script"`):
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `script` | Required for `POST /invoke`; omitted for `POST /invoke/{path}` | — | Path to `.mini` script |
+| `script` | Required for `POST /invoke`; omitted for `POST /invoke/{path}` | — | Path to `.mini` or `.rs` script |
 | `params` | No | `{}` | Object mapping parameter names to Tagged JSON values |
-| `args` | No | `[]` | Array of positional Tagged JSON values (`Args` in Minilang) |
+| `args` | No | `[]` | Array of positional Tagged JSON values (`Args` in Minilang / `args` in Rust) |
 | `function` | No | `null` | Optional function name in the script to invoke after loading |
 | `timeout_ms` | No | `30000` | Execution timeout in ms (clamped to `100`–`120000`) |
 
@@ -298,11 +664,12 @@ An empty request body on `POST /invoke/{path}` is valid and runs the script with
 | Status | Meaning |
 |---|---|
 | `200 OK` | Script executed cleanly (`ok: true`) |
-| `400 Bad Request` | Malformed JSON, invalid/unsupported tagged type, missing `script`, or non-`.mini` file |
+| `400 Bad Request` | Malformed JSON, invalid/unsupported tagged type, missing `script`, or unsupported extension |
+| `401 Unauthorized` / `403 Forbidden` | Missing, expired, or unauthorized Bearer token (when `--require-login` / `--require-group` is enabled) |
 | `404 Not Found` | Script does not exist (or path traversal attempt) |
-| `408 Request Timeout` | Script exceeded `timeout_ms` (kernel subprocess killed) |
-| `422 Unprocessable Entity` | Minilang parse, compile, parameter, or runtime error (`ok: false`, details in `error`) |
-| `500 Internal Server Error` | Kernel crashed or called `halt()` before returning |
+| `408 Request Timeout` | Script exceeded `timeout_ms` (subprocess killed) |
+| `422 Unprocessable Entity` | Parse, compile, parameter, or runtime error (`ok: false`, details in `error`) |
+| `500 Internal Server Error` | Kernel crashed or exited abnormally before returning |
 
 ### Tagged JSON Type Reference
 
@@ -338,15 +705,16 @@ Every parameter value and return value uses the adjacently-tagged JSON shape `{ 
 
 > **UTC Timestamps**: `time` values returned from scripts are always serialized as canonical UTC ISO-8601 strings ending in `Z`.
 
-### Calling Specific Functions in a `.mini` File
+### Calling Specific Functions in a Script
 
-Set `"function"` in the request body to call a specific function defined in the script after the script's top-level statements finish loading:
+Set `"function"` in the request body to call a specific function defined in a `.mini` or `.rs` script after the script's top-level definitions load:
 
 - If `args` is non-empty, the function is called with `args` unpacked positionally (`fn(arg1, arg2, ...)`).
-- If `args` is empty and `params` is non-empty, the function is called with the `Params` map (`fn(Params)`).
+- If `args` is empty and `params` is non-empty, Minilang calls `fn(Params)` and Rust matches parameter names (or passes `params`).
 - If both are empty, the function is called with 0 arguments (`fn()`).
 
 ```bash
+# Minilang function call
 curl -s -X POST http://127.0.0.1:8888/invoke/scripts/stats.mini \
   -H "Content-Type: application/json" \
   -d '{
@@ -362,19 +730,24 @@ curl -s -X POST http://127.0.0.1:8888/invoke/scripts/stats.mini \
     },
     "args": [{ "type": "real", "value": 0.5 }]
   }'
+
+# Rust function call
+curl -s -X POST http://127.0.0.1:8888/invoke/scripts/fib.rs \
+  -H "Content-Type: application/json" \
+  -d '{ "function": "fib", "args": [{ "type": "integer", "value": 20 }] }'
 ```
 
 ### Timeouts, Isolation & Security
 
-- Each invocation runs in its own OS process (`--kernel`) and is killed on completion or timeout.
+- Each invocation runs in its own OS process and is killed cleanly on completion or timeout.
 - Infinite loops (e.g. `loop end`) are terminated cleanly at `timeout_ms` and return HTTP `408`.
-- Only `.mini` files inside `--root` can be invoked.
+- Only `.mini` and `.rs` files inside `--root` can be invoked.
 
 ---
 
-## 5. Writing `.ui` Files (Custom Minilang User Interfaces)
+## 6. Writing `.ui` Files (Custom Minilang User Interfaces)
 
-`.ui` files let you build complete interactive web interfaces in pure Minilang — including forms, layout containers, raw HTML views, reactive local state, and asynchronous calls to `.mini` backend scripts via `exec()`.
+`.ui` files let you build complete interactive web interfaces in pure Minilang — including forms, layout containers, raw HTML views, reactive local state, and asynchronous calls to `.mini` or `.rs` backend scripts via `exec()`.
 
 ### How `.ui` Files Work (MiniJS Bytecode Compilation)
 
@@ -396,7 +769,7 @@ Any `.ui` file in your workspace can be opened directly in a browser as a standa
 | `GET /ui/notebooks/my_tool.ui` | Serves `notebooks/my_tool.ui` |
 | `GET /api/uis` | Returns JSON list of all `.ui` files in the workspace |
 
-You can also create new `.ui` files directly from the **New Minilang UI (`.ui`)** button in the sidebar header, preview them inline with **Preview UI**, or open them in a dedicated tab with **Launch UI**.
+You can also create new `.ui` files from the **New Minilang UI (`.ui`)** button (or the file explorer right-click menu), preview them inline with **Preview UI**, or open them in a dedicated tab with **Launch UI**.
 
 ### Two Authoring Styles: Direct `ui::show` vs `ui::compile`
 
@@ -445,16 +818,14 @@ You can save the JSON output of `ui::compile(...):json` directly to a `.ui` file
 
 ```minilang
 let app := ui::compile(my_widget)
-let f := file("uis/prebuilt.ui", "w")
-f:write(app:json)
-f:close
+store::put_string("uis/prebuilt.ui", app:json)
 ```
 
 When `GET /ui/uis/prebuilt.ui` is requested, the server detects `"format": "minilang-ui"` and serves the pre-compiled MiniJS bundle immediately without spawning a Minilang kernel process.
 
 ---
 
-## 6. Complete `ui` Widget Reference
+## 7. Complete `ui` Widget Reference
 
 All widget constructors accept optional named properties (e.g. `gap := 12`, `variant := "danger"`, `on_click := fn`) using Minilang's named-argument syntax.
 
@@ -554,9 +925,9 @@ ui::show(ui::vbox(slider, add_btn, out))
 
 ---
 
-## 7. Calling `.mini` Endpoints from `.ui` Files with `exec()`
+## 8. Calling Scripts from `.ui` Files with `exec()`
 
-`exec()` bridges your browser-side `.ui` interface to your server-side `.mini` scripts via `POST /invoke/{script}`.
+`exec()` bridges your browser-side `.ui` interface to any server-side **`.mini` or `.rs`** script via `POST /invoke/{script}`.
 
 ### Signatures
 
@@ -566,8 +937,8 @@ exec("scripts/greet.mini"; res, err, meta) do
     ...
 end
 
-:> 2. Named parameters map
-exec("scripts/greet.mini", {
+:> 2. Named parameters map (works with .mini or .rs!)
+exec("scripts/hello.rs", {
     "name" is name_inp:value,
     "repeat" is 3,
     "excited" is true
@@ -605,10 +976,113 @@ You **never** need to hand-construct `{"type": "integer", "value": ...}` inside 
 
 - `exec()` automatically converts all Minilang values in `params` and `args` (`string`, `integer`, `real`, `boolean`, `nil`, `list`, `tuple`, `set`, `map`, `symbol`, `time`, `uuid`, `bytes`) into the server's tagged JSON format.
 - When the server responds, `exec()` automatically converts the tagged JSON `result` back into native Minilang values so you can immediately write `res["greeting"]`, `res["count"] + 1`, `list(res["lines"]; l) ...`, etc.
+- When authentication is enabled, `exec()` automatically includes the user's Bearer access token.
 
 ---
 
-## 8. End-to-End Cookbook Examples
+## 9. Workspace Viewers, File Explorer & Inline `agy` Assistant
+
+### File Explorer & Right-Click Context Menu
+
+Right-click any **file**, **folder**, or **empty space** in the left file explorer sidebar to open the context menu:
+
+- **On a file**: Open, Launch UI (`.ui`), Open as Notebook (`.mini`/`.rs`), **Cut**, **Copy**, **Paste**, **Duplicate**, **Copy Relative Path**, **Copy Absolute Path**, **Copy File Name**, **Download**, **Rename**, and **Delete**.
+- **On a folder**: Open Folder, New Notebook / File / UI / Folder Here, **Cut**, **Copy**, **Paste into Folder**, **Duplicate**, **Copy Relative Path**, **Copy Absolute Path**, **Copy Name**, **Rename**, and **Delete**.
+- **On empty space**: New Notebook / File / UI / Folder, **Paste**, **Copy Folder Path**, **Copy Absolute Path**, and **Refresh**.
+
+Details:
+- **Copy & Paste** (`POST /api/file/copy`) recursively copies directories as well as single files, automatically resolves name collisions (`foo.mini` → `foo copy.mini`, `foo copy 2.mini`), and rejects copying or moving a directory into itself or outside the workspace root.
+- **Cut & Paste** dims the cut item in the sidebar, moves it on paste, and keeps any open tabs synchronized with the new path.
+
+### Image & PDF Viewer Tabs & Lightbox
+
+- Clicking any image (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.bmp`, `.ico`, `.avif`) or `.pdf` in the file explorer opens it in a dedicated viewer tab with **Zoom In/Out**, **Fit**, **100%**, **Rotate** (images), and **Download** controls.
+- Files are streamed efficiently via `GET /api/file/raw?path=<rel>&download=1` (with proper `Content-Type` and authentication support).
+- In notebooks, `image()`, `pdf()`, `preview()`, and Markdown image/PDF links render compact **thumbnail previews** that expand into the **Media Lightbox** on click.
+
+### Log File Viewer (`MLOG` & Plain-Text `.log`)
+
+Opening any `.log` / `.mlog` file (or any binary file starting with the `MLOG` header created by Minilang's `log(path)`) opens the dedicated **Log Viewer** tab (backed by `GET /api/log`):
+
+- **Binary `MLOG` logs**: Displays nanosecond timestamps, Minilang value types (`map`, `list`, `string`, `integer`, etc.), detected severity badges (`INFO`, `WARN`, `ERROR`, `DEBUG`), and expandable structured JSON/value previews.
+- **Plain-text `.log` files**: Parses lines with timestamp & log-level highlighting.
+- **Controls**: Full-text search filter, type filter dropdown, newest-first / oldest-first toggle, pagination, and a **Live Tail** mode that polls for newly appended entries.
+
+### Markdown Document Viewer
+
+Opening any `.md` or `.markdown` file opens the **Markdown Viewer** tab with three switchable modes:
+
+- **Preview**: Rendered document with GitHub-Flavored Markdown tables, task lists, Minilang & Rust syntax-highlighted code blocks, clickable workspace links, and automatic inline thumbnails for linked images/PDFs.
+- **Split**: Side-by-side live editor and synchronized preview.
+- **Edit**: Distraction-free source editing with `Ctrl+S` save.
+
+### Inline Google Antigravity (`agy`) Assistant
+
+When the Google Antigravity CLI (`agy`) is installed on the host machine (auto-detected from `PATH`, `~/.local/bin/agy`, `~/bin/agy`, `MINILANG_AGY_BIN`, or `--agy-bin`), inline AI help is available directly inside both notebook cells and script editors:
+
+- **In Notebook Cells**:
+  - Click **`✦ agy`** on any cell (or press **`Ctrl+K`** while focused in a cell) to open an inline prompt bar with quick actions (**Explain**, **Optimize**, **Refactor**, **Fix**).
+  - When a cell raises an error, a **`✦ Fix with agy`** button appears directly on the error output and automatically sends the cell code, surrounding context cells, `stdout`, and traceback.
+  - Suggested code blocks can be applied with one click (**Replace Cell**, **Insert Cell Below**, or **Copy**).
+- **In Script Files (`.mini`, `.rs`, `.ui`, etc.)**:
+  - Click **`✦ Ask agy`** in the file toolbar (or press **`Ctrl+K`**). If you have text highlighted, `agy` receives your exact selection along with the surrounding file context and lets you **Replace Selection**, **Replace File**, or **Append**.
+- **Conversation & Control**:
+  - Multi-turn follow-ups preserve conversation state per cell/tab (`conversation_id`).
+  - In-flight requests can be cancelled immediately (`POST /api/agy/cancel`).
+  - REST endpoints: `GET /api/agy/status`, `POST /api/agy/assist`, `POST /api/agy/cancel`.
+
+---
+
+## 10. Local Machine Authentication (PAM + Refreshable Tokens)
+
+### Enabling Login & Unix Group Restrictions
+
+By default, authentication is disabled for local single-user use. To require local Unix credentials (verified via `libpam.so.0` + POSIX NSS group checks):
+
+```bash
+# Require any valid local Unix account
+minilang-notebook --host 0.0.0.0 --port 8888 --require-login
+
+# Restrict access to members of the `devs` Unix group
+minilang-notebook --host 0.0.0.0 --port 8888 --require-group devs \
+  --pam-service login \
+  --access-token-ttl 900 \
+  --refresh-token-ttl 604800
+```
+
+Set `--auth-secret` (or `MINILANG_AUTH_SECRET`) if you want issued access tokens to remain valid across server restarts.
+
+### Token Lifecycle & API Endpoints
+
+- **Access tokens**: Short-lived HS256 JWTs (`Authorization: Bearer <access_token>`).
+- **Refresh tokens**: Opaque rotating tokens stored hashed (SHA-256) on the server with **token-family replay revocation** (reusing an already-rotated refresh token automatically revokes the entire session family).
+- The Web UI handles sign-in, automatic background token rotation before expiry, and `/ui/{path}` login redirects seamlessly.
+
+| Endpoint | Auth Required | Purpose |
+|---|---|---|
+| `GET /api/auth/status` | No | Check if auth is enabled, required group, and current session user |
+| `POST /api/auth/login` | No | Authenticate `{ "username": "...", "password": "..." }` → `{ access_token, refresh_token, expires_in, user }` |
+| `POST /api/auth/refresh` | No | Rotate `{ "refresh_token": "..." }` → fresh access & refresh token pair |
+| `POST /api/auth/logout` | No | Revoke the provided `{ "refresh_token": "..." }` |
+| `GET /api/auth/me` | Yes | Return authenticated user info (`username`, `uid`, `groups`) |
+| `POST /api/auth/logout-all` | Yes | Revoke all active refresh token sessions for the current user |
+
+### Using Authenticated Requests with `curl`
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8888/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"..."}' | jq -r .access_token)
+
+curl -s -X POST http://127.0.0.1:8888/invoke/greet \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"params":{"name":{"type":"string","value":"Alice"}}}'
+```
+
+---
+
+## 11. End-to-End Cookbook Examples
 
 ### Example 1: Parameterized API Script (`scripts/greet.mini`)
 
@@ -794,16 +1268,71 @@ let form := ui::form(
 ui::show(ui::card("Todo List", ui::vbox(form, ui::divider(), list_box)))
 ```
 
+### Example 6: Cached HTTP Pipeline with `store`, `http`, and `log`
+
+```minilang
+let audit := log('{import}/sync.log')
+
+let payload := store::create('{import}/users.cbor'; cache_path) do
+    audit({"level" is "info", "event" is "cache_miss", "path" is cache_path})
+    http::get("https://jsonplaceholder.typicode.com/users", "json")
+end
+
+audit({"level" is "info", "event" is "loaded", "count" is payload:count})
+audit:close
+
+{ "users" is payload:count }
+```
+
+### Example 7: Reusable Minilang Module (`import` / `export`)
+
+`scripts/math.mini`:
+```minilang
+export: let VERSION := "1.0"
+export: fun square(X) X * X
+```
+
+`scripts/test.mini` (or a notebook cell):
+```minilang
+import: math("./math")
+println('Using math v{math::VERSION} from {import}')
+math::square(5)   :> 25
+```
+
+### Example 8: Invocable Rust Script with Cargo Dependencies
+
+`scripts/json_summary.rs`:
+```rust
+:dep serde_json = "1.0"
+
+let label = params.get_str("label").unwrap_or("demo");
+let count = params.get_int("count").unwrap_or(3);
+
+let obj = serde_json::json!({
+    "label": label,
+    "squares": (1..=count).map(|n| n * n).collect::<Vec<_>>(),
+});
+
+Value::string(obj.to_string())
+```
+
+Invoke via `POST /invoke/json_summary` (or call from a `.ui` file with `exec("scripts/json_summary.rs", ...)`).
+
 ---
 
-## 9. Troubleshooting & Minilang Gotchas
+## 12. Troubleshooting & Gotchas
 
 | Issue | Cause & Fix |
 |---|---|
 | `if flag then ...` always takes the `then` branch even when `flag` is `false` | In Minilang, **only `nil` is falsy**. Use `if flag = true then ... else ... end`. |
 | `ValueError: foo is uninitialized` in a `.mini` script | The caller didn't pass `"foo"` in `params`. Use `Params["foo"] or default_value` for optional parameters. |
 | `ParseError` on `1..10` | Add spaces around the range operator: `1 .. 10`. |
-| `MiniJSError: Unsupported type: ...` when calling `ui::show` / `ui::compile` | A closure inside a `.ui` file captured a server-only native handle (such as an open `file` or `socket`). Keep server I/O inside `.mini` scripts and call them from the `.ui` file using `exec()`. |
+| `MiniJSError: Unsupported type: ...` when calling `ui::show` / `ui::compile` | A closure inside a `.ui` file captured a server-only native handle (such as an open `file`, `socket`, or `log`). Keep server I/O inside `.mini` / `.rs` scripts and call them from the `.ui` file using `exec()`. |
 | `UI file executed without calling ui::show(...)` at `/ui/{path}` | Ensure your `.ui` file ends with `ui::show(root_widget)` (or `ui::show(ui::compile(...))`). |
 | `400 Bad Request` on `/invoke` | Check that every parameter uses the tagged JSON format `{"type": "...", "value": ...}` (and `"type": "nil"` has `null` or omitted `"value"`). |
-| `408 Request Timeout` on `/invoke` | Script exceeded `timeout_ms` (default 30s). Optimize the script or pass a higher `timeout_ms` (up to `120000`). |
+| `408 Request Timeout` on `/invoke` | Script exceeded `timeout_ms` (default 30s). Optimize the script or pass a higher `timeout_ms` (up to `120000`, especially for first-time Rust Cargo builds). |
+| `HttpError: Could not load libcurl.so.4` | Install `libcurl` on the host OS (`libcurl4` / `curl` package). |
+| `ModuleError` when calling `import(...)` | Use `./name` for files relative to the current script/notebook directory, or place shared modules in the workspace root or `scripts/`. Both `.mini` and extensionless names are supported. |
+| Rust `:dep` fails in an air-gapped environment | Pre-fetch crates into Cargo's local cache or use a local `{ path = "..." }` dependency. Set `MINILANG_RUST_OFFLINE=1` to skip online retry attempts. |
+| `✦ agy` reports `agy` not found | Ensure `agy` is in `PATH` or `~/.local/bin/agy`, or launch the server with `--agy-bin /path/to/agy` (or `MINILANG_AGY_BIN`). |
+| PAM login fails with `401` / `403` | Verify the host has `/etc/pam.d/<service>` (default `login`), that the server process can authenticate via PAM (e.g., `unix_chkpwd` / shadow access), and that the user belongs to `--require-group` if configured. |

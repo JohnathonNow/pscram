@@ -1,3 +1,4 @@
+use crate::agy::{AgyAssistRequest, AgyRunner};
 use crate::auth::{self, AuthManager, AuthenticatedUser};
 use crate::files::FileStore;
 use crate::kernel_mgr::{InvokeExecError, KernelManager};
@@ -27,6 +28,7 @@ pub struct AppState {
     pub kernels: KernelManager,
     pub languages: Arc<LanguageRegistry>,
     pub auth: Arc<AuthManager>,
+    pub agy: Arc<AgyRunner>,
     pub web_dir: Option<PathBuf>,
 }
 
@@ -56,6 +58,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/log", get(api_read_log))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
+        .route("/api/file/copy", post(api_copy_file))
         .route("/api/notebook/from-mini", post(api_notebook_from_script))
         .route("/api/notebook/to-mini", post(api_notebook_to_script))
         .route("/api/notebook/from-script", post(api_notebook_from_script))
@@ -75,6 +78,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/kernels/:id/inspect", get(api_kernel_inspect))
         .route("/api/kernels/:id/complete", post(api_kernel_complete))
         .route("/api/kernels/:id/chdir", post(api_kernel_chdir))
+        // Google Antigravity (agy) inline assistant API
+        .route("/api/agy/status", get(api_agy_status))
+        .route("/api/agy/assist", post(api_agy_assist))
+        .route("/api/agy/cancel", post(api_agy_cancel))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     public_routes.merge(protected_routes).with_state(state)
@@ -399,6 +406,7 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "languages": st.languages.list_info(),
         "auth_required": st.auth.is_enabled(),
         "required_group": st.auth.required_group(),
+        "agy": st.agy.status(),
         "root_name": root_name,
         "root_path": st.files.root().display().to_string(),
     }))
@@ -764,6 +772,25 @@ async fn api_rename_file(
     Json(body): Json<RenameBody>,
 ) -> Response {
     match st.files.rename_entry(&body.from, &body.to) {
+        Ok(new_path) => Json(json!({ "ok": true, "path": new_path })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CopyBody {
+    from: String,
+    #[serde(default)]
+    to_dir: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn api_copy_file(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<CopyBody>,
+) -> Response {
+    match st.files.copy_entry(&body.from, &body.to_dir, body.name.as_deref()) {
         Ok(new_path) => Json(json!({ "ok": true, "path": new_path })).into_response(),
         Err(e) => api_err(StatusCode::BAD_REQUEST, e),
     }
@@ -1256,4 +1283,36 @@ async fn api_list_uis(State(st): State<Arc<AppState>>) -> Response {
         b_uis.cmp(&a_uis).then_with(|| a.path.cmp(&b.path))
     });
     Json(json!({ "uis": entries })).into_response()
+}
+
+// --- Google Antigravity (agy) Inline Assistant Routes ---
+
+async fn api_agy_status(State(st): State<Arc<AppState>>) -> Response {
+    Json(st.agy.status()).into_response()
+}
+
+async fn api_agy_assist(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AgyAssistRequest>,
+) -> Response {
+    if req.prompt.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "Prompt cannot be empty");
+    }
+    match st.agy.assist(req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => api_err(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AgyCancelBody {
+    request_id: String,
+}
+
+async fn api_agy_cancel(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<AgyCancelBody>,
+) -> Response {
+    let cancelled = st.agy.cancel(&body.request_id).await;
+    Json(json!({ "ok": true, "cancelled": cancelled })).into_response()
 }

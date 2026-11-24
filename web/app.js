@@ -798,6 +798,7 @@
   // --- Application State ---
   const state = {
     rootName: "workspace",
+    rootPath: "",
     languages: [
       { id: "minilang", name: "Minilang", version: "2.17.0", extensions: ["mini"], supports_notebook: true, supports_invoke: true, supports_ui: true },
       { id: "rust", name: "Rust", version: "1.x", extensions: ["rs"], supports_notebook: true, supports_invoke: true, supports_ui: false },
@@ -806,6 +807,7 @@
     showHidden: false,
     searchQuery: "",
     dirEntries: [],
+    fileClipboard: null, // { mode: "copy"|"cut", path, name, kind }
     tabs: [], // { id, kind: 'notebook'|'file', path, title, dirty, kernelId, language?, doc?, activeCellId?, content?, extension? }
     activeTabId: null,
     varsOpen: false,
@@ -1112,11 +1114,12 @@
 
     for (const entry of entries) {
       const selected = openPath && entry.path === openPath ? "selected" : "";
+      const isCut = state.fileClipboard && state.fileClipboard.mode === "cut" && state.fileClipboard.path === entry.path ? "is-cut" : "";
       const subDir = isSearch && entry.path.includes("/")
         ? entry.path.slice(0, entry.path.lastIndexOf("/"))
         : "";
       html += `
-        <div class="file-row ${selected}" data-path="${escapeHtml(entry.path)}" data-kind="${entry.kind}" data-notebook="${entry.is_notebook}">
+        <div class="file-row ${selected} ${isCut}" data-path="${escapeHtml(entry.path)}" data-kind="${entry.kind}" data-notebook="${entry.is_notebook}">
           ${fileIconSvg(entry)}
           <span class="file-name" title="${escapeHtml(entry.path)}">${escapeHtml(entry.name)}</span>
           ${subDir ? `<span class="file-subpath">${escapeHtml(subDir)}</span>` : ""}
@@ -1133,6 +1136,8 @@
     }
 
     listEl.innerHTML = html;
+
+    const entryByPath = new Map(entries.map((ent) => [ent.path, ent]));
 
     listEl.querySelectorAll(".file-row").forEach((row) => {
       if (row.dataset.up !== undefined) {
@@ -1151,61 +1156,499 @@
           openPathInTab(p);
         }
       };
+      row.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const ent = entryByPath.get(row.dataset.path) || {
+          path: row.dataset.path,
+          name: row.dataset.path.split("/").pop(),
+          kind: row.dataset.kind,
+        };
+        openFileContextMenu(e.clientX, e.clientY, ent, row);
+      });
     });
 
     listEl.querySelectorAll(".act-rename").forEach((btn) => {
-      btn.onclick = async (e) => {
+      btn.onclick = (e) => {
         e.stopPropagation();
-        const oldPath = btn.dataset.path;
-        const base = oldPath.split("/").pop();
-        const dir = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "";
-        const newName = await showModal({
-          title: "Rename",
-          bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Rename <code>${escapeHtml(base)}</code> to:</p>`,
-          confirmText: "Rename",
-          inputValue: base,
-        });
-        if (!newName || !newName.trim() || newName.trim() === base) return;
-        const to = dir ? `${dir}/${newName.trim()}` : newName.trim();
-        try {
-          await api("/api/file/rename", { method: "POST", body: JSON.stringify({ from: oldPath, to }) });
-          const existingTab = state.tabs.find((t) => t.path === oldPath);
-          if (existingTab) {
-            existingTab.path = to;
-            existingTab.title = newName.trim();
-            renderTabs();
-            updateStatusBar();
-          }
-          toast(`Renamed to ${newName.trim()}`, "success");
-          loadDirectory();
-        } catch (err) {
-          toast(`Rename failed: ${err.message}`, "error");
-        }
+        renameFileEntry(btn.dataset.path);
       };
     });
 
     listEl.querySelectorAll(".act-delete").forEach((btn) => {
-      btn.onclick = async (e) => {
+      btn.onclick = (e) => {
         e.stopPropagation();
-        const p = btn.dataset.path;
-        const ok = await showModal({
-          title: "Delete",
-          bodyHtml: `<p style="margin:0;color:var(--text-secondary)">Permanently delete <code>${escapeHtml(p)}</code>?</p>`,
-          confirmText: "Delete",
-        });
-        if (!ok) return;
-        try {
-          await api(`/api/file?path=${encodeURIComponent(p)}`, { method: "DELETE" });
-          const tabIdx = state.tabs.findIndex((t) => t.path === p);
-          if (tabIdx >= 0) closeTab(state.tabs[tabIdx].id);
-          toast(`Deleted ${p}`, "success");
-          loadDirectory();
-        } catch (err) {
-          toast(`Delete failed: ${err.message}`, "error");
-        }
+        deleteFileEntry(btn.dataset.path);
       };
     });
   }
+
+  // --- File Explorer Actions & Context Menu ---
+  function parentDirOf(relPath) {
+    if (!relPath || !relPath.includes("/")) return "";
+    return relPath.slice(0, relPath.lastIndexOf("/"));
+  }
+
+  function buildAbsolutePath(relPath) {
+    const base = (state.rootPath || "").replace(/\/+$/, "");
+    if (!base) return relPath || "/";
+    return relPath ? `${base}/${relPath}` : base;
+  }
+
+  async function copyTextToClipboard(text, label = "Copied") {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        throw new Error("clipboard unavailable");
+      }
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.pointerEvents = "none";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        ta.remove();
+      }
+    }
+    toast(label, "success");
+  }
+
+  function updateOpenTabsForMove(oldPath, newPath) {
+    let changed = false;
+    const prefix = `${oldPath}/`;
+    for (const tab of state.tabs) {
+      if (!tab.path) continue;
+      if (tab.path === oldPath) {
+        tab.path = newPath;
+        tab.title = newPath.split("/").pop();
+        changed = true;
+      } else if (tab.path.startsWith(prefix)) {
+        tab.path = `${newPath}/${tab.path.slice(prefix.length)}`;
+        changed = true;
+      }
+    }
+    if (changed) {
+      renderTabs();
+      updateStatusBar();
+    }
+  }
+
+  async function renameFileEntry(oldPath) {
+    const base = oldPath.split("/").pop();
+    const dir = parentDirOf(oldPath);
+    const newName = await showModal({
+      title: "Rename",
+      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Rename <code>${escapeHtml(base)}</code> to:</p>`,
+      confirmText: "Rename",
+      inputValue: base,
+    });
+    if (!newName || !newName.trim() || newName.trim() === base) return;
+    const trimmed = newName.trim();
+    const to = dir ? `${dir}/${trimmed}` : trimmed;
+    try {
+      await api("/api/file/rename", { method: "POST", body: JSON.stringify({ from: oldPath, to }) });
+      updateOpenTabsForMove(oldPath, to);
+      if (state.fileClipboard) {
+        if (state.fileClipboard.path === oldPath) {
+          state.fileClipboard.path = to;
+          state.fileClipboard.name = trimmed;
+        } else if (state.fileClipboard.path.startsWith(`${oldPath}/`)) {
+          state.fileClipboard.path = `${to}/${state.fileClipboard.path.slice(oldPath.length + 1)}`;
+        }
+      }
+      toast(`Renamed to ${trimmed}`, "success");
+      loadDirectory();
+    } catch (err) {
+      toast(`Rename failed: ${err.message}`, "error");
+    }
+  }
+
+  async function deleteFileEntry(targetPath) {
+    const ok = await showModal({
+      title: "Delete",
+      bodyHtml: `<p style="margin:0;color:var(--text-secondary)">Permanently delete <code>${escapeHtml(targetPath)}</code>?</p>`,
+      confirmText: "Delete",
+    });
+    if (!ok) return;
+    try {
+      await api(`/api/file?path=${encodeURIComponent(targetPath)}`, { method: "DELETE" });
+      const prefix = `${targetPath}/`;
+      const tabsToClose = state.tabs
+        .filter((t) => t.path === targetPath || (t.path && t.path.startsWith(prefix)))
+        .map((t) => t.id);
+      for (const id of tabsToClose) closeTab(id);
+      if (state.fileClipboard && (state.fileClipboard.path === targetPath || state.fileClipboard.path.startsWith(prefix))) {
+        state.fileClipboard = null;
+      }
+      toast(`Deleted ${targetPath}`, "success");
+      loadDirectory();
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, "error");
+    }
+  }
+
+  function setFileClipboard(mode, entry) {
+    state.fileClipboard = {
+      mode,
+      path: entry.path,
+      name: entry.name || entry.path.split("/").pop(),
+      kind: entry.kind,
+    };
+    renderFileList(state.dirEntries, !!state.searchQuery);
+    toast(`${mode === "cut" ? "Cut" : "Copied"} ${state.fileClipboard.name}`, "info");
+  }
+
+  async function pasteClipboardInto(targetDir) {
+    const clip = state.fileClipboard;
+    if (!clip) return;
+    const destDir = targetDir || "";
+    try {
+      if (clip.mode === "copy") {
+        const res = await api("/api/file/copy", {
+          method: "POST",
+          body: JSON.stringify({ from: clip.path, to_dir: destDir }),
+        });
+        toast(`Pasted ${res.path}`, "success");
+        await loadDirectory();
+      } else {
+        const to = destDir ? `${destDir}/${clip.name}` : clip.name;
+        if (to === clip.path) {
+          state.fileClipboard = null;
+          renderFileList(state.dirEntries, !!state.searchQuery);
+          toast("Item is already in this folder", "info");
+          return;
+        }
+        await api("/api/file/rename", {
+          method: "POST",
+          body: JSON.stringify({ from: clip.path, to }),
+        });
+        updateOpenTabsForMove(clip.path, to);
+        state.fileClipboard = null;
+        toast(`Moved to ${to}`, "success");
+        await loadDirectory();
+      }
+    } catch (err) {
+      toast(`Paste failed: ${err.message}`, "error");
+    }
+  }
+
+  async function duplicateEntry(entry) {
+    const dir = parentDirOf(entry.path);
+    try {
+      const res = await api("/api/file/copy", {
+        method: "POST",
+        body: JSON.stringify({ from: entry.path, to_dir: dir }),
+      });
+      toast(`Duplicated as ${res.path.split("/").pop()}`, "success");
+      await loadDirectory();
+    } catch (err) {
+      toast(`Duplicate failed: ${err.message}`, "error");
+    }
+  }
+
+  async function openEntryAsNotebook(entry) {
+    try {
+      const file = await api(`/api/file?path=${encodeURIComponent(entry.path)}`);
+      const fileLang = langByExtension(file.extension);
+      const doc = await api("/api/notebook/from-script", {
+        method: "POST",
+        body: JSON.stringify({
+          title: file.name,
+          content: file.content,
+          language: fileLang ? fileLang.id : "minilang",
+        }),
+      });
+      const nbTitle = file.name.replace(/\.[^.]+$/i, "") + ".mnb";
+      await createUntitledNotebook(doc, nbTitle, null, doc.language);
+    } catch (err) {
+      toast(`Open as notebook failed: ${err.message}`, "error");
+    }
+  }
+
+  async function downloadFileEntry(relPath) {
+    const url = `/api/file/raw?path=${encodeURIComponent(relPath)}&download=1`;
+    const fileName = relPath.split("/").pop() || "download";
+    if (!authState.required) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    try {
+      const res = await authFetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+    } catch (err) {
+      toast(`Download failed: ${err.message}`, "error");
+    }
+  }
+
+  const CTX_ICONS = {
+    open: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`,
+    folder: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`,
+    plus: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
+    cut: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>`,
+    copy: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
+    paste: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>`,
+    path: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
+    download: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+    rename: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+    trash: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>`,
+    refresh: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`,
+    ui: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>`,
+  };
+
+  let activeContextRow = null;
+
+  function closeFileContextMenu() {
+    const menu = document.getElementById("file-context-menu");
+    if (menu) {
+      menu.classList.add("hidden");
+      menu.innerHTML = "";
+    }
+    if (activeContextRow) {
+      activeContextRow.classList.remove("context-target");
+      activeContextRow = null;
+    }
+  }
+
+  function openFileContextMenu(x, y, entry, rowEl = null) {
+    closeFileContextMenu();
+    const menu = document.getElementById("file-context-menu");
+    if (!menu) return;
+
+    if (rowEl) {
+      activeContextRow = rowEl;
+      rowEl.classList.add("context-target");
+    }
+
+    const clip = state.fileClipboard;
+    const clipHint = clip ? `${clip.mode === "cut" ? "Move" : "Copy"}: ${clip.name}` : "";
+    const items = [];
+
+    if (entry && entry.kind === "dir") {
+      items.push({ header: entry.name });
+      items.push({
+        label: "Open Folder",
+        icon: CTX_ICONS.folder,
+        action: () => {
+          document.getElementById("file-search-input").value = "";
+          state.searchQuery = "";
+          document.getElementById("btn-clear-search").classList.add("hidden");
+          loadDirectory(entry.path);
+        },
+      });
+      items.push({ sep: true });
+      items.push({ label: "New Notebook Here", icon: CTX_ICONS.plus, action: () => promptNewNotebook(entry.path) });
+      items.push({ label: "New File Here", icon: CTX_ICONS.plus, action: () => promptNewFile(entry.path) });
+      items.push({ label: "New UI Here", icon: CTX_ICONS.ui, action: () => promptNewUi(entry.path) });
+      items.push({ label: "New Folder Here", icon: CTX_ICONS.folder, action: () => promptNewFolder(entry.path) });
+      items.push({ sep: true });
+      items.push({ label: "Cut", icon: CTX_ICONS.cut, action: () => setFileClipboard("cut", entry) });
+      items.push({ label: "Copy", icon: CTX_ICONS.copy, action: () => setFileClipboard("copy", entry) });
+      items.push({
+        label: "Paste into Folder",
+        icon: CTX_ICONS.paste,
+        hint: clipHint,
+        disabled: !clip,
+        action: () => pasteClipboardInto(entry.path),
+      });
+      items.push({ label: "Duplicate", icon: CTX_ICONS.copy, action: () => duplicateEntry(entry) });
+      items.push({ sep: true });
+      items.push({
+        label: "Copy Relative Path",
+        icon: CTX_ICONS.path,
+        action: () => copyTextToClipboard(entry.path, `Copied path: ${entry.path}`),
+      });
+      items.push({
+        label: "Copy Absolute Path",
+        icon: CTX_ICONS.path,
+        action: () => {
+          const abs = buildAbsolutePath(entry.path);
+          copyTextToClipboard(abs, `Copied absolute path`);
+        },
+      });
+      items.push({
+        label: "Copy Name",
+        icon: CTX_ICONS.copy,
+        action: () => copyTextToClipboard(entry.name, `Copied name: ${entry.name}`),
+      });
+      items.push({ sep: true });
+      items.push({ label: "Rename", icon: CTX_ICONS.rename, action: () => renameFileEntry(entry.path) });
+      items.push({ label: "Delete", icon: CTX_ICONS.trash, danger: true, action: () => deleteFileEntry(entry.path) });
+    } else if (entry) {
+      const ext = (entry.extension || (entry.name.includes(".") ? entry.name.split(".").pop() : "") || "").toLowerCase();
+      const targetDir = parentDirOf(entry.path);
+      items.push({ header: entry.name });
+      items.push({ label: "Open", icon: CTX_ICONS.open, action: () => openPathInTab(entry.path) });
+      if (ext === "ui") {
+        items.push({
+          label: "Launch UI",
+          icon: CTX_ICONS.ui,
+          action: () => window.open(`/ui/${encodeURI(entry.path)}`, "_blank", "noopener"),
+        });
+      }
+      if (ext === "mini" || ext === "rs") {
+        items.push({
+          label: "Open as Notebook",
+          icon: CTX_ICONS.open,
+          action: () => openEntryAsNotebook(entry),
+        });
+      }
+      items.push({ sep: true });
+      items.push({ label: "Cut", icon: CTX_ICONS.cut, action: () => setFileClipboard("cut", entry) });
+      items.push({ label: "Copy", icon: CTX_ICONS.copy, action: () => setFileClipboard("copy", entry) });
+      items.push({
+        label: "Paste",
+        icon: CTX_ICONS.paste,
+        hint: clipHint,
+        disabled: !clip,
+        action: () => pasteClipboardInto(targetDir),
+      });
+      items.push({ label: "Duplicate", icon: CTX_ICONS.copy, action: () => duplicateEntry(entry) });
+      items.push({ sep: true });
+      items.push({
+        label: "Copy Relative Path",
+        icon: CTX_ICONS.path,
+        action: () => copyTextToClipboard(entry.path, `Copied path: ${entry.path}`),
+      });
+      items.push({
+        label: "Copy Absolute Path",
+        icon: CTX_ICONS.path,
+        action: () => {
+          const abs = buildAbsolutePath(entry.path);
+          copyTextToClipboard(abs, `Copied absolute path`);
+        },
+      });
+      items.push({
+        label: "Copy File Name",
+        icon: CTX_ICONS.copy,
+        action: () => copyTextToClipboard(entry.name, `Copied name: ${entry.name}`),
+      });
+      items.push({ sep: true });
+      items.push({ label: "Download", icon: CTX_ICONS.download, action: () => downloadFileEntry(entry.path) });
+      items.push({ label: "Rename", icon: CTX_ICONS.rename, action: () => renameFileEntry(entry.path) });
+      items.push({ label: "Delete", icon: CTX_ICONS.trash, danger: true, action: () => deleteFileEntry(entry.path) });
+    } else {
+      const curDir = state.currentDir || "";
+      items.push({ header: curDir || state.rootName || "/" });
+      items.push({ label: "New Notebook", icon: CTX_ICONS.plus, action: () => promptNewNotebook(curDir) });
+      items.push({ label: "New File", icon: CTX_ICONS.plus, action: () => promptNewFile(curDir) });
+      items.push({ label: "New UI", icon: CTX_ICONS.ui, action: () => promptNewUi(curDir) });
+      items.push({ label: "New Folder", icon: CTX_ICONS.folder, action: () => promptNewFolder(curDir) });
+      items.push({ sep: true });
+      items.push({
+        label: "Paste",
+        icon: CTX_ICONS.paste,
+        hint: clipHint,
+        disabled: !clip,
+        action: () => pasteClipboardInto(curDir),
+      });
+      items.push({ sep: true });
+      items.push({
+        label: "Copy Folder Path",
+        icon: CTX_ICONS.path,
+        action: () => copyTextToClipboard(curDir || ".", `Copied path: ${curDir || "."}`),
+      });
+      items.push({
+        label: "Copy Absolute Path",
+        icon: CTX_ICONS.path,
+        action: () => copyTextToClipboard(buildAbsolutePath(curDir), "Copied absolute path"),
+      });
+      items.push({ sep: true });
+      items.push({ label: "Refresh", icon: CTX_ICONS.refresh, action: () => loadDirectory() });
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const item of items) {
+      if (item.sep) {
+        const sep = document.createElement("div");
+        sep.className = "context-menu-sep";
+        frag.appendChild(sep);
+        continue;
+      }
+      if (item.header) {
+        const hdr = document.createElement("div");
+        hdr.className = "context-menu-header";
+        hdr.textContent = item.header;
+        hdr.title = item.header;
+        frag.appendChild(hdr);
+        continue;
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `context-menu-item${item.danger ? " danger" : ""}${item.disabled ? " disabled" : ""}`;
+      btn.setAttribute("role", "menuitem");
+      if (item.disabled) btn.disabled = true;
+      btn.innerHTML = `
+        <span class="context-menu-item-icon">${item.icon || ""}</span>
+        <span class="context-menu-item-label">${escapeHtml(item.label)}</span>
+        ${item.hint ? `<span class="context-menu-item-hint" title="${escapeHtml(item.hint)}">${escapeHtml(item.hint)}</span>` : ""}
+      `;
+      if (!item.disabled) {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          closeFileContextMenu();
+          item.action();
+        });
+      }
+      frag.appendChild(btn);
+    }
+
+    menu.innerHTML = "";
+    menu.appendChild(frag);
+    menu.classList.remove("hidden");
+
+    // Position clamped to viewport
+    const pad = 8;
+    const rect = menu.getBoundingClientRect();
+    let left = x;
+    let top = y;
+    if (left + rect.width + pad > window.innerWidth) {
+      left = Math.max(pad, window.innerWidth - rect.width - pad);
+    }
+    if (top + rect.height + pad > window.innerHeight) {
+      top = Math.max(pad, window.innerHeight - rect.height - pad);
+    }
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  document.getElementById("file-list").addEventListener("contextmenu", (e) => {
+    if (e.target.closest(".file-row")) return;
+    e.preventDefault();
+    openFileContextMenu(e.clientX, e.clientY, null, null);
+  });
+  document.getElementById("file-list").addEventListener("scroll", closeFileContextMenu);
+  document.addEventListener("click", (e) => {
+    const menu = document.getElementById("file-context-menu");
+    if (menu && !menu.classList.contains("hidden") && !menu.contains(e.target)) {
+      closeFileContextMenu();
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeFileContextMenu();
+  });
+  window.addEventListener("resize", closeFileContextMenu);
+  window.addEventListener("blur", closeFileContextMenu);
 
   // --- Tabs & Opening Files ---
   async function ensureKernel(sessionId, cwdPath = "", language = "minilang") {
@@ -1695,6 +2138,8 @@
       document.getElementById("ftb-open-as-nb").classList.toggle("hidden", !isScript);
       document.getElementById("file-run-output").classList.add("hidden");
       document.getElementById("file-invoke-panel").classList.add("hidden");
+      document.getElementById("file-agy-panel").classList.toggle("hidden", !tab._agyOpen);
+      if (tab._agyOpen) renderFileAgyPanel(tab);
     }
   }
 
@@ -1839,7 +2284,10 @@
           <div class="output-gutter" style="color:var(--accent-red)">Err:</div>
           <div class="output-body">
             <div class="output-error">
-              <div class="output-error-title">${escapeHtml(output.error.error_type)}: ${escapeHtml(output.error.message)}</div>
+              <div class="output-error-head">
+                <div class="output-error-title">${escapeHtml(output.error.error_type)}: ${escapeHtml(output.error.message)}</div>
+                <button type="button" class="fix-agy-btn" title="Ask Google Antigravity (agy) to diagnose and fix this error">✦ Fix with agy</button>
+              </div>
               ${output.error.traceback ? `<pre class="output-error-tb">${escapeHtml(output.error.traceback)}</pre>` : ""}
             </div>
           </div>
@@ -1884,6 +2332,9 @@
     const toolbar = document.createElement("div");
     toolbar.className = "cell-toolbar";
     toolbar.innerHTML = `
+      <button class="icon-btn sm ct-agy" title="Ask Google Antigravity (agy) about this cell (Ctrl+K)">
+        <span>✦ agy</span>
+      </button>
       <button class="icon-btn sm ct-run" title="Run Cell (Shift+Enter)">
         <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
       </button>
@@ -1903,6 +2354,10 @@
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
       </button>
     `;
+    toolbar.querySelector(".ct-agy").onclick = (e) => {
+      e.stopPropagation();
+      toggleCellAgy(tab, cell);
+    };
     toolbar.querySelector(".ct-run").onclick = (e) => { e.stopPropagation(); runCell(cell.id); };
     toolbar.querySelector(".ct-type").onclick = (e) => { e.stopPropagation(); toggleCellType(cell.id); };
     toolbar.querySelector(".ct-up").onclick = (e) => { e.stopPropagation(); moveCell(cell.id, -1); };
@@ -2011,6 +2466,11 @@
 
     el.appendChild(row);
 
+    // Inline Antigravity (agy) assistant panel for this cell
+    if (cell._agyOpen) {
+      el.appendChild(buildCellAgyPanel(tab, cell));
+    }
+
     // Output
     if (cell.cell_type === "code" && hasOutput) {
       const outWrap = document.createElement("div");
@@ -2020,6 +2480,12 @@
         el.appendChild(outNode);
         hydrateUiDisplays(outNode, cell.output);
         hydrateMediaPreviews(outNode);
+        outNode.querySelector(".fix-agy-btn")?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          cell._agyOpen = true;
+          updateSingleCellDom(tab, cell.id);
+          runCellAgy(tab, cell, "Diagnose and fix this error.", "fix");
+        });
       }
     }
 
@@ -2643,8 +3109,9 @@
   const savedTheme = localStorage.getItem("ml_theme");
   if (savedTheme) document.documentElement.dataset.theme = savedTheme;
 
-  // Sidebar file creation buttons
-  document.getElementById("btn-new-notebook").onclick = async () => {
+  // Sidebar file creation helpers & buttons
+  async function promptNewNotebook(targetDir = state.currentDir) {
+    const dir = targetDir || "";
     const langOpts = state.languages
       .filter((l) => l.supports_notebook)
       .map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.name)} (${escapeHtml(l.version)})</option>`)
@@ -2654,14 +3121,14 @@
       bodyHtml: `
         <p style="margin:0 0 8px;color:var(--text-secondary)">Language kernel:</p>
         <select id="modal-lang-select" class="modal-input" style="margin-bottom:12px">${langOpts}</select>
-        <p style="margin:0 0 8px;color:var(--text-secondary)">Create in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+        <p style="margin:0 0 8px;color:var(--text-secondary)">Create in <code>${escapeHtml(dir || "/")}</code>:</p>`,
       confirmText: "Create",
       inputValue: "untitled.mnb",
     });
     if (!name || !name.trim()) return;
     const chosenLang = document.getElementById("modal-lang-select")?.value || "minilang";
     const fname = name.trim().endsWith(".mnb") ? name.trim() : `${name.trim()}.mnb`;
-    const fullPath = state.currentDir ? `${state.currentDir}/${fname}` : fname;
+    const fullPath = dir ? `${dir}/${fname}` : fname;
     try {
       await api("/api/file/new", {
         method: "POST",
@@ -2673,18 +3140,19 @@
     } catch (e) {
       toast(e.message, "error");
     }
-  };
+  }
 
-  document.getElementById("btn-new-ui").onclick = async () => {
+  async function promptNewUi(targetDir = state.currentDir) {
+    const dir = targetDir || "";
     const name = await showModal({
       title: "New Minilang UI (.ui)",
-      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create UI file in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create UI file in <code>${escapeHtml(dir || "/")}</code>:</p>`,
       confirmText: "Create",
       inputValue: "app.ui",
     });
     if (!name || !name.trim()) return;
     const fname = name.trim().endsWith(".ui") ? name.trim() : `${name.trim()}.ui`;
-    const fullPath = state.currentDir ? `${state.currentDir}/${fname}` : fname;
+    const fullPath = dir ? `${dir}/${fname}` : fname;
     try {
       await api("/api/file/new", { method: "POST", body: JSON.stringify({ path: fullPath, kind: "ui" }) });
       await loadDirectory();
@@ -2693,17 +3161,18 @@
     } catch (e) {
       toast(e.message, "error");
     }
-  };
+  }
 
-  document.getElementById("btn-new-file").onclick = async () => {
+  async function promptNewFile(targetDir = state.currentDir) {
+    const dir = targetDir || "";
     const name = await showModal({
       title: "New File",
-      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create file in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create file in <code>${escapeHtml(dir || "/")}</code>:</p>`,
       confirmText: "Create",
       inputValue: "script.mini",
     });
     if (!name || !name.trim()) return;
-    const fullPath = state.currentDir ? `${state.currentDir}/${name.trim()}` : name.trim();
+    const fullPath = dir ? `${dir}/${name.trim()}` : name.trim();
     try {
       await api("/api/file/new", { method: "POST", body: JSON.stringify({ path: fullPath, kind: "file" }) });
       await loadDirectory();
@@ -2711,24 +3180,30 @@
     } catch (e) {
       toast(e.message, "error");
     }
-  };
+  }
 
-  document.getElementById("btn-new-folder").onclick = async () => {
+  async function promptNewFolder(targetDir = state.currentDir) {
+    const dir = targetDir || "";
     const name = await showModal({
       title: "New Folder",
-      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create folder in <code>${escapeHtml(state.currentDir || "/")}</code>:</p>`,
+      bodyHtml: `<p style="margin:0 0 10px;color:var(--text-secondary)">Create folder in <code>${escapeHtml(dir || "/")}</code>:</p>`,
       confirmText: "Create",
       inputValue: "notebooks",
     });
     if (!name || !name.trim()) return;
-    const fullPath = state.currentDir ? `${state.currentDir}/${name.trim()}` : name.trim();
+    const fullPath = dir ? `${dir}/${name.trim()}` : name.trim();
     try {
       await api("/api/file/new", { method: "POST", body: JSON.stringify({ path: fullPath, kind: "dir" }) });
       await loadDirectory();
     } catch (e) {
       toast(e.message, "error");
     }
-  };
+  }
+
+  document.getElementById("btn-new-notebook").onclick = () => promptNewNotebook();
+  document.getElementById("btn-new-ui").onclick = () => promptNewUi();
+  document.getElementById("btn-new-file").onclick = () => promptNewFile();
+  document.getElementById("btn-new-folder").onclick = () => promptNewFolder();
 
   document.getElementById("btn-toggle-hidden").onclick = (e) => {
     state.showHidden = !state.showHidden;
@@ -2844,9 +3319,14 @@
         method: "POST",
         body: JSON.stringify({ code: tab.content, source: tab.title, language: fileLang.id }),
       });
+      tab._lastRunOutput = resp;
       outBody.innerHTML = renderOutputHtml(resp, resp.execution_count) || `<span style="color:var(--text-muted)">(no output)</span>`;
       hydrateUiDisplays(outBody, resp);
       hydrateMediaPreviews(outBody);
+      outBody.querySelector(".fix-agy-btn")?.addEventListener("click", () => {
+        openFileAgyPanel(tab);
+        runFileAgy(tab, "Diagnose and fix the error from the last run.", "fix");
+      });
     } catch (e) {
       outBody.innerHTML = `<div class="output-error">${escapeHtml(e.message)}</div>`;
     }
@@ -3019,6 +3499,443 @@
       e.preventDefault();
       document.getElementById("sidebar").classList.toggle("hidden");
       document.getElementById("sidebar-resizer").classList.toggle("hidden");
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      const tab = activeTab();
+      if (!tab) return;
+      if (tab.kind === "notebook") {
+        e.preventDefault();
+        const cell = tab.doc.cells.find((c) => c.id === tab.activeCellId) || tab.doc.cells[0];
+        if (cell) toggleCellAgy(tab, cell, true);
+      } else if (tab.kind === "file") {
+        e.preventDefault();
+        openFileAgyPanel(tab);
+      }
+    }
+  });
+
+  // --- Google Antigravity (agy) Inline Assistant (Cells & Script Files) ---
+  function formatOutputErrorForAgy(output) {
+    if (!output || !output.error) return null;
+    const e = output.error;
+    return `${e.error_type || "Error"}: ${e.message || ""}${e.traceback ? `\n${e.traceback}` : ""}`;
+  }
+
+  function toggleCellAgy(tab, cell, forceOpen = false) {
+    cell._agyOpen = forceOpen ? true : !cell._agyOpen;
+    updateSingleCellDom(tab, cell.id);
+    if (cell._agyOpen) {
+      setTimeout(() => {
+        document.querySelector(`.cell[data-cell-id="${cell.id}"] .cell-agy-input`)?.focus();
+      }, 20);
+    }
+  }
+
+  async function runCellAgy(tab, cell, promptText, action = "ask") {
+    const prompt = (promptText || "").trim();
+    if (!prompt) return;
+    if (cell._agyLoading && cell._agyRequestId) {
+      api("/api/agy/cancel", { method: "POST", body: JSON.stringify({ request_id: cell._agyRequestId }) }).catch(() => {});
+    }
+
+    const idx = tab.doc.cells.findIndex((c) => c.id === cell.id);
+    const surrounding = tab.doc.cells
+      .slice(0, Math.max(0, idx))
+      .filter((c) => c.cell_type === "code" && c.source.trim())
+      .map((c) => c.source);
+
+    const reqId = `agy-${uid().slice(0, 10)}`;
+    cell._agyOpen = true;
+    cell._agyPrompt = prompt;
+    cell._agyLoading = true;
+    cell._agyRequestId = reqId;
+    cell._agyError = null;
+    updateSingleCellDom(tab, cell.id);
+
+    try {
+      const data = await api("/api/agy/assist", {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: reqId,
+          prompt,
+          action,
+          kind: "cell",
+          language: cell.cell_type === "markdown" ? "markdown" : (tab.doc.language || "minilang"),
+          path: tab.path || tab.title,
+          code: cell.source || "",
+          error: formatOutputErrorForAgy(cell.output),
+          stdout: cell.output?.stdout || null,
+          surrounding_cells: surrounding,
+          conversation_id: cell._agyConvId || null,
+        }),
+      });
+      if (cell._agyRequestId !== reqId) return;
+      cell._agyResponse = data.response || "";
+      cell._agySuggestedCode = data.suggested_code || null;
+      cell._agyConvId = data.conversation_id || cell._agyConvId || null;
+      cell._agyDurationMs = data.duration_ms || null;
+    } catch (err) {
+      if (cell._agyRequestId !== reqId) return;
+      cell._agyError = err.message;
+    } finally {
+      if (cell._agyRequestId === reqId) {
+        cell._agyLoading = false;
+        cell._agyRequestId = null;
+        updateSingleCellDom(tab, cell.id);
+      }
+    }
+  }
+
+  function buildCellAgyPanel(tab, cell) {
+    const panel = document.createElement("div");
+    panel.className = "cell-agy-panel";
+    panel.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    const hasErr = !!(cell.output && cell.output.error);
+    const statusText = cell._agyLoading
+      ? "Thinking with agy..."
+      : (typeof cell._agyDurationMs === "number" ? `${(cell._agyDurationMs / 1000).toFixed(1)}s` : "");
+
+    panel.innerHTML = `
+      <div class="agy-header">
+        <div class="agy-title-wrap">
+          <span class="agy-spark">✦</span>
+          <strong>Antigravity (agy)</strong>
+          <span class="tb-meta">${escapeHtml(statusText)}</span>
+        </div>
+        <div class="toolbar-group">
+          ${cell._agyConvId ? `<button type="button" class="tb-btn agy-cell-reset" style="height:22px;font-size:11px;padding:0 7px">New Thread</button>` : ""}
+          <button type="button" class="icon-btn sm agy-cell-close" title="Close">&times;</button>
+        </div>
+      </div>
+      <div class="agy-chips">
+        ${hasErr ? `<button type="button" class="agy-chip emph" data-action="fix" data-prompt="Diagnose and fix this error.">Fix Error</button>` : ""}
+        <button type="button" class="agy-chip" data-action="explain" data-prompt="Explain what this cell does.">Explain</button>
+        <button type="button" class="agy-chip" data-action="improve" data-prompt="Improve and clean up this cell.">Improve</button>
+        <button type="button" class="agy-chip" data-action="generate" data-prompt="Write a clean example for this cell.">Generate</button>
+      </div>
+      <div class="agy-prompt-row">
+        <input class="agy-input cell-agy-input" type="text" placeholder="Ask agy about this cell... (Enter to send, Esc to close)" value="${escapeHtml(cell._agyPrompt || "")}" ${cell._agyLoading ? "disabled" : ""} />
+        ${cell._agyLoading
+          ? `<button type="button" class="tb-btn danger-hover agy-cell-cancel">Cancel</button>`
+          : `<button type="button" class="tb-btn primary agy-cell-send">Ask</button>`}
+      </div>
+      ${(cell._agyError || cell._agyResponse) ? `
+        <div class="agy-response-wrap">
+          <div class="agy-response ${cell._agyError ? "is-error" : "md-rendered"}">
+            ${cell._agyError ? escapeHtml(cell._agyError) : renderMarkdown(cell._agyResponse)}
+          </div>
+          ${(!cell._agyError && cell._agySuggestedCode) ? `
+            <div class="agy-apply-bar">
+              <button type="button" class="tb-btn primary agy-cell-replace">Replace Cell</button>
+              <button type="button" class="tb-btn agy-cell-insert">Insert Cell Below</button>
+              <button type="button" class="tb-btn agy-cell-copy">Copy Code</button>
+            </div>
+          ` : ""}
+        </div>
+      ` : ""}
+    `;
+
+    hydrateMediaPreviews(panel);
+
+    const input = panel.querySelector(".cell-agy-input");
+    input?.addEventListener("input", (e) => { cell._agyPrompt = e.target.value; });
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        runCellAgy(tab, cell, input.value, "ask");
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cell._agyOpen = false;
+        updateSingleCellDom(tab, cell.id);
+      }
+    });
+
+    panel.querySelector(".agy-cell-send")?.addEventListener("click", () => {
+      runCellAgy(tab, cell, input?.value || "", "ask");
+    });
+    panel.querySelector(".agy-cell-cancel")?.addEventListener("click", () => {
+      if (cell._agyRequestId) {
+        api("/api/agy/cancel", { method: "POST", body: JSON.stringify({ request_id: cell._agyRequestId }) }).catch(() => {});
+      }
+    });
+    panel.querySelector(".agy-cell-close")?.addEventListener("click", () => {
+      cell._agyOpen = false;
+      updateSingleCellDom(tab, cell.id);
+    });
+    panel.querySelector(".agy-cell-reset")?.addEventListener("click", () => {
+      cell._agyConvId = null;
+      cell._agyResponse = "";
+      cell._agySuggestedCode = null;
+      cell._agyError = null;
+      cell._agyDurationMs = null;
+      updateSingleCellDom(tab, cell.id);
+    });
+    panel.querySelectorAll(".agy-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        runCellAgy(tab, cell, chip.dataset.prompt, chip.dataset.action);
+      });
+    });
+    panel.querySelector(".agy-cell-replace")?.addEventListener("click", () => {
+      if (cell._agySuggestedCode == null) return;
+      cell.source = cell._agySuggestedCode;
+      markDirty(tab);
+      updateSingleCellDom(tab, cell.id);
+      toast("Applied agy code to cell", "success");
+    });
+    panel.querySelector(".agy-cell-insert")?.addEventListener("click", () => {
+      if (cell._agySuggestedCode == null) return;
+      const idx = tab.doc.cells.findIndex((c) => c.id === cell.id);
+      const newCell = { id: uid(), cell_type: "code", source: cell._agySuggestedCode, execution_count: null, output: null };
+      tab.doc.cells.splice(idx + 1, 0, newCell);
+      tab.activeCellId = newCell.id;
+      markDirty(tab);
+      renderCells();
+      toast("Inserted new cell with agy code", "success");
+    });
+    panel.querySelector(".agy-cell-copy")?.addEventListener("click", () => {
+      if (cell._agySuggestedCode != null) {
+        navigator.clipboard?.writeText(cell._agySuggestedCode).catch(() => {});
+        toast("Copied code to clipboard", "success");
+      }
+    });
+
+    return panel;
+  }
+
+  // --- Script File agy Panel ---
+  function captureFileSelection(tab) {
+    const ta = document.getElementById("file-editor-textarea");
+    if (!ta) return;
+    const s = ta.selectionStart;
+    const e = ta.selectionEnd;
+    if (typeof s === "number" && typeof e === "number" && e > s) {
+      tab._agySelStart = s;
+      tab._agySelEnd = e;
+      tab._agySelText = ta.value.slice(s, e);
+    } else {
+      tab._agySelStart = null;
+      tab._agySelEnd = null;
+      tab._agySelText = null;
+    }
+  }
+
+  function renderFileAgyPanel(tab) {
+    const panel = document.getElementById("file-agy-panel");
+    const selBadge = document.getElementById("file-agy-selection-badge");
+    const statusEl = document.getElementById("file-agy-status");
+    const input = document.getElementById("file-agy-input");
+    const sendBtn = document.getElementById("btn-file-agy-send");
+    const cancelBtn = document.getElementById("btn-file-agy-cancel");
+    const respWrap = document.getElementById("file-agy-response-wrap");
+    const respEl = document.getElementById("file-agy-response");
+    const applyBar = document.getElementById("file-agy-apply-bar");
+    const repSelBtn = document.getElementById("btn-file-agy-replace-sel");
+    if (!panel || !tab) return;
+
+    panel.classList.toggle("hidden", !tab._agyOpen);
+    if (!tab._agyOpen) return;
+
+    if (tab._agySelText) {
+      const lineCount = tab._agySelText.split("\n").length;
+      selBadge.textContent = `Selection (${lineCount} ${lineCount === 1 ? "line" : "lines"})`;
+      selBadge.classList.remove("hidden");
+    } else {
+      selBadge.classList.add("hidden");
+    }
+
+    statusEl.textContent = tab._agyLoading
+      ? "Thinking with agy..."
+      : (typeof tab._agyDurationMs === "number" ? `${(tab._agyDurationMs / 1000).toFixed(1)}s` : "");
+
+    input.disabled = !!tab._agyLoading;
+    sendBtn.classList.toggle("hidden", !!tab._agyLoading);
+    cancelBtn.classList.toggle("hidden", !tab._agyLoading);
+
+    if (tab._agyError) {
+      respWrap.classList.remove("hidden");
+      respEl.className = "agy-response is-error";
+      respEl.textContent = tab._agyError;
+      applyBar.classList.add("hidden");
+    } else if (tab._agyResponse) {
+      respWrap.classList.remove("hidden");
+      respEl.className = "agy-response md-rendered";
+      respEl.innerHTML = renderMarkdown(tab._agyResponse);
+      hydrateMediaPreviews(respEl);
+      const hasCode = !!tab._agySuggestedCode;
+      applyBar.classList.toggle("hidden", !hasCode);
+      repSelBtn.classList.toggle("hidden", !(hasCode && tab._agySelText));
+    } else {
+      respWrap.classList.add("hidden");
+    }
+  }
+
+  function openFileAgyPanel(tab) {
+    if (!tab || tab.kind !== "file") return;
+    captureFileSelection(tab);
+    tab._agyOpen = true;
+    document.getElementById("file-invoke-panel")?.classList.add("hidden");
+    renderFileAgyPanel(tab);
+    setTimeout(() => document.getElementById("file-agy-input")?.focus(), 20);
+  }
+
+  async function runFileAgy(tab, promptText, action = "ask") {
+    const prompt = (promptText || "").trim();
+    if (!tab || !prompt) return;
+    if (tab._agyLoading && tab._agyRequestId) {
+      api("/api/agy/cancel", { method: "POST", body: JSON.stringify({ request_id: tab._agyRequestId }) }).catch(() => {});
+    }
+
+    const reqId = `agy-${uid().slice(0, 10)}`;
+    const fileLang = tab.extension === "ui" ? "ui" : (langByExtension(tab.extension)?.id || tab.extension || "text");
+    tab._agyOpen = true;
+    tab._agyLoading = true;
+    tab._agyRequestId = reqId;
+    tab._agyError = null;
+    renderFileAgyPanel(tab);
+
+    try {
+      const data = await api("/api/agy/assist", {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: reqId,
+          prompt,
+          action,
+          kind: "file",
+          language: fileLang,
+          path: tab.path || tab.title,
+          code: tab.content || "",
+          selection: tab._agySelText || null,
+          error: formatOutputErrorForAgy(tab._lastRunOutput),
+          stdout: tab._lastRunOutput?.stdout || null,
+          conversation_id: tab._agyConvId || null,
+        }),
+      });
+      if (tab._agyRequestId !== reqId) return;
+      tab._agyResponse = data.response || "";
+      tab._agySuggestedCode = data.suggested_code || null;
+      tab._agyConvId = data.conversation_id || tab._agyConvId || null;
+      tab._agyDurationMs = data.duration_ms || null;
+    } catch (err) {
+      if (tab._agyRequestId !== reqId) return;
+      tab._agyError = err.message;
+    } finally {
+      if (tab._agyRequestId === reqId) {
+        tab._agyLoading = false;
+        tab._agyRequestId = null;
+        if (activeTab()?.id === tab.id) renderFileAgyPanel(tab);
+      }
+    }
+  }
+
+  function applyFileContentChange(tab, nextContent) {
+    tab.content = nextContent;
+    markDirty(tab);
+    const ta = document.getElementById("file-editor-textarea");
+    ta.value = nextContent;
+    const isUi = tab.extension === "ui";
+    const fileLang = langByExtension(tab.extension);
+    syncFileEditorHighlight(nextContent, isUi ? "minilang" : (fileLang ? fileLang.id : null));
+    syncFileEditorScroll();
+    document.getElementById("ftb-meta").textContent = `${tab.path} (${formatSize(nextContent.length)})`;
+  }
+
+  document.getElementById("ftb-agy")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "file") return;
+    if (tab._agyOpen) {
+      tab._agyOpen = false;
+      renderFileAgyPanel(tab);
+    } else {
+      openFileAgyPanel(tab);
+    }
+  });
+
+  document.getElementById("btn-file-agy-close")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab) return;
+    tab._agyOpen = false;
+    renderFileAgyPanel(tab);
+  });
+
+  document.getElementById("btn-file-agy-reset")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab) return;
+    tab._agyConvId = null;
+    tab._agyResponse = "";
+    tab._agySuggestedCode = null;
+    tab._agyError = null;
+    tab._agyDurationMs = null;
+    document.getElementById("file-agy-input").value = "";
+    renderFileAgyPanel(tab);
+  });
+
+  document.getElementById("btn-file-agy-send")?.addEventListener("click", () => {
+    const tab = activeTab();
+    const input = document.getElementById("file-agy-input");
+    if (tab && input) runFileAgy(tab, input.value, "ask");
+  });
+
+  document.getElementById("btn-file-agy-cancel")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab && tab._agyRequestId) {
+      api("/api/agy/cancel", { method: "POST", body: JSON.stringify({ request_id: tab._agyRequestId }) }).catch(() => {});
+    }
+  });
+
+  document.getElementById("file-agy-input")?.addEventListener("keydown", (e) => {
+    const tab = activeTab();
+    if (!tab) return;
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      runFileAgy(tab, e.target.value, "ask");
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      tab._agyOpen = false;
+      renderFileAgyPanel(tab);
+    }
+  });
+
+  document.querySelectorAll("[data-file-agy-action]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const tab = activeTab();
+      if (!tab) return;
+      document.getElementById("file-agy-input").value = chip.dataset.fileAgyPrompt;
+      runFileAgy(tab, chip.dataset.fileAgyPrompt, chip.dataset.fileAgyAction);
+    });
+  });
+
+  document.getElementById("btn-file-agy-replace-sel")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab._agySuggestedCode == null || tab._agySelStart == null || tab._agySelEnd == null) return;
+    const next = tab.content.slice(0, tab._agySelStart) + tab._agySuggestedCode + tab.content.slice(tab._agySelEnd);
+    tab._agySelStart = null;
+    tab._agySelEnd = null;
+    tab._agySelText = null;
+    applyFileContentChange(tab, next);
+    renderFileAgyPanel(tab);
+    toast("Replaced selection with agy code", "success");
+  });
+
+  document.getElementById("btn-file-agy-replace-all")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab._agySuggestedCode == null) return;
+    applyFileContentChange(tab, tab._agySuggestedCode);
+    toast("Replaced file content with agy code", "success");
+  });
+
+  document.getElementById("btn-file-agy-append")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab._agySuggestedCode == null) return;
+    const sep = tab.content.endsWith("\n") || !tab.content ? "" : "\n";
+    applyFileContentChange(tab, `${tab.content}${sep}\n${tab._agySuggestedCode}\n`);
+    toast("Appended agy code to file", "success");
+  });
+
+  document.getElementById("btn-file-agy-copy")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab && tab._agySuggestedCode != null) {
+      navigator.clipboard?.writeText(tab._agySuggestedCode).catch(() => {});
+      toast("Copied code to clipboard", "success");
     }
   });
 
@@ -3322,6 +4239,7 @@
     try {
       const info = await api("/api/info");
       state.rootName = info.root_name || "workspace";
+      state.rootPath = info.root_path || "";
       if (Array.isArray(info.languages) && info.languages.length > 0) {
         state.languages = info.languages;
       }

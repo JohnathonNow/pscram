@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Minilang Notebook</title>
+  <title>pSCRAM</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -19,8 +19,8 @@
         </button>
         <div class="brand">
           <span class="brand-logo">λ</span>
-          <span class="brand-name">Minilang</span>
-          <span class="brand-tag">Notebook</span>
+          <span class="brand-name">pSCRAM</span>
+          <span class="brand-tag">Workbench</span>
         </div>
       </div>
 
@@ -244,6 +244,11 @@
             <button id="ftb-open-as-nb" class="tb-btn" title="Convert & Open as Interactive Notebook">
               <span>Open as Notebook</span>
             </button>
+            <span class="tb-sep"></span>
+            <button id="ftb-agy" class="tb-btn agy-btn" title="Ask Google Antigravity (agy) about this script (Ctrl+K)">
+              <span class="agy-spark">✦</span>
+              <span>Ask agy</span>
+            </button>
           </div>
           <span id="ftb-meta" class="tb-meta"></span>
         </div>
@@ -313,6 +318,40 @@
             <div class="file-editor-surface">
               <pre id="file-editor-highlight" class="file-editor-highlight" aria-hidden="true"></pre>
               <textarea id="file-editor-textarea" class="file-editor-textarea" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+            </div>
+          </div>
+          <div id="file-agy-panel" class="file-agy-panel hidden">
+            <div class="agy-header">
+              <div class="agy-title-wrap">
+                <span class="agy-spark">✦</span>
+                <strong>Antigravity (agy)</strong>
+                <span id="file-agy-selection-badge" class="agy-sel-badge hidden"></span>
+                <span id="file-agy-status" class="tb-meta"></span>
+              </div>
+              <div class="toolbar-group">
+                <button id="btn-file-agy-reset" class="tb-btn" style="height:22px;font-size:11px;padding:0 7px" title="Start a fresh agy conversation">New Thread</button>
+                <button id="btn-file-agy-close" class="icon-btn sm" title="Close">&times;</button>
+              </div>
+            </div>
+            <div class="agy-chips">
+              <button type="button" class="agy-chip" data-file-agy-action="explain" data-file-agy-prompt="Explain what this script does.">Explain</button>
+              <button type="button" class="agy-chip" data-file-agy-action="fix" data-file-agy-prompt="Find and fix any bugs or errors in this script.">Fix Bugs</button>
+              <button type="button" class="agy-chip" data-file-agy-action="refactor" data-file-agy-prompt="Refactor and improve clarity and error handling.">Refactor</button>
+              <button type="button" class="agy-chip" data-file-agy-action="edit" data-file-agy-prompt="Add concise comments and usage documentation.">Add Docs</button>
+            </div>
+            <div class="agy-prompt-row">
+              <input id="file-agy-input" class="agy-input" type="text" placeholder="Ask agy to explain, edit, fix, or generate code in this script... (Enter to send)" autocomplete="off" />
+              <button id="btn-file-agy-send" class="tb-btn primary">Ask</button>
+              <button id="btn-file-agy-cancel" class="tb-btn danger-hover hidden">Cancel</button>
+            </div>
+            <div id="file-agy-response-wrap" class="agy-response-wrap hidden">
+              <div id="file-agy-response" class="agy-response md-rendered"></div>
+              <div id="file-agy-apply-bar" class="agy-apply-bar hidden">
+                <button id="btn-file-agy-replace-sel" class="tb-btn primary hidden">Replace Selection</button>
+                <button id="btn-file-agy-replace-all" class="tb-btn primary">Replace File</button>
+                <button id="btn-file-agy-append" class="tb-btn">Append to File</button>
+                <button id="btn-file-agy-copy" class="tb-btn">Copy Code</button>
+              </div>
             </div>
           </div>
           <div id="file-invoke-panel" class="file-invoke-panel hidden">
@@ -406,6 +445,7 @@
       <div class="status-right">
         <span class="shortcut-hint"><kbd>Shift</kbd>+<kbd>Enter</kbd> Run</span>
         <span class="shortcut-hint"><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</span>
+        <span class="shortcut-hint"><kbd>Ctrl</kbd>+<kbd>K</kbd> agy</span>
         <span class="shortcut-hint"><kbd>Tab</kbd> Complete</span>
         <span class="status-sep">|</span>
         <span id="status-kernel">Kernel idle</span>
@@ -474,6 +514,9 @@
       </form>
     </div>
   </div>
+
+  <!-- File Explorer Right-Click Context Menu -->
+  <div id="file-context-menu" class="context-menu hidden" role="menu"></div>
 
   <script src="/minijs_vm.js"></script>
   <script src="/app.js"></script>

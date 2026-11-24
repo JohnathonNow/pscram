@@ -490,6 +490,9 @@ impl FileStore {
             return Err("Cannot rename workspace root".to_string());
         }
         let dst = self.resolve_new(to)?;
+        if src.is_dir() && dst.starts_with(&src) {
+            return Err("Cannot move a directory into itself".to_string());
+        }
         if dst.exists() {
             return Err(format!("Destination '{}' already exists", to));
         }
@@ -497,6 +500,54 @@ impl FileStore {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
         }
         fs::rename(&src, &dst).map_err(|e| format!("rename failed: {}", e))?;
+        Ok(self.to_rel_string(&dst))
+    }
+
+    pub fn copy_entry(
+        &self,
+        from: &str,
+        to_dir: &str,
+        new_name: Option<&str>,
+    ) -> Result<String, String> {
+        let src = self.resolve_existing(from)?;
+        if src == self.root {
+            return Err("Cannot copy workspace root".to_string());
+        }
+        let dst_dir = if to_dir.trim().is_empty() || to_dir.trim() == "/" || to_dir.trim() == "." {
+            self.root.clone()
+        } else {
+            self.resolve_existing(to_dir)?
+        };
+        if !dst_dir.is_dir() {
+            return Err(format!("Destination '{}' is not a directory", to_dir));
+        }
+
+        let base_name = match new_name.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => {
+                if n.contains('/') || n.contains('\\') || n == "." || n == ".." {
+                    return Err(format!("Invalid file name '{}'", n));
+                }
+                n.to_string()
+            }
+            None => src
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| "Invalid source path".to_string())?,
+        };
+
+        let dst = pick_unique_dest(&dst_dir, &base_name, src.is_dir());
+        if !dst.starts_with(&self.root) {
+            return Err("Access outside workspace root is forbidden".to_string());
+        }
+        if src.is_dir() && dst.starts_with(&src) {
+            return Err("Cannot copy a directory into itself".to_string());
+        }
+
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst).map_err(|e| format!("copy failed: {}", e))?;
+        }
         Ok(self.to_rel_string(&dst))
     }
 
@@ -527,4 +578,51 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(out)
+}
+
+fn pick_unique_dest(dir: &Path, name: &str, is_dir: bool) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = if is_dir {
+        (name.to_string(), String::new())
+    } else if let Some(dot) = name.rfind('.') {
+        if dot > 0 {
+            (name[..dot].to_string(), name[dot..].to_string())
+        } else {
+            (name.to_string(), String::new())
+        }
+    } else {
+        (name.to_string(), String::new())
+    };
+
+    let cand1 = dir.join(format!("{} copy{}", stem, ext));
+    if !cand1.exists() {
+        return cand1;
+    }
+    for n in 2..10_000 {
+        let cand = dir.join(format!("{} copy {}{}", stem, n, ext));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    dir.join(format!("{} copy {}{}", stem, uuid::Uuid::new_v4(), ext))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("mkdir failed: {}", e))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("read_dir failed: {}", e))?;
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| format!("read_dir entry failed: {}", e))?;
+        let src_child = entry.path();
+        let dst_child = dst.join(entry.file_name());
+        let meta = fs::symlink_metadata(&src_child).map_err(|e| format!("stat failed: {}", e))?;
+        if meta.is_dir() {
+            copy_dir_recursive(&src_child, &dst_child)?;
+        } else if meta.is_file() {
+            fs::copy(&src_child, &dst_child).map_err(|e| format!("copy failed: {}", e))?;
+        }
+    }
+    Ok(())
 }
