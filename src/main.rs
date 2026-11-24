@@ -2,6 +2,7 @@ mod agy;
 mod api;
 mod auth;
 mod files;
+mod jobs;
 mod kernel_mgr;
 mod kernel_proc;
 mod lang;
@@ -149,6 +150,25 @@ fn main() {
             root_canon.clone(),
         ));
 
+        let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
+            .parse()
+            .expect("invalid host:port");
+        let internal_host = if cli.host == "0.0.0.0" || cli.host == "::" || cli.host == "[::]" {
+            "127.0.0.1"
+        } else {
+            cli.host.as_str()
+        };
+        let internal_token = auth::b64url_encode(
+            &auth::random_bytes::<32>().expect("CSPRNG failed for internal token"),
+        );
+        std::env::set_var(
+            "MINILANG_INTERNAL_URL",
+            format!("http://{}:{}", internal_host, cli.port),
+        );
+        std::env::set_var("MINILANG_INTERNAL_TOKEN", &internal_token);
+
+        let job_mgr = Arc::new(jobs::JobManager::new(root_canon.clone()));
+
         let state = Arc::new(api::AppState {
             files,
             kernels,
@@ -157,13 +177,12 @@ fn main() {
             agy: agy_runner.clone(),
             secrets: secrets.clone(),
             scheduler: scheduler.clone(),
+            jobs: job_mgr,
+            internal_token,
             web_dir: cli.web_dir,
         });
 
         let app = api::build_router(state);
-        let addr: SocketAddr = format!("{}:{}", cli.host, cli.port)
-            .parse()
-            .expect("invalid host:port");
 
         println!("Minilang Notebook Server v{}", env!("CARGO_PKG_VERSION"));
         println!("  Workspace: {}", root_canon.display());

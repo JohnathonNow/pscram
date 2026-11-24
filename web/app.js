@@ -1514,6 +1514,11 @@
           action: () => openEntryAsNotebook(entry),
         });
         items.push({
+          label: "Run in Background",
+          icon: CTX_ICONS.open,
+          action: () => launchBackgroundJobQuick(entry.path),
+        });
+        items.push({
           label: "Schedule Script...",
           icon: CTX_ICONS.refresh,
           action: () => openSchedulesModal(entry.path),
@@ -3973,6 +3978,266 @@
   });
 
   // =========================================================================
+  // Background Jobs & Active Sessions Manager
+  // =========================================================================
+  let jobsActiveTab = "bg";
+  let jobsPollTimer = null;
+
+  async function refreshJobsBadge() {
+    try {
+      const data = await api("/api/jobs");
+      const badge = document.getElementById("jobs-active-badge");
+      if (!badge) return;
+      const running = data.running || 0;
+      badge.textContent = String(running);
+      badge.classList.toggle("hidden", running === 0);
+    } catch { /* ignore */ }
+  }
+
+  async function launchBackgroundJobQuick(scriptPath) {
+    try {
+      const res = await api("/api/jobs", {
+        method: "POST",
+        body: JSON.stringify({ script: scriptPath, source: "ui" }),
+      });
+      toast(`Started background job ${res.job.id} (${scriptPath})`, "success");
+      refreshJobsBadge();
+      openJobsModal("bg");
+    } catch (err) {
+      toast(`Failed to start job: ${err.message}`, "error");
+    }
+  }
+
+  async function loadJobsAndSessions() {
+    const [jobsRes, kernelsRes] = await Promise.all([
+      api("/api/jobs").catch(() => ({ jobs: [], running: 0 })),
+      api("/api/kernels").catch(() => ({ kernels: [] })),
+    ]);
+
+    const jobs = jobsRes.jobs || [];
+    const kernels = kernelsRes.kernels || [];
+    const running = jobsRes.running || 0;
+
+    const bgCnt = document.getElementById("jobs-tab-bg-count");
+    const sessCnt = document.getElementById("jobs-tab-sess-count");
+    if (bgCnt) bgCnt.textContent = running > 0 ? `${running} running / ${jobs.length}` : String(jobs.length);
+    if (sessCnt) sessCnt.textContent = String(kernels.length);
+    const badge = document.getElementById("jobs-active-badge");
+    if (badge) {
+      badge.textContent = String(running);
+      badge.classList.toggle("hidden", running === 0);
+    }
+
+    // Render Background Jobs
+    const jobsList = document.getElementById("jobs-list");
+    if (jobsList) {
+      if (!jobs.length) {
+        jobsList.innerHTML = `<div class="log-empty">No background jobs yet. Launch a <code>.mini</code> script above, right-click a script, or call <code>jobs::start("scripts/worker.mini")</code> in Minilang.</div>`;
+      } else {
+        jobsList.innerHTML = jobs.map((j) => {
+          const pillCls = j.status === "running" ? "running" : (j.status === "completed" ? "ok" : (j.status === "cancelled" ? "paused" : "err"));
+          const dur = j.duration_ms >= 1000 ? `${(j.duration_ms / 1000).toFixed(2)}s` : `${j.duration_ms.toFixed(0)} ms`;
+          const progHtml = j.progress ? `
+            <div class="ml-progress-card" style="max-width:none;padding:6px 9px">
+              <div class="ml-progress-head" style="margin-bottom:4px">
+                <span>${escapeHtml(j.progress.label || "Progress")}</span>
+                <span>${j.progress.done}/${j.progress.total} (${Math.round(j.progress.percent)}%)</span>
+              </div>
+              <div class="ml-progress-track"><div class="ml-progress-fill" style="width:${Math.max(0, Math.min(100, j.progress.percent))}%"></div></div>
+            </div>` : "";
+          const outParts = [];
+          if (j.stdout) outParts.push(`<pre class="job-output-box">${escapeHtml(j.stdout)}</pre>`);
+          if (j.error) outParts.push(`<pre class="job-output-box is-err">${escapeHtml(j.error)}</pre>`);
+          else if (j.status === "completed" && j.repr && j.repr !== "nil") {
+            outParts.push(`<pre class="job-output-box">Result: ${escapeHtml(j.repr)}</pre>`);
+          }
+          return `
+            <div class="job-card">
+              <div class="job-card-top">
+                <div class="manager-item-main">
+                  <div class="manager-item-title">
+                    <span>${escapeHtml(j.name)}</span>
+                    <span class="status-pill ${pillCls}">${escapeHtml(j.status)}</span>
+                    <span class="tb-meta">${escapeHtml(j.id)}</span>
+                  </div>
+                  <div class="manager-item-sub">${escapeHtml(j.script)} · ${escapeHtml(j.language)} · ${escapeHtml(dur)}${j.pid ? ` · pid ${j.pid}` : ""} · via ${escapeHtml(j.source)}</div>
+                </div>
+                <div class="manager-item-actions">
+                  ${j.status === "running"
+                    ? `<button type="button" class="tb-btn danger-hover job-act-stop" data-id="${escapeHtml(j.id)}">Stop</button>`
+                    : `<button type="button" class="tb-btn job-act-log" data-log="${escapeHtml(j.log_path)}">Log</button>
+                       <button type="button" class="tb-btn danger-hover job-act-del" data-id="${escapeHtml(j.id)}">Remove</button>`}
+                </div>
+              </div>
+              ${progHtml}
+              ${outParts.join("")}
+            </div>`;
+        }).join("");
+
+        jobsList.querySelectorAll(".job-act-stop").forEach((b) => {
+          b.onclick = async () => {
+            await api(`/api/jobs/${encodeURIComponent(b.dataset.id)}/stop`, { method: "POST" });
+            toast(`Stopped job ${b.dataset.id}`, "info");
+            loadJobsAndSessions();
+          };
+        });
+        jobsList.querySelectorAll(".job-act-log").forEach((b) => {
+          b.onclick = () => {
+            closeJobsModal();
+            openPathInTab(b.dataset.log);
+          };
+        });
+        jobsList.querySelectorAll(".job-act-del").forEach((b) => {
+          b.onclick = async () => {
+            await api(`/api/jobs/${encodeURIComponent(b.dataset.id)}`, { method: "DELETE" });
+            loadJobsAndSessions();
+          };
+        });
+      }
+    }
+
+    // Render Active Kernel Sessions
+    const sessList = document.getElementById("sessions-list");
+    if (sessList) {
+      if (!kernels.length) {
+        sessList.innerHTML = `<div class="log-empty">No active notebook kernel sessions.</div>`;
+      } else {
+        sessList.innerHTML = kernels.map((k) => {
+          const linkedTab = state.tabs.find((t) => t.kernelId === k.id);
+          const title = linkedTab ? linkedTab.title : k.id;
+          const stCls = !k.alive ? "err" : (k.busy ? "running" : "ok");
+          const stText = !k.alive ? "stopped" : (k.busy ? "busy" : "idle");
+          return `
+            <div class="manager-item">
+              <div class="manager-item-main">
+                <div class="manager-item-title">
+                  <span>${escapeHtml(title)}</span>
+                  <span class="status-pill ${stCls}">${stText}</span>
+                  <span class="tb-meta">${escapeHtml(langInfo(k.language).name)}</span>
+                </div>
+                <div class="manager-item-sub">id: ${escapeHtml(k.id)} · pid ${k.pid} · In[${k.execution_count}] · ${escapeHtml(k.cwd || "")}</div>
+              </div>
+              <div class="manager-item-actions">
+                ${linkedTab ? `<button type="button" class="tb-btn sess-act-focus" data-tab="${escapeHtml(linkedTab.id)}">Open Tab</button>` : ""}
+                <button type="button" class="tb-btn sess-act-int" data-id="${escapeHtml(k.id)}">Interrupt</button>
+                <button type="button" class="tb-btn sess-act-rst" data-id="${escapeHtml(k.id)}">Restart</button>
+                <button type="button" class="tb-btn danger-hover sess-act-kill" data-id="${escapeHtml(k.id)}">Kill</button>
+              </div>
+            </div>`;
+        }).join("");
+
+        sessList.querySelectorAll(".sess-act-focus").forEach((b) => {
+          b.onclick = () => {
+            closeJobsModal();
+            activateTab(b.dataset.tab);
+          };
+        });
+        sessList.querySelectorAll(".sess-act-int").forEach((b) => {
+          b.onclick = async () => {
+            await api(`/api/kernels/${encodeURIComponent(b.dataset.id)}/interrupt`, { method: "POST" });
+            toast(`Interrupted session ${b.dataset.id}`, "info");
+            loadJobsAndSessions();
+          };
+        });
+        sessList.querySelectorAll(".sess-act-rst").forEach((b) => {
+          b.onclick = async () => {
+            await api(`/api/kernels/${encodeURIComponent(b.dataset.id)}/restart`, { method: "POST" });
+            toast(`Restarted session ${b.dataset.id}`, "success");
+            refreshKernelList();
+            loadJobsAndSessions();
+          };
+        });
+        sessList.querySelectorAll(".sess-act-kill").forEach((b) => {
+          b.onclick = async () => {
+            await api(`/api/kernels/${encodeURIComponent(b.dataset.id)}`, { method: "DELETE" });
+            toast(`Terminated session ${b.dataset.id}`, "info");
+            refreshKernelList();
+            loadJobsAndSessions();
+          };
+        });
+      }
+    }
+  }
+
+  function setJobsModalTab(tabName) {
+    jobsActiveTab = tabName === "sessions" ? "sessions" : "bg";
+    document.getElementById("jobs-tab-bg")?.classList.toggle("active", jobsActiveTab === "bg");
+    document.getElementById("jobs-tab-sessions")?.classList.toggle("active", jobsActiveTab === "sessions");
+    document.getElementById("jobs-pane-bg")?.classList.toggle("hidden", jobsActiveTab !== "bg");
+    document.getElementById("jobs-pane-sessions")?.classList.toggle("hidden", jobsActiveTab !== "sessions");
+    document.getElementById("jobs-clear-btn")?.classList.toggle("hidden", jobsActiveTab !== "bg");
+  }
+
+  function openJobsModal(tabName = "bg") {
+    setJobsModalTab(tabName);
+    document.getElementById("jobs-modal-overlay")?.classList.remove("hidden");
+    loadJobsAndSessions();
+    if (jobsPollTimer) clearInterval(jobsPollTimer);
+    jobsPollTimer = setInterval(() => {
+      const ov = document.getElementById("jobs-modal-overlay");
+      if (ov && !ov.classList.contains("hidden")) {
+        loadJobsAndSessions();
+      }
+    }, 1500);
+  }
+
+  function closeJobsModal() {
+    document.getElementById("jobs-modal-overlay")?.classList.add("hidden");
+    if (jobsPollTimer) {
+      clearInterval(jobsPollTimer);
+      jobsPollTimer = null;
+    }
+  }
+
+  document.getElementById("btn-open-jobs")?.addEventListener("click", () => openJobsModal("bg"));
+  document.getElementById("btn-manage-sessions")?.addEventListener("click", () => openJobsModal("sessions"));
+  document.getElementById("jobs-modal-close")?.addEventListener("click", closeJobsModal);
+  document.getElementById("jobs-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "jobs-modal-overlay") closeJobsModal();
+  });
+  document.getElementById("jobs-tab-bg")?.addEventListener("click", () => setJobsModalTab("bg"));
+  document.getElementById("jobs-tab-sessions")?.addEventListener("click", () => setJobsModalTab("sessions"));
+  document.getElementById("jobs-refresh-btn")?.addEventListener("click", loadJobsAndSessions);
+  document.getElementById("jobs-clear-btn")?.addEventListener("click", async () => {
+    const res = await api("/api/jobs/clear", { method: "POST" });
+    toast(`Cleared ${res.cleared || 0} finished job(s)`, "info");
+    loadJobsAndSessions();
+  });
+  document.getElementById("job-launch-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const script = document.getElementById("job-script").value.trim();
+    const name = document.getElementById("job-name").value.trim() || null;
+    const rawParams = document.getElementById("job-params").value.trim();
+    let params = null;
+    if (rawParams) {
+      try {
+        params = JSON.parse(rawParams);
+      } catch (err) {
+        toast(`Invalid JSON params: ${err.message}`, "error");
+        return;
+      }
+    }
+    try {
+      const res = await api("/api/jobs", {
+        method: "POST",
+        body: JSON.stringify({ script, name, params, source: "ui" }),
+      });
+      document.getElementById("job-script").value = "";
+      document.getElementById("job-name").value = "";
+      document.getElementById("job-params").value = "";
+      toast(`Launched ${res.job.id}`, "success");
+      loadJobsAndSessions();
+    } catch (err) {
+      toast(`Launch failed: ${err.message}`, "error");
+    }
+  });
+
+  // Periodic lightweight badge sync for background jobs
+  setInterval(() => {
+    if (!authState.required || authState.user) refreshJobsBadge();
+  }, 5000);
+
+  // =========================================================================
   // Scheduled Jobs & Webhooks Modal (#2)
   // =========================================================================
   async function loadSchedulesList() {
@@ -4185,6 +4450,8 @@
       { label: "New Folder", meta: "Command", run: () => promptNewFolder() },
       { label: "Upload Files...", meta: "Command", run: () => document.getElementById("file-upload-input")?.click() },
       { label: "Find in Files (Workspace Search)", meta: "Ctrl+Shift+F", run: () => openGrepModal() },
+      { label: "Jobs & Sessions Manager", meta: "Manager", run: () => openJobsModal("bg") },
+      { label: "Active Kernel Sessions", meta: "Manager", run: () => openJobsModal("sessions") },
       { label: "Scheduled Jobs & Webhooks", meta: "Manager", run: () => openSchedulesModal() },
       { label: "Encrypted Secrets Vault", meta: "Manager", run: () => openSecretsModal() },
       { label: "Save Active Tab", meta: "Ctrl+S", run: () => saveActiveTab() },

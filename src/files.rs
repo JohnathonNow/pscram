@@ -901,6 +901,113 @@ fn build_zip_archive(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempWorkspace(PathBuf);
+    impl TempWorkspace {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("mlnb_files_test_{}_{}", tag, uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_file_crud_copy_rename_and_traversal_guards() {
+        let ws = TempWorkspace::new("crud");
+        let store = FileStore::new(ws.0.clone()).unwrap();
+
+        store.create_entry("sub", "dir", None).unwrap();
+        store.create_entry("sub/a.mini", "file", None).unwrap();
+        store.write_file("sub/a.mini", "let x := 42\n").unwrap();
+
+        // Read & verify
+        let r = store.read_file("sub/a.mini").unwrap();
+        assert_eq!(r.content, "let x := 42\n");
+        assert!(!r.is_binary);
+
+        // Copy collision naming
+        let c1 = store.copy_entry("sub/a.mini", "sub", None).unwrap();
+        assert_eq!(c1, "sub/a copy.mini");
+        let c2 = store.copy_entry("sub/a.mini", "sub", None).unwrap();
+        assert_eq!(c2, "sub/a copy 2.mini");
+
+        // Recursive directory copy
+        let dcopy = store.copy_entry("sub", "", None).unwrap();
+        assert_eq!(dcopy, "sub copy");
+        assert_eq!(store.read_file("sub copy/a.mini").unwrap().content, "let x := 42\n");
+
+        // Self-copy & self-move rejected
+        assert!(store.copy_entry("sub", "sub", None).is_err());
+        assert!(store.rename_entry("sub", "sub/nested").is_err());
+
+        // Path traversal rejected
+        assert!(store.resolve_existing("../etc/passwd").is_err());
+        assert!(store.resolve_new("../escape.txt").is_err());
+        assert!(store.upload_file("..", "bad.txt", b"x").is_err());
+
+        // Root cannot be deleted
+        assert!(store.delete_entry("").is_err());
+
+        // Delete works
+        store.delete_entry("sub copy").unwrap();
+        assert!(store.resolve_existing("sub copy").is_err());
+    }
+
+    #[test]
+    fn test_upload_zip_and_crc32() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+
+        let ws = TempWorkspace::new("zip");
+        let store = FileStore::new(ws.0.clone()).unwrap();
+        store.create_entry("pkg", "dir", None).unwrap();
+        let up = store.upload_file("pkg", "hello.txt", b"hello zip world").unwrap();
+        assert_eq!(up, "pkg/hello.txt");
+        // Secrets must be excluded from ZIP exports
+        fs::write(ws.0.join("pkg/.minilang-secrets.enc"), b"secret").unwrap();
+
+        let (zname, zbytes) = store.zip_directory("pkg").unwrap();
+        assert_eq!(zname, "pkg.zip");
+        // Verify local file header magic + EOCD magic
+        assert_eq!(&zbytes[0..4], b"PK\x03\x04");
+        assert!(zbytes.windows(4).any(|w| w == b"PK\x05\x06"));
+        assert!(zbytes.windows(9).any(|w| w == b"hello.txt"));
+        assert!(!zbytes.windows(21).any(|w| w == b".minilang-secrets.enc"));
+    }
+
+    #[test]
+    fn test_grep_workspace_text_and_notebooks() {
+        let ws = TempWorkspace::new("grep");
+        let store = FileStore::new(ws.0.clone()).unwrap();
+        store.write_file("alpha.mini", "let needle := 1\nprintln(NEEDLE)\n").unwrap();
+        store.create_entry("nb.mnb", "notebook", Some("minilang")).unwrap();
+        let nb = NotebookDocument::from_script("nb.mnb", "let my_needle := 99\n", "minilang");
+        store.write_file("nb.mnb", &serde_json::to_string(&nb).unwrap()).unwrap();
+        // Binary file with NUL bytes should be skipped
+        fs::write(ws.0.join("bin.dat"), b"\x00\x01needle\x00").unwrap();
+
+        let ci = store.grep_workspace("needle", false, None, 100);
+        assert_eq!(ci.len(), 3);
+        assert!(ci.iter().any(|m| m.path == "nb.mnb" && m.cell_index == Some(0)));
+
+        let cs = store.grep_workspace("NEEDLE", true, None, 100);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].path, "alpha.mini");
+        assert_eq!(cs[0].line, 2);
+
+        let only_mnb = store.grep_workspace("needle", false, Some("mnb"), 100);
+        assert_eq!(only_mnb.len(), 1);
+        assert_eq!(only_mnb[0].path, "nb.mnb");
+    }
+}
+
 fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
     let trimmed = rel.trim().trim_start_matches('/');
     let mut out = PathBuf::new();

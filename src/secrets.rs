@@ -260,3 +260,80 @@ fn decrypt_blob(master: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     }
     Ok(xor_keystream(&enc_key, &nonce, ct))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("mlnb_secrets_test_{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_vault_encrypt_persist_reopen_and_tamper_detection() {
+        let dir = TempDir::new();
+        let vault = SecretsVault::open(&dir.0, Some("master-pass-1".into())).unwrap();
+
+        // Invalid names rejected
+        assert!(vault.set("123BAD", "x".into(), None).is_err());
+        assert!(vault.set("BAD-NAME", "x".into(), None).is_err());
+        assert!(vault.set("", "x".into(), None).is_err());
+
+        // Set & mask
+        let m1 = vault.set("API_KEY", "sk-live-1234567890".into(), Some("Prod key".into())).unwrap();
+        assert_eq!(m1.name, "API_KEY");
+        assert_eq!(m1.masked, "••••7890");
+        assert_eq!(m1.description, "Prod key");
+
+        let m2 = vault.set("SHORT", "ab".into(), None).unwrap();
+        assert_eq!(m2.masked, "••••");
+
+        // On-disk ciphertext must not contain plaintext
+        let raw = fs::read(dir.0.join(".minilang-secrets.enc")).unwrap();
+        assert!(raw.starts_with(VAULT_MAGIC));
+        assert!(!raw.windows(18).any(|w| w == b"sk-live-1234567890"));
+
+        // Reopen with same key succeeds
+        let reopened = SecretsVault::open(&dir.0, Some("master-pass-1".into())).unwrap();
+        assert_eq!(reopened.env_map().get("API_KEY").map(String::as_str), Some("sk-live-1234567890"));
+        assert_eq!(reopened.list().len(), 2);
+
+        // Wrong key fails MAC check
+        assert!(SecretsVault::open(&dir.0, Some("wrong-key".into())).is_err());
+
+        // Tampered ciphertext fails MAC check
+        let mut tampered = raw.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        fs::write(dir.0.join(".minilang-secrets.enc"), &tampered).unwrap();
+        assert!(SecretsVault::open(&dir.0, Some("master-pass-1".into())).is_err());
+
+        // Restore valid file and test delete
+        fs::write(dir.0.join(".minilang-secrets.enc"), &raw).unwrap();
+        let v3 = SecretsVault::open(&dir.0, Some("master-pass-1".into())).unwrap();
+        assert!(v3.delete("API_KEY").unwrap());
+        assert!(!v3.delete("API_KEY").unwrap());
+        assert_eq!(v3.list().len(), 1);
+    }
+
+    #[test]
+    fn test_vault_auto_generated_key_file() {
+        let dir = TempDir::new();
+        let v1 = SecretsVault::open(&dir.0, None).unwrap();
+        v1.set("AUTO_KEY", "auto-secret-val".into(), None).unwrap();
+        assert!(dir.0.join(".minilang-secrets.key").exists());
+
+        let v2 = SecretsVault::open(&dir.0, None).unwrap();
+        assert_eq!(v2.env_map().get("AUTO_KEY").map(String::as_str), Some("auto-secret-val"));
+    }
+}

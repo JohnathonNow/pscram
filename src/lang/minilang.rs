@@ -78,6 +78,7 @@ impl LanguageBackend for MinilangBackend {
                 params: req.params,
                 args: req.args,
                 function: req.function,
+                stream: false,
             };
             let mut payload = serde_json::to_string(&kreq)
                 .map_err(|e| InvokeExecError::Internal(format!("encode error: {}", e)))?;

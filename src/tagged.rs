@@ -401,3 +401,97 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tagged_value_roundtrips_all_variants() {
+        let cases = vec![
+            TaggedValue::Nil,
+            TaggedValue::Boolean(true),
+            TaggedValue::Boolean(false),
+            TaggedValue::Integer(-42),
+            TaggedValue::Real(3.25),
+            TaggedValue::String("hello world".into()),
+            TaggedValue::Symbol("length".into()),
+            TaggedValue::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+            TaggedValue::Bytes(vec![0, 1, 2, 254, 255]),
+            TaggedValue::TimeIso("2026-11-24T00:00:00Z".into()),
+            TaggedValue::List(vec![TaggedValue::Integer(1), TaggedValue::String("two".into())]),
+            TaggedValue::Tuple(vec![TaggedValue::Boolean(true), TaggedValue::Nil]),
+            TaggedValue::Set(vec![TaggedValue::String("a".into()), TaggedValue::String("b".into())]),
+            TaggedValue::Map(vec![
+                (TaggedValue::String("k1".into()), TaggedValue::Integer(10)),
+                (TaggedValue::String("k2".into()), TaggedValue::Boolean(false)),
+            ]),
+            TaggedValue::Map(vec![
+                (TaggedValue::Integer(1), TaggedValue::String("one".into())),
+                (TaggedValue::Integer(2), TaggedValue::String("two".into())),
+            ]),
+        ];
+
+        for orig in cases {
+            let encoded = serde_json::to_string(&orig).unwrap();
+            let decoded: TaggedValue = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, orig, "roundtrip failed for {}", encoded);
+        }
+    }
+
+    #[test]
+    fn test_tagged_aliases_and_time_epoch() {
+        let v: TaggedValue = serde_json::from_value(json!({"type": "null"})).unwrap();
+        assert_eq!(v, TaggedValue::Nil);
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "bool", "value": true})).unwrap();
+        assert_eq!(v, TaggedValue::Boolean(true));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "int", "value": 99})).unwrap();
+        assert_eq!(v, TaggedValue::Integer(99));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "float", "value": 1.5})).unwrap();
+        assert_eq!(v, TaggedValue::Real(1.5));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "str", "value": "abc"})).unwrap();
+        assert_eq!(v, TaggedValue::String("abc".into()));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "method", "value": "count"})).unwrap();
+        assert_eq!(v, TaggedValue::Symbol("count".into()));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "time", "value": 1700000000})).unwrap();
+        assert_eq!(v, TaggedValue::TimeEpoch(1700000000, 0));
+
+        let v: TaggedValue = serde_json::from_value(json!({"type": "time", "value": 1700000000.5})).unwrap();
+        assert_eq!(v, TaggedValue::TimeEpoch(1700000000, 500_000_000));
+    }
+
+    #[test]
+    fn test_tagged_validation_errors_and_ident_checker() {
+        assert!(serde_json::from_value::<TaggedValue>(json!({"type": "unknown", "value": 1})).is_err());
+        assert!(serde_json::from_value::<TaggedValue>(json!({"type": "integer", "value": "nope"})).is_err());
+        assert!(serde_json::from_value::<TaggedValue>(json!({"type": "bytes", "value": "!!!bad!!!"})).is_err());
+        assert!(serde_json::from_value::<TaggedValue>(json!({"value": 123})).is_err());
+
+        assert!(is_valid_ml_ident("foo"));
+        assert!(is_valid_ml_ident("_bar_123"));
+        assert!(!is_valid_ml_ident(""));
+        assert!(!is_valid_ml_ident("1abc"));
+        assert!(!is_valid_ml_ident("foo-bar"));
+        assert!(!is_valid_ml_ident("a.b"));
+    }
+
+    #[test]
+    fn test_base64_roundtrip_and_invalid_inputs() {
+        for sample in [b"".as_slice(), b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0u8, 127, 128, 255]] {
+            let enc = base64_encode(sample);
+            let dec = base64_decode(&enc).unwrap();
+            assert_eq!(dec, sample);
+        }
+        assert!(base64_decode("abc").is_err());
+        assert!(base64_decode("=====").is_err());
+        assert!(base64_decode("a=b=").is_err());
+        assert!(base64_decode("ab*d").is_err());
+    }
+}

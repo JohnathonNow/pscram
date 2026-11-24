@@ -135,3 +135,76 @@ impl NotebookDocument {
         parts.join("\n\n") + "\n"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_notebook_defaults() {
+        let nb = NotebookDocument::empty(Some("demo.mnb".into()), None);
+        assert_eq!(nb.format, "minilang-notebook");
+        assert_eq!(nb.version, 1);
+        assert_eq!(nb.language, "minilang");
+        assert_eq!(nb.cells.len(), 1);
+        assert_eq!(nb.cells[0].cell_type, "code");
+
+        let rust_nb = NotebookDocument::empty(None, Some("rust"));
+        assert_eq!(rust_nb.language, "rust");
+    }
+
+    #[test]
+    fn test_from_script_and_to_script_cell_markers() {
+        let script = ":> %% Cell 1\nlet x := 10\n:> %% Cell 2\nx * 2\n";
+        let nb = NotebookDocument::from_script("calc.mini", script, "minilang");
+        assert_eq!(nb.cells.len(), 2);
+        assert_eq!(nb.cells[0].source, "let x := 10");
+        assert_eq!(nb.cells[1].source, "x * 2");
+
+        let exported = nb.to_script(":>");
+        assert!(exported.contains(":> %% Cell 1\nlet x := 10"));
+        assert!(exported.contains(":> %% Cell 2\nx * 2"));
+
+        let rust_script = "// %% Part 1\nlet a = 1;\n// %% Part 2\na + 2\n";
+        let rnb = NotebookDocument::from_script("demo.rs", rust_script, "rust");
+        assert_eq!(rnb.cells.len(), 2);
+        assert_eq!(rnb.language, "rust");
+        assert_eq!(rnb.cells[0].source, "let a = 1;");
+        assert_eq!(rnb.cells[1].source, "a + 2");
+    }
+
+    #[test]
+    fn test_to_script_comments_out_markdown_cells() {
+        let mut nb = NotebookDocument::empty(Some("mix.mnb".into()), Some("minilang"));
+        nb.cells = vec![
+            NotebookCell {
+                id: "c1".into(),
+                cell_type: "markdown".into(),
+                source: "# Title\nSome notes".into(),
+                execution_count: None,
+                output: None,
+            },
+            NotebookCell {
+                id: "c2".into(),
+                cell_type: "code".into(),
+                source: "1 + 1".into(),
+                execution_count: Some(1),
+                output: None,
+            },
+        ];
+        let out = nb.to_script(":>");
+        assert!(out.contains(":> # Title\n:> Some notes"));
+        assert!(out.contains(":> %% Cell 2\n1 + 1"));
+    }
+
+    #[test]
+    fn test_from_script_without_markers_and_empty() {
+        let nb = NotebookDocument::from_script("plain.mini", "let a := 1\na + 2", "minilang");
+        assert_eq!(nb.cells.len(), 1);
+        assert_eq!(nb.cells[0].source, "let a := 1\na + 2");
+
+        let empty = NotebookDocument::from_script("empty.mini", ":> %%\n", "minilang");
+        assert_eq!(empty.cells.len(), 1);
+        assert_eq!(empty.cells[0].source, "");
+    }
+}

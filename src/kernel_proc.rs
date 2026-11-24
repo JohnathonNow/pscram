@@ -87,6 +87,8 @@ pub enum KernelRequest {
         args: Vec<TaggedValue>,
         #[serde(default)]
         function: Option<String>,
+        #[serde(default)]
+        stream: bool,
     },
     Inspect,
     Complete {
@@ -477,6 +479,7 @@ fn handle_invoke(
     params: BTreeMap<String, TaggedValue>,
     args: Vec<TaggedValue>,
     function: Option<String>,
+    stream: Option<&mut dyn Write>,
 ) -> KernelResponse {
     let start = Instant::now();
 
@@ -553,7 +556,7 @@ fn handle_invoke(
         displays: Vec::new(),
         results: Vec::new(),
         error: None,
-        stream: None,
+        stream,
     };
 
     unsafe {
@@ -793,7 +796,15 @@ pub fn run_kernel_process() -> io::Result<()> {
                 params,
                 args,
                 function,
-            }) => handle_invoke(code, source, params, args, function),
+                stream,
+            }) => handle_invoke(
+                code,
+                source,
+                params,
+                args,
+                function,
+                if stream { Some(&mut out) } else { None },
+            ),
             Ok(KernelRequest::Inspect) => {
                 let all = collect_all_vars();
                 let globals_count = all.iter().filter(|v| !v.is_user).count();

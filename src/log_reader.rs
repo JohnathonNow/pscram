@@ -559,3 +559,67 @@ fn f16_to_f64(bits: u16) -> f64 {
     };
     if sign != 0 { -val } else { val }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_plain_text_log_levels_filtering_and_pagination() {
+        let path = std::env::temp_dir().join(format!("mlnb_text_log_{}.log", uuid::Uuid::new_v4()));
+        fs::write(
+            &path,
+            "2026-11-24T01:00:00Z INFO server started\n\
+             2026-11-24T01:01:00Z WARN high latency detected\n\
+             2026-11-24T01:02:00Z ERROR database timeout\n\
+             plain unformatted line\n",
+        )
+        .unwrap();
+
+        let all = read_log_file(&path, "app.log", None, None, false, 0, 50).unwrap();
+        assert_eq!(all.format, "text");
+        assert_eq!(all.total, 4);
+        assert_eq!(all.entries[0].level.as_deref(), Some("info"));
+        assert_eq!(all.entries[1].level.as_deref(), Some("warn"));
+        assert_eq!(all.entries[2].level.as_deref(), Some("error"));
+
+        let rev = read_log_file(&path, "app.log", None, None, true, 0, 2).unwrap();
+        assert_eq!(rev.entries.len(), 2);
+        assert_eq!(rev.entries[0].index, 4);
+
+        let filtered = read_log_file(&path, "app.log", Some("timeout"), None, false, 0, 50).unwrap();
+        assert_eq!(filtered.filtered, 1);
+        assert!(filtered.entries[0].repr.contains("database timeout"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_truncated_mlog_frame_is_crash_safe() {
+        let path = std::env::temp_dir().join(format!("mlnb_trunc_{}.mlog", uuid::Uuid::new_v4()));
+        let mut data = Vec::new();
+        // Valid frame 1: CBOR string "ok" (0x62 'o' 'k')
+        data.extend_from_slice(b"MLOG");
+        data.extend_from_slice(&1700000000i64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&[0x62, b'o', b'k']);
+        // Partial corrupted trailing frame
+        data.extend_from_slice(b"MLOG\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x64\x00\x00\x00\x01\x02");
+        fs::write(&path, &data).unwrap();
+
+        assert!(has_mlog_magic(&path));
+        let res = read_log_file(&path, "trunc.mlog", None, None, false, 0, 50).unwrap();
+        assert_eq!(res.format, "mlog");
+        assert_eq!(res.total, 1);
+        assert_eq!(res.entries[0].value, json!("ok"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_f16_conversion() {
+        assert_eq!(f16_to_f64(0x3c00), 1.0);
+        assert_eq!(f16_to_f64(0xc000), -2.0);
+        assert_eq!(f16_to_f64(0x0000), 0.0);
+    }
+}

@@ -677,3 +677,125 @@ fn encode_cbor_value(val: &Value, out: &mut Vec<u8>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_cron_validation_and_matching() {
+        assert!(validate_cron("*/5 * * * *").is_ok());
+        assert!(validate_cron("0 9 * * 1-5").is_ok());
+        assert!(validate_cron("15,45 8-17/2 1 1,6 0").is_ok());
+        assert!(validate_cron("0 0 * * 7").is_ok()); // Sunday = 7 alias
+
+        assert!(validate_cron("* * *").is_err());
+        assert!(validate_cron("60 * * * *").is_err());
+        assert!(validate_cron("*/0 * * * *").is_err());
+        assert!(validate_cron("0 25 * * *").is_err());
+        assert!(validate_cron("0 0 0 * *").is_err());
+        assert!(validate_cron("10-5 * * * *").is_err());
+
+        // 2026-11-24 is a Tuesday (dow = 2)
+        let dt = Utc.with_ymd_and_hms(2026, 11, 24, 9, 15, 0).unwrap();
+        assert!(cron_matches("*/15 9 * * 1-5", &dt));
+        assert!(cron_matches("15 9 24 11 2", &dt));
+        assert!(!cron_matches("0 9 * * 1-5", &dt));
+        assert!(!cron_matches("15 9 * * 0,6", &dt));
+    }
+
+    #[test]
+    fn test_mlog_cbor_frame_readable_by_log_reader() {
+        let path = std::env::temp_dir().join(format!("mlnb_sched_mlog_{}.mlog", uuid::Uuid::new_v4()));
+        let ts = Utc::now();
+        let entry = json!({
+            "level": "info",
+            "job": "nightly",
+            "count": 42,
+            "neg": -7,
+            "ratio": 1.25,
+            "ok": true,
+            "tags": ["a", "b"],
+            "err": null
+        });
+        append_mlog_json_frame(&path, ts, &entry).unwrap();
+
+        let parsed = crate::log_reader::read_log_file(&path, "test.mlog", None, None, false, 0, 50).unwrap();
+        assert_eq!(parsed.format, "mlog");
+        assert_eq!(parsed.total, 1);
+        assert_eq!(parsed.entries[0].level.as_deref(), Some("info"));
+        assert_eq!(parsed.entries[0].value.get("job").and_then(|v| v.as_str()), Some("nightly"));
+        assert_eq!(parsed.entries[0].value.get("count").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(parsed.entries[0].value.get("neg").and_then(|v| v.as_i64()), Some(-7));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_crud_and_persistence() {
+        let dir = std::env::temp_dir().join(format!("mlnb_sched_crud_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let sched = Scheduler::open(&dir);
+        let created = sched
+            .create(CreateScheduleRequest {
+                name: Some("Ping Job".into()),
+                script: "scripts/greet.mini".into(),
+                cron: Some("*/10 * * * *".into()),
+                interval_secs: None,
+                function: None,
+                params: BTreeMap::new(),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.name, "Ping Job");
+        assert!(created.enabled);
+        assert!(sched.find_by_webhook(&created.webhook_token).await.is_some());
+
+        // Interval < 5 rejected
+        assert!(sched
+            .create(CreateScheduleRequest {
+                name: None,
+                script: "scripts/greet.mini".into(),
+                cron: None,
+                interval_secs: Some(2),
+                function: None,
+                params: BTreeMap::new(),
+                enabled: true,
+            })
+            .await
+            .is_err());
+
+        // Toggle & update
+        let toggled = sched.toggle(&created.id).await.unwrap();
+        assert!(!toggled.enabled);
+        let updated = sched
+            .update(
+                &created.id,
+                UpdateScheduleRequest {
+                    name: Some("Renamed Job".into()),
+                    script: None,
+                    cron: Some(Some("0 * * * *".into())),
+                    interval_secs: None,
+                    function: None,
+                    params: None,
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Renamed Job");
+        assert_eq!(updated.cron.as_deref(), Some("0 * * * *"));
+
+        // Reopen from disk
+        let reopened = Scheduler::open(&dir);
+        assert_eq!(reopened.list().await.len(), 1);
+        assert_eq!(reopened.list().await[0].name, "Renamed Job");
+
+        assert!(reopened.delete(&created.id).await.unwrap());
+        assert!(reopened.list().await.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

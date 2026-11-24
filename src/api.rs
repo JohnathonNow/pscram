@@ -1,6 +1,7 @@
 use crate::agy::{AgyAssistRequest, AgyRunner};
 use crate::auth::{self, AuthManager, AuthenticatedUser};
 use crate::files::FileStore;
+use crate::jobs::{JobManager, StartJobRequest};
 use crate::kernel_mgr::{InvokeExecError, KernelManager};
 use crate::kernel_proc::KernelResponse;
 use crate::lang::LanguageRegistry;
@@ -38,6 +39,8 @@ pub struct AppState {
     pub agy: Arc<AgyRunner>,
     pub secrets: Arc<SecretsVault>,
     pub scheduler: Arc<Scheduler>,
+    pub jobs: Arc<JobManager>,
+    pub internal_token: String,
     pub web_dir: Option<PathBuf>,
 }
 
@@ -106,6 +109,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/schedules/:id", put(api_update_schedule).delete(api_delete_schedule))
         .route("/api/schedules/:id/run", post(api_run_schedule))
         .route("/api/schedules/:id/toggle", post(api_toggle_schedule))
+        // Background Jobs API (used by Minilang `jobs` module & Web UI)
+        .route("/api/jobs", get(api_list_jobs).post(api_start_job))
+        .route("/api/jobs/clear", post(api_clear_jobs))
+        .route("/api/jobs/:id", get(api_get_job).delete(api_delete_job))
+        .route("/api/jobs/:id/wait", post(api_wait_job))
+        .route("/api/jobs/:id/stop", post(api_stop_job))
         // Google Antigravity (agy) inline assistant API
         .route("/api/agy/status", get(api_agy_status))
         .route("/api/agy/assist", post(api_agy_assist))
@@ -122,6 +131,25 @@ async fn auth_middleware<B>(
 ) -> Response {
     if !st.auth.is_enabled() {
         return next.run(req).await;
+    }
+
+    // Allow internal loopback calls from server-spawned kernels (e.g. Minilang `jobs` module)
+    if let Some(tok) = req
+        .headers()
+        .get("x-internal-token")
+        .and_then(|v| v.to_str().ok())
+    {
+        let a = tok.as_bytes();
+        let b = st.internal_token.as_bytes();
+        if a.len() == b.len() && !a.is_empty() {
+            let mut diff = 0u8;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                diff |= x ^ y;
+            }
+            if diff == 0 {
+                return next.run(req).await;
+            }
+        }
     }
 
     let token = auth::extract_access_token(req.headers(), req.uri().query());
@@ -1793,4 +1821,87 @@ async fn api_trigger_webhook(
         StatusCode::UNPROCESSABLE_ENTITY
     };
     (status, Json(res)).into_response()
+}
+
+// --- Background Jobs API ---
+
+async fn api_list_jobs(State(st): State<Arc<AppState>>) -> Response {
+    let jobs = st.jobs.list().await;
+    let running = jobs.iter().filter(|j| j.status == "running").count();
+    Json(json!({ "jobs": jobs, "running": running, "total": jobs.len() })).into_response()
+}
+
+async fn api_start_job(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<StartJobRequest>,
+) -> Response {
+    match st
+        .jobs
+        .start(
+            req,
+            st.files.clone(),
+            st.kernels.clone(),
+            st.languages.clone(),
+            st.secrets.clone(),
+        )
+        .await
+    {
+        Ok(job) => Json(json!({ "ok": true, "job": job })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_get_job(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.jobs.get(&id).await {
+        Some(job) => Json(json!({ "ok": true, "job": job })).into_response(),
+        None => api_err(StatusCode::NOT_FOUND, format!("Background job '{}' not found", id)),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct WaitJobBody {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+async fn api_wait_job(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    raw_body: String,
+) -> Response {
+    let body: WaitJobBody = if raw_body.trim().is_empty() {
+        WaitJobBody::default()
+    } else {
+        serde_json::from_str(&raw_body).unwrap_or_default()
+    };
+    match st.jobs.wait(&id, body.timeout_ms).await {
+        Ok(job) => Json(json!({ "ok": true, "job": job })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_stop_job(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.jobs.stop(&id).await {
+        Ok(job) => Json(json!({ "ok": true, "job": job })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_delete_job(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let removed = st.jobs.remove(&id).await;
+    Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
+async fn api_clear_jobs(State(st): State<Arc<AppState>>) -> Response {
+    let cleared = st.jobs.clear_finished().await;
+    Json(json!({ "ok": true, "cleared": cleared })).into_response()
 }

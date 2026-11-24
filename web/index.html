@@ -44,6 +44,13 @@
             <line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
         </button>
+        <button id="btn-open-jobs" class="toolbar-chip" title="Background Jobs &amp; Active Sessions">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          <span>Jobs</span>
+          <span id="jobs-active-badge" class="jobs-count-badge hidden">0</span>
+        </button>
         <button id="btn-open-schedules" class="toolbar-chip" title="Scheduled Jobs & Webhooks">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="10"/>
@@ -175,7 +182,10 @@
         </div>
 
         <div class="sidebar-footer">
-          <div class="sidebar-section-label">ACTIVE KERNELS</div>
+          <div class="sidebar-section-header">
+            <div class="sidebar-section-label">ACTIVE KERNELS</div>
+            <button id="btn-manage-sessions" type="button" class="sidebar-manage-link" title="Manage Jobs &amp; Sessions">Manage</button>
+          </div>
           <div id="kernel-list" class="kernel-list"></div>
         </div>
       </aside>
@@ -636,6 +646,40 @@
         <div id="grep-status" class="tb-meta" style="margin:6px 0"></div>
         <div id="grep-results" class="grep-results">
           <div class="log-empty">Enter a search term to search workspace files and notebook cells.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Background Jobs & Active Sessions Manager Modal -->
+  <div id="jobs-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide-modal-card">
+      <div class="modal-header">
+        <div class="jobs-modal-head-left">
+          <h3>Jobs &amp; Sessions</h3>
+          <div class="tb-segmented" role="tablist">
+            <button id="jobs-tab-bg" type="button" class="tb-seg-btn active" data-jobs-tab="bg">Background Jobs (<span id="jobs-tab-bg-count">0</span>)</button>
+            <button id="jobs-tab-sessions" type="button" class="tb-seg-btn" data-jobs-tab="sessions">Sessions (<span id="jobs-tab-sess-count">0</span>)</button>
+          </div>
+        </div>
+        <div class="toolbar-group">
+          <button id="jobs-refresh-btn" type="button" class="tb-btn" style="height:26px;font-size:12px">Refresh</button>
+          <button id="jobs-clear-btn" type="button" class="tb-btn" style="height:26px;font-size:12px">Clear Finished</button>
+          <button id="jobs-modal-close" type="button" class="icon-btn sm">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body manager-modal-body">
+        <div id="jobs-pane-bg" class="jobs-pane">
+          <form id="job-launch-form" class="manager-form">
+            <input id="job-script" class="modal-input" type="text" placeholder="Script path (e.g. scripts/greet.mini)" required />
+            <input id="job-name" class="modal-input" type="text" placeholder="Optional job name" />
+            <input id="job-params" class="modal-input" type="text" placeholder='Optional JSON params (e.g. {"name":"Ada"})' />
+            <button type="submit" class="tb-btn primary">Launch Job</button>
+          </form>
+          <div id="jobs-list" class="manager-list"></div>
+        </div>
+        <div id="jobs-pane-sessions" class="jobs-pane hidden">
+          <div id="sessions-list" class="manager-list"></div>
         </div>
       </div>
     </div>

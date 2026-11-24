@@ -22,6 +22,7 @@
 #include "ml_io.h"
 #include "ml_log.h"
 #include "ml_db.h"
+#include "ml_jobs.h"
 #include "stringmap.h"
 
 #include <stdio.h>
@@ -884,6 +885,7 @@ void mlk_init(const char *exec_name) {
     ml_io_init(MLGlobals);
     ml_log_init(MLGlobals);
     ml_db_init(MLGlobals);
+    ml_jobs_init(MLGlobals);
 
     g_compiler = ml_compiler2((ml_getter_t)ml_stringmap_global_get, MLGlobals, 1);
     g_parser = ml_parser(NULL, NULL);

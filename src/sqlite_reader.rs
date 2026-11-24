@@ -389,3 +389,56 @@ pub fn run_query(
         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sqlite_ext_detection_and_query_guard() {
+        assert!(is_sqlite_ext("db"));
+        assert!(is_sqlite_ext("sqlite"));
+        assert!(is_sqlite_ext("sqlite3"));
+        assert!(!is_sqlite_ext("mini"));
+
+        // Nonexistent file returns error
+        let missing = std::env::temp_dir().join("mlnb_definitely_missing_xyz.db");
+        assert!(!has_sqlite_magic(&missing));
+        assert!(inspect_schema(&missing, "missing.db").is_err());
+
+        // Create a real SQLite DB via open_v2 READWRITE|CREATE and test inspect_schema + run_query
+        let path = std::env::temp_dir().join(format!("mlnb_sql_unit_{}.sqlite", uuid::Uuid::new_v4()));
+        unsafe {
+            let a = api().unwrap();
+            let c_path = CString::new(path.to_string_lossy().as_ref()).unwrap();
+            let mut db: *mut c_void = std::ptr::null_mut();
+            let rc = (a.open_v2)(c_path.as_ptr(), &mut db, SQLITE_OPEN_READWRITE | 0x0000_0004, std::ptr::null());
+            assert_eq!(rc, SQLITE_OK);
+            (a.close_v2)(db);
+        }
+        // Populate via allow_write=true
+        run_query(&path, "u.sqlite", "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, raw BLOB)", 100, false).unwrap();
+        run_query(&path, "u.sqlite", "INSERT INTO t VALUES (1, 'Ada', 99.5, X'DEADBEEF'), (2, 'Grace', 100.0, NULL)", 100, false).unwrap();
+
+        assert!(has_sqlite_magic(&path));
+        let schema = inspect_schema(&path, "u.sqlite").unwrap();
+        assert_eq!(schema.tables.len(), 1);
+        assert_eq!(schema.tables[0].name, "t");
+        assert_eq!(schema.tables[0].row_count, Some(2));
+        assert_eq!(schema.tables[0].columns.len(), 4);
+
+        // Read-only query + truncation limit
+        let q = run_query(&path, "u.sqlite", "SELECT id, name, score, raw FROM t ORDER BY id", 1, true).unwrap();
+        assert_eq!(q.row_count, 1);
+        assert!(q.truncated);
+        assert_eq!(q.rows[0][1], json!("Ada"));
+        assert!(q.rows[0][3].as_str().unwrap().contains("deadbeef"));
+
+        // Write blocked when read_only = true
+        assert!(run_query(&path, "u.sqlite", "DELETE FROM t", 100, true).is_err());
+        // Empty SQL rejected
+        assert!(run_query(&path, "u.sqlite", "   ", 100, true).is_err());
+
+        let _ = fs::remove_file(&path);
+    }
+}
