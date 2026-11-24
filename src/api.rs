@@ -9,6 +9,10 @@ use crate::lang::LanguageRegistry;
 use crate::notebook::NotebookDocument;
 use crate::scheduler::{CreateScheduleRequest, Scheduler, UpdateScheduleRequest};
 use crate::secrets::SecretsVault;
+use crate::services::{
+    CallServiceRequest, EmitMessageRequest, RecvMessageRequest, ReplyMessageRequest,
+    SendMessageRequest, ServiceManager, StartServiceRequest,
+};
 use crate::tagged::TaggedValue;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -29,8 +33,29 @@ use std::task::{Context, Poll};
 
 const EMBED_INDEX_HTML: &str = include_str!("../web/index.html");
 const EMBED_STYLE_CSS: &str = include_str!("../web/style.css");
-const EMBED_APP_JS: &str = include_str!("../web/app.js");
-const EMBED_MINIJS_VM_JS: &str = include_str!("../web/minijs_vm.js");
+
+const EMBED_JS_MODULES: &[(&str, &str)] = &[
+    ("main.js", include_str!("../web/js/main.js")),
+    ("viz/viz.js", include_str!("../web/js/viz/viz.js")),
+    ("minijs/index.js", include_str!("../web/js/minijs/index.js")),
+    ("minijs/values.js", include_str!("../web/js/minijs/values.js")),
+    ("minijs/widgets.js", include_str!("../web/js/minijs/widgets.js")),
+    ("minijs/service_client.js", include_str!("../web/js/minijs/service_client.js")),
+    ("minijs/vm.js", include_str!("../web/js/minijs/vm.js")),
+    ("core/highlight.js", include_str!("../web/js/core/highlight.js")),
+    ("core/markdown.js", include_str!("../web/js/core/markdown.js")),
+    ("core/auth.js", include_str!("../web/js/core/auth.js")),
+    ("core/ui_helpers.js", include_str!("../web/js/core/ui_helpers.js")),
+    ("core/state.js", include_str!("../web/js/core/state.js")),
+    ("features/media.js", include_str!("../web/js/features/media.js")),
+    ("features/files.js", include_str!("../web/js/features/files.js")),
+    ("features/viewers.js", include_str!("../web/js/features/viewers.js")),
+    ("features/notebook.js", include_str!("../web/js/features/notebook.js")),
+    ("features/script_tools.js", include_str!("../web/js/features/script_tools.js")),
+    ("features/managers.js", include_str!("../web/js/features/managers.js")),
+    ("features/agy.js", include_str!("../web/js/features/agy.js")),
+    ("features/debugger.js", include_str!("../web/js/features/debugger.js")),
+];
 
 pub struct AppState {
     pub files: Arc<FileStore>,
@@ -41,6 +66,7 @@ pub struct AppState {
     pub secrets: Arc<SecretsVault>,
     pub scheduler: Arc<Scheduler>,
     pub jobs: Arc<JobManager>,
+    pub services: Arc<ServiceManager>,
     pub debugger: Arc<DebugManager>,
     pub internal_token: String,
     pub web_dir: Option<PathBuf>,
@@ -50,6 +76,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
+        .route("/js/*path", get(serve_js_module))
         .route("/app.js", get(serve_js))
         .route("/minijs_vm.js", get(serve_minijs_vm))
         // Authentication & token lifecycle endpoints (always accessible)
@@ -117,6 +144,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/:id", get(api_get_job).delete(api_delete_job))
         .route("/api/jobs/:id/wait", post(api_wait_job))
         .route("/api/jobs/:id/stop", post(api_stop_job))
+        // Background Services & Cross-UI Messaging API
+        .route("/api/services", get(api_list_services).post(api_start_service))
+        .route("/api/services/:name", get(api_get_service).delete(api_delete_service))
+        .route("/api/services/:name/stop", post(api_stop_service))
+        .route("/api/services/:name/restart", post(api_restart_service))
+        .route("/api/services/:name/send", post(api_service_send))
+        .route("/api/services/:name/call", post(api_service_call))
+        .route("/api/services/:name/recv", post(api_service_recv))
+        .route("/api/services/:name/emit", post(api_service_emit))
+        .route("/api/services/:name/reply", post(api_service_reply))
+        .route("/api/services/:name/events", get(api_service_events))
         // Interactive Minilang Debugger API
         .route("/api/debug/sessions", get(api_debug_list))
         .route("/api/debug/start", post(api_debug_start))
@@ -246,20 +284,49 @@ async fn serve_css(State(st): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn serve_js(State(st): State<Arc<AppState>>) -> Response {
-    let body = load_asset(&st.web_dir, "app.js", EMBED_APP_JS);
+async fn serve_js_module(
+    State(st): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    let clean = path.trim_start_matches('/');
+    if clean.is_empty()
+        || clean.contains("..")
+        || clean.contains('\\')
+        || !clean.ends_with(".js")
+    {
+        return (StatusCode::NOT_FOUND, "JS module not found").into_response();
+    }
+    if let Some(dir) = &st.web_dir {
+        if let Ok(content) = std::fs::read_to_string(dir.join("js").join(clean)) {
+            return (
+                [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                content,
+            )
+                .into_response();
+        }
+    }
+    if let Some((_, embedded)) = EMBED_JS_MODULES.iter().find(|(k, _)| *k == clean) {
+        return (
+            [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+            *embedded,
+        )
+            .into_response();
+    }
+    (StatusCode::NOT_FOUND, "JS module not found").into_response()
+}
+
+async fn serve_js(State(_st): State<Arc<AppState>>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        body,
+        "import \"/js/main.js\";\n",
     )
         .into_response()
 }
 
-async fn serve_minijs_vm(State(st): State<Arc<AppState>>) -> Response {
-    let body = load_asset(&st.web_dir, "minijs_vm.js", EMBED_MINIJS_VM_JS);
+async fn serve_minijs_vm(State(_st): State<Arc<AppState>>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        body,
+        "export * from \"/js/minijs/index.js\";\n",
     )
         .into_response()
 }
@@ -389,8 +456,8 @@ async fn serve_standalone_ui(
     </div>
     <div id="ui-mount"></div>
   </div>
-  <script src="/minijs_vm.js"></script>
-  <script>
+  <script type="module">
+    import {{ MinijsUI }} from "/js/minijs/index.js";
     const bundles = {bundles};
     const errMsg = {err};
     const mount = document.getElementById("ui-mount");
@@ -405,7 +472,7 @@ async fn serve_standalone_ui(
       d.textContent = "UI file executed without calling ui::show(...).";
       mount.appendChild(d);
     }} else {{
-      for (const b of bundles) window.MinijsUI.mount(mount, b);
+      for (const b of bundles) MinijsUI.mount(mount, b);
     }}
   </script>
 </body>
@@ -2064,4 +2131,203 @@ async fn api_debug_terminate(
         Ok(session) => Json(json!({ "ok": true, "session": session })).into_response(),
         Err(e) => api_err(StatusCode::NOT_FOUND, e),
     }
+}
+
+// --- Background Services & Cross-UI Messaging API ---
+
+async fn api_list_services(State(st): State<Arc<AppState>>) -> Response {
+    let services = st.services.list().await;
+    let running = services.iter().filter(|s| s.status == "running").count();
+    Json(json!({
+        "services": services,
+        "running": running,
+        "total": services.len(),
+    }))
+    .into_response()
+}
+
+async fn api_start_service(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<StartServiceRequest>,
+) -> Response {
+    match st
+        .services
+        .start(req, &st.files, st.secrets.clone())
+        .await
+    {
+        Ok(service) => Json(json!({ "ok": true, "service": service })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_get_service(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match st.services.get(&name).await {
+        Some(service) => Json(json!({ "ok": true, "service": service })).into_response(),
+        None => api_err(StatusCode::NOT_FOUND, format!("Service '{}' not found", name)),
+    }
+}
+
+async fn api_stop_service(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match st.services.stop(&name).await {
+        Ok(service) => Json(json!({ "ok": true, "service": service })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_restart_service(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match st
+        .services
+        .restart(&name, &st.files, st.secrets.clone())
+        .await
+    {
+        Ok(service) => Json(json!({ "ok": true, "service": service })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_delete_service(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match st.services.remove(&name).await {
+        Ok(removed) => Json(json!({ "ok": true, "removed": removed })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_service_send(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SendMessageRequest>,
+) -> Response {
+    match st.services.send_to_service(&name, req).await {
+        Ok(msg) => Json(json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_service_call(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CallServiceRequest>,
+) -> Response {
+    match st.services.call_service(&name, req).await {
+        Ok((reply, reply_plain)) => Json(json!({
+            "ok": true,
+            "reply": reply,
+            "reply_plain": reply_plain,
+        }))
+        .into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_service_recv(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw_body: String,
+) -> Response {
+    let body: RecvMessageRequest = if raw_body.trim().is_empty() {
+        RecvMessageRequest::default()
+    } else {
+        serde_json::from_str(&raw_body).unwrap_or_default()
+    };
+    let timeout_ms = body.timeout_ms.unwrap_or(25_000);
+    match st.services.recv_for_service(&name, timeout_ms).await {
+        Ok((msg, closed)) => Json(json!({
+            "ok": true,
+            "message": msg,
+            "closed": closed,
+        }))
+        .into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_service_emit(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<EmitMessageRequest>,
+) -> Response {
+    match st.services.emit_from_service(&name, req).await {
+        Ok((delivered, msg)) => Json(json!({
+            "ok": true,
+            "delivered": delivered,
+            "message": msg,
+        }))
+        .into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn api_service_reply(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ReplyMessageRequest>,
+) -> Response {
+    match st.services.reply_from_service(&name, req).await {
+        Ok(delivered) => Json(json!({ "ok": true, "delivered": delivered })).into_response(),
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ServiceEventsQuery {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+async fn api_service_events(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<ServiceEventsQuery>,
+) -> Response {
+    let mut sub = match st.services.subscribe(&name, q.client_id).await {
+        Ok(s) => s,
+        Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+    };
+
+    let topic_filter = q.topic.filter(|t| !t.trim().is_empty() && t != "*");
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+
+    let init_payload = json!({
+        "client_id": sub.client_id,
+        "service": sub.service_name,
+    });
+    let _ = sse_tx.send(Ok(Event::default()
+        .event("connected")
+        .data(init_payload.to_string())));
+
+    tokio::spawn(async move {
+        while let Some(msg) = sub.recv().await {
+            if let Some(ref wanted) = topic_filter {
+                if &msg.topic != wanted {
+                    continue;
+                }
+            }
+            let payload = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".to_string());
+            if sse_tx
+                .send(Ok(Event::default().event("message").data(payload)))
+                .is_err()
+            {
+                break;
+            }
+        }
+        // `sub` drops here and automatically unsubscribes `client_id`
+    });
+
+    Sse::new(SseReceiverStream { rx: sse_rx })
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
 }

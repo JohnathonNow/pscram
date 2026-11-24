@@ -13,6 +13,7 @@ mod notebook;
 mod rust_kernel_proc;
 mod scheduler;
 mod secrets;
+mod services;
 mod sqlite_reader;
 mod tagged;
 
@@ -182,6 +183,7 @@ fn main() {
         std::env::set_var("MINILANG_INTERNAL_TOKEN", &internal_token);
 
         let job_mgr = Arc::new(jobs::JobManager::new(root_canon.clone()));
+        let service_mgr = Arc::new(services::ServiceManager::new(root_canon.clone()));
         let debug_mgr = Arc::new(debugger::DebugManager::new(
             root_canon.clone(),
             secrets.clone(),
@@ -196,6 +198,7 @@ fn main() {
             secrets: secrets.clone(),
             scheduler: scheduler.clone(),
             jobs: job_mgr,
+            services: service_mgr,
             debugger: debug_mgr,
             internal_token,
             web_dir: cli.web_dir,

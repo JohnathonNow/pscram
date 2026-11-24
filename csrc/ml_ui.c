@@ -23,6 +23,16 @@ typedef struct {
 } ml_ui_app_t;
 
 static ml_ui_emit_fn g_ui_emit = NULL;
+static ml_value_t *g_ui_service_subs = NULL;
+
+void ml_ui_register_service_sub(ml_value_t *ServiceName, ml_value_t *Topic, ml_value_t *Handler) {
+    if (!g_ui_service_subs) g_ui_service_subs = ml_list();
+    ml_value_t *Entry = ml_list();
+    ml_list_put(Entry, ml_deref(ServiceName));
+    ml_list_put(Entry, ml_deref(Topic));
+    ml_list_put(Entry, ml_deref(Handler));
+    ml_list_put(g_ui_service_subs, Entry);
+}
 
 ML_TYPE(MLUIWidgetT, (), "ui::widget");
 ML_TYPE(MLUIAppT, (), "ui::compiled");
@@ -362,6 +372,10 @@ static ml_value_t *ml_ui_compile_value(ml_value_t *Target) {
         Mode = "function";
     } else if (ml_is(Target, MLUIWidgetT)) {
         Mode = "widget";
+        if (g_ui_service_subs) {
+            ml_ui_prop_set((ml_ui_widget_t *)Target, "__service_subs", g_ui_service_subs);
+            g_ui_service_subs = NULL;
+        }
     } else {
         return ml_error("TypeError", "ui::compile expects a ui::widget or function, not %s", ml_typeof(Target)->Name);
     }

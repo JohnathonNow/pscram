@@ -23,6 +23,7 @@
 #include "ml_log.h"
 #include "ml_db.h"
 #include "ml_jobs.h"
+#include "ml_service.h"
 #include "stringmap.h"
 
 #include <stdio.h>
@@ -892,6 +893,7 @@ void mlk_init(const char *exec_name) {
     ml_log_init(MLGlobals);
     ml_db_init(MLGlobals);
     ml_jobs_init(MLGlobals);
+    ml_service_init(MLGlobals);
 
     g_compiler = ml_compiler2((ml_getter_t)ml_stringmap_global_get, MLGlobals, 1);
     g_parser = ml_parser(NULL, NULL);
@@ -1286,7 +1288,7 @@ static void mlk_write_base64(ml_stringbuffer_t *sb, const unsigned char *data, s
     }
 }
 
-static void mlk_write_tagged_json(ml_stringbuffer_t *sb, ml_value_t *Val, int depth) {
+void mlk_write_tagged_json(ml_stringbuffer_t *sb, ml_value_t *Val, int depth) {
     if (!Val) {
         ml_stringbuffer_write(sb, "{\"type\":\"nil\"}", 14);
         return;

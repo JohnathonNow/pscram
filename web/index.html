@@ -319,6 +319,13 @@
               <span>Params</span>
               <span id="ftb-params-badge" class="params-count-badge hidden">0</span>
             </button>
+            <button id="ftb-service" class="tb-btn hidden" title="Run this script as a persistent Background Service for UIs">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+              <span>Service</span>
+            </button>
             <button id="ftb-invoke-mini" class="tb-btn" title="Invoke via POST /invoke with tagged JSON parameters">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
@@ -821,14 +828,15 @@
     </div>
   </div>
 
-  <!-- Background Jobs & Active Sessions Manager Modal -->
+  <!-- Background Jobs, Services & Active Sessions Manager Modal -->
   <div id="jobs-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card wide-modal-card">
       <div class="modal-header">
         <div class="jobs-modal-head-left">
-          <h3>Jobs &amp; Sessions</h3>
+          <h3>Jobs, Services &amp; Sessions</h3>
           <div class="tb-segmented" role="tablist">
-            <button id="jobs-tab-bg" type="button" class="tb-seg-btn active" data-jobs-tab="bg">Background Jobs (<span id="jobs-tab-bg-count">0</span>)</button>
+            <button id="jobs-tab-bg" type="button" class="tb-seg-btn active" data-jobs-tab="bg">Jobs (<span id="jobs-tab-bg-count">0</span>)</button>
+            <button id="jobs-tab-services" type="button" class="tb-seg-btn" data-jobs-tab="services">Services (<span id="jobs-tab-svc-count">0</span>)</button>
             <button id="jobs-tab-sessions" type="button" class="tb-seg-btn" data-jobs-tab="sessions">Sessions (<span id="jobs-tab-sess-count">0</span>)</button>
           </div>
         </div>
@@ -847,6 +855,15 @@
             <button type="submit" class="tb-btn primary">Launch Job</button>
           </form>
           <div id="jobs-list" class="manager-list"></div>
+        </div>
+        <div id="jobs-pane-services" class="jobs-pane hidden">
+          <form id="service-launch-form" class="manager-form">
+            <input id="svc-name" class="modal-input" type="text" placeholder="Service name (e.g. counter)" />
+            <input id="svc-script" class="modal-input" type="text" placeholder="Script path (e.g. services/counter.mini)" required />
+            <input id="svc-params" class="modal-input" type="text" placeholder='Optional JSON params (e.g. {"initial":0})' />
+            <button type="submit" class="tb-btn primary">Start Service</button>
+          </form>
+          <div id="services-list" class="manager-list"></div>
         </div>
         <div id="jobs-pane-sessions" class="jobs-pane hidden">
           <div id="sessions-list" class="manager-list"></div>
@@ -898,7 +915,6 @@
     </div>
   </div>
 
-  <script src="/minijs_vm.js"></script>
-  <script src="/app.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>

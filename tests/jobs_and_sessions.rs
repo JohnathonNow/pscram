@@ -142,9 +142,11 @@ fn test_jobs_rest_api_sessions_management_and_ui_assets() {
     assert_eq!(srv.delete("/api/kernels/sess-b").json()["ok"], true);
     assert_eq!(srv.get("/api/kernels").json()["kernels"].as_array().unwrap().len(), 1);
 
-    // Verify Jobs & Sessions Manager UI markup & handlers are served
+    // Verify Jobs & Sessions Manager UI markup & modular JS handlers are served
     let html = srv.get("/").text();
     assert!(html.contains("jobs-modal-overlay") && html.contains("btn-open-jobs") && html.contains("sessions-list"));
-    let js = srv.get("/app.js").text();
-    assert!(js.contains("openJobsModal") && js.contains("loadJobsAndSessions") && js.contains("Run in Background"));
+    let mgr_js = srv.get("/js/features/managers.js").text();
+    let files_js = srv.get("/js/features/files.js").text();
+    assert!(mgr_js.contains("openJobsModal") && mgr_js.contains("loadJobsAndSessions"));
+    assert!(files_js.contains("Run in Background"));
 }
