@@ -248,6 +248,25 @@
           <span id="ftb-meta" class="tb-meta"></span>
         </div>
 
+        <!-- Media Viewer Toolbar (shown when viewing an image or PDF file) -->
+        <div id="media-toolbar" class="editor-toolbar hidden">
+          <div class="toolbar-group">
+            <div id="mtb-image-controls" class="toolbar-group">
+              <button id="mtb-zoom-out" class="tb-btn" title="Zoom Out">&minus;</button>
+              <span id="mtb-zoom-label" class="tb-meta" style="min-width:44px;text-align:center">Fit</span>
+              <button id="mtb-zoom-in" class="tb-btn" title="Zoom In">+</button>
+              <button id="mtb-zoom-fit" class="tb-btn" title="Fit to Window">Fit</button>
+              <button id="mtb-zoom-100" class="tb-btn" title="Actual Size (100%)">100%</button>
+              <button id="mtb-rotate" class="tb-btn" title="Rotate 90° Clockwise">Rotate</button>
+              <span class="tb-sep"></span>
+            </div>
+            <button id="mtb-edit-svg" class="tb-btn hidden" title="Open SVG XML in Text Editor">Edit Source</button>
+            <button id="mtb-open-external" class="tb-btn" title="Open Raw File in New Browser Tab">Open in New Tab</button>
+            <button id="mtb-download" class="tb-btn primary" title="Download File">Download</button>
+          </div>
+          <span id="mtb-meta" class="tb-meta"></span>
+        </div>
+
         <!-- Notebook Canvas -->
         <div id="notebook-view" class="notebook-scroll">
           <div id="cells-container" class="cells-container"></div>
@@ -298,6 +317,16 @@
               <button id="btn-close-file-output" class="icon-btn sm">&times;</button>
             </div>
             <div id="file-run-output-body" class="file-run-output-body"></div>
+          </div>
+        </div>
+
+        <!-- Image & PDF Media Viewer -->
+        <div id="media-view" class="media-viewer-pane hidden">
+          <div id="media-image-stage" class="media-image-stage hidden">
+            <img id="media-image-el" class="media-image-el fit" alt="" />
+          </div>
+          <div id="media-pdf-stage" class="media-pdf-stage hidden">
+            <iframe id="media-pdf-frame" class="media-pdf-frame" title="PDF Viewer"></iframe>
           </div>
         </div>
       </main>
@@ -359,6 +388,21 @@
 
   <!-- Toast Container -->
   <div id="toast-container" class="toast-container"></div>
+
+  <!-- Media Lightbox Modal (for expanded notebook previews) -->
+  <div id="media-lightbox" class="media-lightbox hidden" role="dialog" aria-modal="true">
+    <div class="media-lightbox-dialog">
+      <div class="media-lightbox-header">
+        <span id="media-lightbox-title" class="media-lightbox-title">Preview</span>
+        <div class="toolbar-group">
+          <button id="media-lightbox-open-tab" class="tb-btn hidden">Open in Tab</button>
+          <a id="media-lightbox-download" class="tb-btn primary" download>Download</a>
+          <button id="media-lightbox-close" class="icon-btn sm" title="Close (Esc)">&times;</button>
+        </div>
+      </div>
+      <div id="media-lightbox-body" class="media-lightbox-body"></div>
+    </div>
+  </div>
 
   <!-- Local Login Overlay (shown only when server requires login) -->
   <div id="login-overlay" class="login-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">

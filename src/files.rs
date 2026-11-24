@@ -4,6 +4,25 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub fn media_mime_for_ext(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+pub fn is_image_ext(ext: &str) -> bool {
+    matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -16,6 +35,9 @@ pub struct FileEntry {
     pub is_minilang: bool,
     pub is_rust: bool,
     pub is_ui: bool,
+    pub is_image: bool,
+    pub is_pdf: bool,
+    pub mime_type: Option<String>,
     pub language: Option<String>,
 }
 
@@ -34,6 +56,9 @@ pub struct FileReadResult {
     pub size: u64,
     pub content: String,
     pub is_binary: bool,
+    pub is_image: bool,
+    pub is_pdf: bool,
+    pub mime_type: Option<String>,
 }
 
 pub struct FileStore {
@@ -143,6 +168,14 @@ impl FileStore {
                 _ => None,
             };
 
+            let is_image = !is_dir && is_image_ext(&ext);
+            let is_pdf = !is_dir && ext == "pdf";
+            let mime_type = if is_dir {
+                None
+            } else {
+                media_mime_for_ext(&ext).map(|s| s.to_string())
+            };
+
             entries.push(FileEntry {
                 name,
                 path: rel_path,
@@ -153,6 +186,9 @@ impl FileStore {
                 is_minilang: ext == "mini",
                 is_rust: ext == "rs",
                 is_ui: ext == "ui",
+                is_image,
+                is_pdf,
+                mime_type,
                 language,
                 extension: ext,
             });
@@ -228,6 +264,13 @@ impl FileStore {
                         "rs" => Some("rust".to_string()),
                         _ => None,
                     };
+                    let is_image = !is_dir && is_image_ext(&ext);
+                    let is_pdf = !is_dir && ext == "pdf";
+                    let mime_type = if is_dir {
+                        None
+                    } else {
+                        media_mime_for_ext(&ext).map(|s| s.to_string())
+                    };
                     results.push(FileEntry {
                         name,
                         path: rel_path,
@@ -238,6 +281,9 @@ impl FileStore {
                         is_minilang: ext == "mini",
                         is_rust: ext == "rs",
                         is_ui: ext == "ui",
+                        is_image,
+                        is_pdf,
+                        mime_type,
                         language,
                         extension: ext,
                     });
@@ -254,10 +300,6 @@ impl FileStore {
             return Err("Cannot read a directory as a file".to_string());
         }
         let meta = fs::metadata(&abs).map_err(|e| format!("stat failed: {}", e))?;
-        if meta.len() > 10 * 1024 * 1024 {
-            return Err("File is too large to open in editor (> 10 MB)".to_string());
-        }
-        let bytes = fs::read(&abs).map_err(|e| format!("read failed: {}", e))?;
         let name = abs
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -267,6 +309,29 @@ impl FileStore {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let is_image = is_image_ext(&ext);
+        let is_pdf = ext == "pdf";
+        let mime_type = media_mime_for_ext(&ext).map(|s| s.to_string());
+
+        // For binary images/PDFs (other than editable UTF-8 SVG), return metadata directly without UTF-8 decoding
+        if (is_image && ext != "svg") || is_pdf {
+            return Ok(FileReadResult {
+                path: self.to_rel_string(&abs),
+                name,
+                extension: ext,
+                size: meta.len(),
+                content: String::new(),
+                is_binary: true,
+                is_image,
+                is_pdf,
+                mime_type,
+            });
+        }
+
+        if meta.len() > 10 * 1024 * 1024 {
+            return Err("File is too large to open in editor (> 10 MB)".to_string());
+        }
+        let bytes = fs::read(&abs).map_err(|e| format!("read failed: {}", e))?;
 
         match String::from_utf8(bytes) {
             Ok(content) => Ok(FileReadResult {
@@ -276,6 +341,9 @@ impl FileStore {
                 size: meta.len(),
                 content,
                 is_binary: false,
+                is_image,
+                is_pdf,
+                mime_type,
             }),
             Err(_) => Ok(FileReadResult {
                 path: self.to_rel_string(&abs),
@@ -284,8 +352,36 @@ impl FileStore {
                 size: meta.len(),
                 content: String::new(),
                 is_binary: true,
+                is_image,
+                is_pdf,
+                mime_type,
             }),
         }
+    }
+
+    pub fn read_raw_file(&self, rel: &str) -> Result<(String, String, Vec<u8>), String> {
+        let abs = self.resolve_existing(rel)?;
+        if abs.is_dir() {
+            return Err("Cannot serve a directory as a raw file".to_string());
+        }
+        let meta = fs::metadata(&abs).map_err(|e| format!("stat failed: {}", e))?;
+        if meta.len() > 64 * 1024 * 1024 {
+            return Err("File exceeds 64 MB preview limit".to_string());
+        }
+        let name = abs
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        let ext = abs
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let mime = media_mime_for_ext(&ext)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = fs::read(&abs).map_err(|e| format!("read failed: {}", e))?;
+        Ok((name, mime, bytes))
     }
 
     pub fn write_file(&self, rel: &str, content: &str) -> Result<String, String> {

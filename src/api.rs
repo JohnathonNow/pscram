@@ -52,6 +52,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/files", get(api_list_files))
         .route("/api/files/search", get(api_search_files))
         .route("/api/file", get(api_read_file).put(api_write_file).delete(api_delete_file))
+        .route("/api/file/raw", get(api_read_file_raw))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
         .route("/api/notebook/from-mini", post(api_notebook_from_script))
@@ -612,6 +613,43 @@ async fn api_search_files(
 #[derive(Deserialize)]
 struct PathQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct RawFileQuery {
+    path: String,
+    #[serde(default)]
+    download: Option<String>,
+}
+
+async fn api_read_file_raw(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<RawFileQuery>,
+) -> Response {
+    let is_download = matches!(
+        q.download.as_deref().map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    match st.files.read_raw_file(&q.path) {
+        Ok((name, mime, bytes)) => {
+            let safe_name = name.replace('"', "_").replace('\r', "").replace('\n', "");
+            let disp = if is_download {
+                format!("attachment; filename=\"{}\"", safe_name)
+            } else {
+                format!("inline; filename=\"{}\"", safe_name)
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CONTENT_DISPOSITION, disp),
+                    (header::CACHE_CONTROL, "no-cache".to_string()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
 }
 
 async fn api_read_file(

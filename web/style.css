@@ -1886,3 +1886,288 @@ html, body {
   font-weight: 600;
   margin-top: 4px;
 }
+
+/* Media File Icons (Images & PDFs) */
+.file-icon.image { color: var(--accent-green); }
+.file-icon.pdf { color: var(--accent-red); }
+
+/* Dedicated Image & PDF Viewer Tab */
+.media-viewer-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-app);
+  overflow: hidden;
+}
+
+.media-image-stage {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background-color: var(--bg-app);
+  background-image:
+    linear-gradient(45deg, rgba(128, 128, 128, 0.08) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(128, 128, 128, 0.08) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(128, 128, 128, 0.08) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(128, 128, 128, 0.08) 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+}
+
+.media-image-el {
+  display: block;
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg);
+  transition: transform 0.14s ease;
+  user-select: none;
+}
+
+.media-image-el.fit {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.media-pdf-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.media-pdf-frame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #1e2230;
+}
+
+/* Notebook Inline Thumbnail Previews */
+.media-thumb-card {
+  display: inline-flex;
+  flex-direction: column;
+  max-width: 360px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--bg-cell);
+  margin: 4px 8px 4px 0;
+  vertical-align: top;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.media-thumb-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.media-thumb-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 160px;
+  min-height: 90px;
+  max-height: 220px;
+  padding: 8px;
+  cursor: pointer;
+  overflow: hidden;
+  background-color: var(--bg-input);
+  background-image:
+    linear-gradient(45deg, rgba(128, 128, 128, 0.08) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(128, 128, 128, 0.08) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(128, 128, 128, 0.08) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(128, 128, 128, 0.08) 75%);
+  background-size: 14px 14px;
+  background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+}
+
+.media-thumb-img {
+  max-width: 340px;
+  max-height: 204px;
+  object-fit: contain;
+  border-radius: 4px;
+  display: block;
+}
+
+.pdf-thumb-stage {
+  position: relative;
+  width: 240px;
+  height: 280px;
+  background: #1d2130;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.pdf-thumb-frame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  pointer-events: none;
+}
+
+.pdf-thumb-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 8px;
+  background: linear-gradient(180deg, transparent 60%, rgba(10, 12, 20, 0.65) 100%);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.pdf-thumb-stage:hover .pdf-thumb-overlay,
+.media-thumb-stage:hover .pdf-thumb-overlay {
+  opacity: 1;
+}
+
+.media-thumb-pill {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(15, 17, 26, 0.85);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.media-thumb-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-toolbar);
+  font-size: 11.5px;
+}
+
+.media-thumb-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.media-thumb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-kind-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.media-kind-badge.img {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--accent-green);
+}
+
+.media-kind-badge.pdf {
+  background: rgba(248, 113, 113, 0.16);
+  color: var(--accent-red);
+}
+
+.media-thumb-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.media-thumb-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.media-thumb-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+/* Lightbox Modal */
+.media-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(9, 11, 18, 0.86);
+  backdrop-filter: blur(6px);
+}
+
+.media-lightbox-dialog {
+  width: min(92vw, 1100px);
+  height: min(90vh, 860px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+}
+
+.media-lightbox-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-topbar);
+}
+
+.media-lightbox-title {
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text-primary);
+}
+
+.media-lightbox-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 16px;
+  background: var(--bg-app);
+}
+
+.media-lightbox-body img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
+.media-lightbox-body iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 6px;
+}

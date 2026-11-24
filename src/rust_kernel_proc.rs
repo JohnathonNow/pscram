@@ -28,6 +28,11 @@ const RUST_PRELUDE_ITEMS: &[(&str, &str, &str)] = &[
     ("html", "function", "fn(&str)"),
     ("svg", "function", "fn(&str)"),
     ("markdown", "function", "fn(&str)"),
+    ("image", "function", "fn(&str)"),
+    ("image_bytes", "function", "fn(&[u8], &str)"),
+    ("pdf", "function", "fn(&str)"),
+    ("pdf_bytes", "function", "fn(&[u8])"),
+    ("preview", "function", "fn(&str)"),
     ("display", "function", "fn(&str, &str)"),
     ("Vec", "type", "std::vec::Vec"),
     ("String", "type", "std::string::String"),
@@ -676,10 +681,90 @@ mod __ml_repl {
             let _ = std::fs::write(path, content);
         }
     }
+
+    pub fn b64_encode(bytes: &[u8]) -> String {
+        const TBL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+        let mut i = 0;
+        while i < bytes.len() {
+            let b0 = bytes[i] as u32;
+            let b1 = if i + 1 < bytes.len() { bytes[i + 1] as u32 } else { 0 };
+            let b2 = if i + 2 < bytes.len() { bytes[i + 2] as u32 } else { 0 };
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TBL[((n >> 18) & 63) as usize] as char);
+            out.push(TBL[((n >> 12) & 63) as usize] as char);
+            out.push(if i + 1 < bytes.len() { TBL[((n >> 6) & 63) as usize] as char } else { '=' });
+            out.push(if i + 2 < bytes.len() { TBL[(n & 63) as usize] as char } else { '=' });
+            i += 3;
+        }
+        out
+    }
+
+    pub fn media_path(path: &str, force_kind: Option<&str>) {
+        let p = std::path::Path::new(path);
+        let canon = match std::fs::canonicalize(p) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Media file '{}' not found: {}", path, e);
+                return;
+            }
+        };
+        let ext = canon.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "bmp" => "image/bmp",
+            "ico" => "image/x-icon",
+            "avif" => "image/avif",
+            "pdf" => "application/pdf",
+            _ => if force_kind == Some("pdf") { "application/pdf" } else { "image/png" },
+        };
+        let kind = force_kind.unwrap_or(if mime == "application/pdf" { "pdf" } else { "image" });
+        let name = canon.file_name().and_then(|s| s.to_str()).unwrap_or(path);
+        let size = std::fs::metadata(&canon).map(|m| m.len()).unwrap_or(0);
+
+        if let Ok(ws_root) = std::env::var("MINILANG_WORKSPACE_ROOT") {
+            if let Ok(ws_canon) = std::fs::canonicalize(ws_root) {
+                if let Ok(rel) = canon.strip_prefix(&ws_canon) {
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    let payload = format!(
+                        "{{\"kind\":{},\"path\":{},\"mime\":{},\"name\":{},\"size\":{}}}",
+                        esc(kind), esc(&rel_str), esc(mime), esc(name), size
+                    );
+                    display("application/vnd.minilang.media+json", &payload);
+                    return;
+                }
+            }
+        }
+
+        if let Ok(bytes) = std::fs::read(&canon) {
+            if mime == "image/svg+xml" {
+                display(mime, String::from_utf8_lossy(&bytes));
+            } else {
+                display(mime, b64_encode(&bytes));
+            }
+        }
+    }
+
+    pub fn media_bytes(bytes: &[u8], mime: &str) {
+        if mime == "image/svg+xml" {
+            display(mime, String::from_utf8_lossy(bytes));
+        } else {
+            display(mime, b64_encode(bytes));
+        }
+    }
 }
 
 fn display(mime: &str, data: impl AsRef<str>) { __ml_repl::display(mime, data); }
 fn html(s: impl AsRef<str>) { __ml_repl::display("text/html", s); }
 fn svg(s: impl AsRef<str>) { __ml_repl::display("image/svg+xml", s); }
 fn markdown(s: impl AsRef<str>) { __ml_repl::display("text/markdown", s); }
+fn image(path: impl AsRef<str>) { __ml_repl::media_path(path.as_ref(), Some("image")); }
+fn image_bytes(bytes: &[u8], mime: &str) { __ml_repl::media_bytes(bytes, mime); }
+fn pdf(path: impl AsRef<str>) { __ml_repl::media_path(path.as_ref(), Some("pdf")); }
+fn pdf_bytes(bytes: &[u8]) { __ml_repl::media_bytes(bytes, "application/pdf"); }
+fn preview(path: impl AsRef<str>) { __ml_repl::media_path(path.as_ref(), None); }
 "#;

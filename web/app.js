@@ -16,9 +16,9 @@
     "call", "callcc", "calldc", "cas", "clock", "console", "copy", "count",
     "count2", "debugger", "deref", "diffused", "display", "distill", "dup",
     "exchange", "exec", "export", "finalize", "findall", "first", "first2",
-    "fold", "global", "globals", "grid", "halt", "html", "http", "import", "isconstant",
+    "fold", "global", "globals", "grid", "halt", "html", "http", "image", "import", "isconstant",
     "iterate", "key", "last", "last2", "locale", "markcc", "markdown", "max",
-    "max2", "min", "min2", "now", "null", "pair", "parallel", "print", "println",
+    "max2", "min", "min2", "now", "null", "pair", "parallel", "pdf", "preview", "print", "println",
     "prod", "raise", "range", "reduce", "reduce2", "replace", "sleep", "some",
     "store", "sum", "svg", "swap", "swapcc", "top", "top2", "trace", "ui", "unfold",
     "unique", "unique1", "unpack", "visit", "watched", "weave", "zip", "zip2"
@@ -418,6 +418,21 @@
       s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
       s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+      // Markdown image thumbnail preview: ![alt](path-or-url)
+      s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, href) => {
+        const isExt = /^https?:\/\/|^data:/i.test(href);
+        const rel = isExt ? null : resolveWorkspaceRelPath(href, activeTab()?.path || "");
+        const src = isExt ? href : rawFileUrl(rel);
+        const label = alt || (rel ? rel.split("/").pop() : href.split("/").pop()) || "Image";
+        return renderMediaThumbnailCard({ kind: "image", src, path: rel, name: label, mime: "image/*" });
+      });
+      // Markdown PDF thumbnail preview: [label](path/to/doc.pdf)
+      s = s.replace(/\[([^\]]+)\]\(([^)\s]+\.pdf)\)/gi, (_, label, href) => {
+        const isExt = /^https?:\/\//i.test(href);
+        const rel = isExt ? null : resolveWorkspaceRelPath(href, activeTab()?.path || "");
+        const src = isExt ? href : rawFileUrl(rel);
+        return renderMediaThumbnailCard({ kind: "pdf", src, path: rel, name: label || (rel ? rel.split("/").pop() : "Document.pdf"), mime: "application/pdf" });
+      });
       s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
       return s;
     };
@@ -781,7 +796,170 @@
     if (entry.is_ui) {
       return `<span class="file-icon ui"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></span>`;
     }
+    if (entry.is_image) {
+      return `<span class="file-icon image"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></span>`;
+    }
+    if (entry.is_pdf) {
+      return `<span class="file-icon pdf"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg></span>`;
+    }
     return `<span class="file-icon generic"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg></span>`;
+  }
+
+  // --- Media URL & Thumbnail Helpers ---
+  function rawFileUrl(relPath, download = false) {
+    const qs = new URLSearchParams({ path: relPath || "" });
+    if (download) qs.set("download", "1");
+    const tok = authState.required ? getStoredAccessToken() : null;
+    if (tok) qs.set("token", tok);
+    return `/api/file/raw?${qs.toString()}`;
+  }
+
+  function resolveWorkspaceRelPath(href, baseFilePath = "") {
+    if (!href) return "";
+    if (href.startsWith("/")) return href.replace(/^\/+/, "");
+    const baseDir = baseFilePath && baseFilePath.includes("/")
+      ? baseFilePath.slice(0, baseFilePath.lastIndexOf("/"))
+      : (state.currentDir || "");
+    const parts = (baseDir ? `${baseDir}/${href}` : href).split("/");
+    const norm = [];
+    for (const p of parts) {
+      if (!p || p === ".") continue;
+      if (p === "..") norm.pop();
+      else norm.push(p);
+    }
+    return norm.join("/");
+  }
+
+  function renderMediaThumbnailCard({ kind, src, path = null, name = "", mime = "", size = null }) {
+    const safeSrc = escapeHtml(src);
+    const safeName = escapeHtml(name || (path ? path.split("/").pop() : (kind === "pdf" ? "document.pdf" : "image")));
+    const safePath = path ? escapeHtml(path) : "";
+    const dlHref = path ? escapeHtml(rawFileUrl(path, true)) : safeSrc;
+    const sizeText = typeof size === "number" && size > 0 ? ` · ${formatSize(size)}` : "";
+
+    if (kind === "pdf") {
+      const thumbSrc = src.startsWith("data:") ? src : `${src}#page=1&toolbar=0&navpanes=0&scrollbar=0&view=FitH`;
+      return `
+        <div class="media-thumb-card" data-media-kind="pdf" data-media-src="${safeSrc}" data-media-path="${safePath}" data-media-name="${safeName}">
+          <div class="pdf-thumb-stage" title="Click to preview PDF">
+            <iframe class="pdf-thumb-frame" src="${escapeHtml(thumbSrc)}" tabindex="-1" loading="lazy"></iframe>
+            <div class="pdf-thumb-overlay">
+              <span class="media-thumb-pill">${path ? "Open PDF Tab" : "Expand PDF"}</span>
+            </div>
+          </div>
+          <div class="media-thumb-footer">
+            <div class="media-thumb-label">
+              <span class="media-kind-badge pdf">PDF</span>
+              <span class="media-thumb-name" title="${safePath || safeName}">${safeName}${sizeText}</span>
+            </div>
+            <div class="media-thumb-actions">
+              ${path ? `<button type="button" class="media-thumb-btn act-media-open">Open</button>` : ""}
+              <button type="button" class="media-thumb-btn act-media-expand">Expand</button>
+              <a class="media-thumb-btn" href="${dlHref}" download="${safeName}" style="text-decoration:none">&darr;</a>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    return `
+      <div class="media-thumb-card" data-media-kind="image" data-media-src="${safeSrc}" data-media-path="${safePath}" data-media-name="${safeName}">
+        <div class="media-thumb-stage" title="Click to open image">
+          <img class="media-thumb-img" src="${safeSrc}" alt="${safeName}" loading="lazy" />
+          <div class="pdf-thumb-overlay">
+            <span class="media-thumb-pill">${path ? "Open Image Tab" : "Expand Image"}</span>
+          </div>
+        </div>
+        <div class="media-thumb-footer">
+          <div class="media-thumb-label">
+            <span class="media-kind-badge img">IMG</span>
+            <span class="media-thumb-name" title="${safePath || safeName}">${safeName}${sizeText}</span>
+          </div>
+          <div class="media-thumb-actions">
+            ${path ? `<button type="button" class="media-thumb-btn act-media-open">Open</button>` : ""}
+            <button type="button" class="media-thumb-btn act-media-expand">Expand</button>
+            <a class="media-thumb-btn" href="${dlHref}" download="${safeName}" style="text-decoration:none">&darr;</a>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function openMediaLightbox({ kind, src, path = "", name = "Preview" }) {
+    const lb = document.getElementById("media-lightbox");
+    const titleEl = document.getElementById("media-lightbox-title");
+    const bodyEl = document.getElementById("media-lightbox-body");
+    const openTabBtn = document.getElementById("media-lightbox-open-tab");
+    const dlLink = document.getElementById("media-lightbox-download");
+    if (!lb || !bodyEl) return;
+
+    titleEl.textContent = path || name || "Preview";
+    dlLink.href = path ? rawFileUrl(path, true) : src;
+    dlLink.setAttribute("download", name || "download");
+
+    if (path) {
+      openTabBtn.classList.remove("hidden");
+      openTabBtn.onclick = () => {
+        closeMediaLightbox();
+        openPathInTab(path);
+      };
+    } else {
+      openTabBtn.classList.add("hidden");
+    }
+
+    bodyEl.innerHTML = "";
+    if (kind === "pdf") {
+      const iframe = document.createElement("iframe");
+      iframe.src = src;
+      iframe.title = name || "PDF Preview";
+      bodyEl.appendChild(iframe);
+    } else {
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = name || "Image Preview";
+      bodyEl.appendChild(img);
+    }
+    lb.classList.remove("hidden");
+  }
+
+  function closeMediaLightbox() {
+    const lb = document.getElementById("media-lightbox");
+    const bodyEl = document.getElementById("media-lightbox-body");
+    if (lb) lb.classList.add("hidden");
+    if (bodyEl) bodyEl.innerHTML = "";
+  }
+
+  function hydrateMediaPreviews(container) {
+    if (!container) return;
+    container.querySelectorAll(".media-thumb-card").forEach((card) => {
+      if (card.dataset.mediaBound) return;
+      card.dataset.mediaBound = "1";
+      const kind = card.dataset.mediaKind || "image";
+      const src = card.dataset.mediaSrc || "";
+      const path = card.dataset.mediaPath || "";
+      const name = card.dataset.mediaName || "Preview";
+
+      const stage = card.querySelector(".media-thumb-stage, .pdf-thumb-stage");
+      if (stage) {
+        stage.onclick = (e) => {
+          e.stopPropagation();
+          if (path) openPathInTab(path);
+          else openMediaLightbox({ kind, src, path, name });
+        };
+      }
+      const openBtn = card.querySelector(".act-media-open");
+      if (openBtn && path) {
+        openBtn.onclick = (e) => {
+          e.stopPropagation();
+          openPathInTab(path);
+        };
+      }
+      const expandBtn = card.querySelector(".act-media-expand");
+      if (expandBtn) {
+        expandBtn.onclick = (e) => {
+          e.stopPropagation();
+          openMediaLightbox({ kind, src, path, name });
+        };
+      }
+    });
   }
 
   async function loadDirectory(relPath = state.currentDir) {
@@ -975,6 +1153,27 @@
 
     try {
       const file = await api(`/api/file?path=${encodeURIComponent(relPath)}`);
+      if (file.is_image || file.is_pdf) {
+        const tab = {
+          id: uid(),
+          kind: "media",
+          mediaKind: file.is_pdf ? "pdf" : "image",
+          path: file.path,
+          title: file.name,
+          dirty: false,
+          kernelId: null,
+          extension: file.extension,
+          mimeType: file.mime_type || (file.is_pdf ? "application/pdf" : "image/png"),
+          size: file.size,
+          content: file.content || "",
+          zoom: "fit",
+          rotation: 0,
+        };
+        state.tabs.push(tab);
+        activateTab(tab.id);
+        renderFileList(state.dirEntries, !!state.searchQuery);
+        return;
+      }
       if (file.is_binary) {
         toast(`Cannot open binary file '${file.name}'`, "error");
         return;
@@ -1113,31 +1312,102 @@
     });
   }
 
+  function applyMediaImageTransform(tab) {
+    const img = document.getElementById("media-image-el");
+    const zoomLabel = document.getElementById("mtb-zoom-label");
+    if (!img || !tab) return;
+    const rot = tab.rotation || 0;
+    if (tab.zoom === "fit") {
+      img.classList.add("fit");
+      img.style.width = "";
+      img.style.height = "";
+      img.style.transform = rot ? `rotate(${rot}deg)` : "";
+      if (zoomLabel) zoomLabel.textContent = "Fit";
+    } else {
+      img.classList.remove("fit");
+      const scale = Number(tab.zoom) || 1;
+      if (img.naturalWidth > 0) {
+        img.style.width = `${Math.round(img.naturalWidth * scale)}px`;
+        img.style.height = "auto";
+      }
+      img.style.transform = rot ? `rotate(${rot}deg)` : "";
+      if (zoomLabel) zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+    }
+  }
+
   function renderActiveWorkspace() {
     const tab = activeTab();
     const nbToolbar = document.getElementById("notebook-toolbar");
     const fileToolbar = document.getElementById("file-toolbar");
+    const mediaToolbar = document.getElementById("media-toolbar");
     const nbView = document.getElementById("notebook-view");
     const fileView = document.getElementById("file-view");
+    const mediaView = document.getElementById("media-view");
 
     if (!tab) return;
 
     if (tab.kind === "notebook") {
       nbToolbar.classList.remove("hidden");
       fileToolbar.classList.add("hidden");
+      mediaToolbar.classList.add("hidden");
       nbView.classList.remove("hidden");
       fileView.classList.add("hidden");
+      mediaView.classList.add("hidden");
       const langSel = document.getElementById("tb-lang-select");
       if (langSel) langSel.value = tab.doc.language || "minilang";
       const linfo = langInfo(tab.doc.language || "minilang");
       const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
       document.getElementById("tb-export-mini").querySelector("span").textContent = `Export .${ext}`;
       renderCells();
+    } else if (tab.kind === "media") {
+      nbToolbar.classList.add("hidden");
+      fileToolbar.classList.add("hidden");
+      mediaToolbar.classList.remove("hidden");
+      nbView.classList.add("hidden");
+      fileView.classList.add("hidden");
+      mediaView.classList.remove("hidden");
+
+      const imgControls = document.getElementById("mtb-image-controls");
+      const imgStage = document.getElementById("media-image-stage");
+      const pdfStage = document.getElementById("media-pdf-stage");
+      const editSvgBtn = document.getElementById("mtb-edit-svg");
+      const metaEl = document.getElementById("mtb-meta");
+      const rawUrl = rawFileUrl(tab.path);
+
+      metaEl.textContent = `${tab.path} (${formatSize(tab.size || 0)})`;
+      editSvgBtn.classList.toggle("hidden", tab.extension !== "svg");
+
+      if (tab.mediaKind === "pdf") {
+        imgControls.classList.add("hidden");
+        imgStage.classList.add("hidden");
+        pdfStage.classList.remove("hidden");
+        const frame = document.getElementById("media-pdf-frame");
+        if (frame.dataset.loadedPath !== tab.path) {
+          frame.src = rawUrl;
+          frame.dataset.loadedPath = tab.path;
+        }
+      } else {
+        imgControls.classList.remove("hidden");
+        imgStage.classList.remove("hidden");
+        pdfStage.classList.add("hidden");
+        const img = document.getElementById("media-image-el");
+        img.onload = () => {
+          if (activeTab()?.id === tab.id) {
+            metaEl.textContent = `${tab.path} · ${img.naturalWidth} × ${img.naturalHeight} px (${formatSize(tab.size || 0)})`;
+            applyMediaImageTransform(tab);
+          }
+        };
+        img.alt = tab.title;
+        img.src = rawUrl;
+        applyMediaImageTransform(tab);
+      }
     } else {
       nbToolbar.classList.add("hidden");
       fileToolbar.classList.remove("hidden");
+      mediaToolbar.classList.add("hidden");
       nbView.classList.add("hidden");
       fileView.classList.remove("hidden");
+      mediaView.classList.add("hidden");
 
       const ta = document.getElementById("file-editor-textarea");
       ta.value = tab.content || "";
@@ -1208,7 +1478,53 @@
         let rendered = "";
         if (d.mime === "application/vnd.minilang.ui+json") {
           rendered = `<div class="mlui-mount-slot" data-ui-idx="${idx}"></div>`;
-        } else if (d.mime === "text/html" || d.mime === "image/svg+xml") {
+        } else if (d.mime === "application/vnd.minilang.media+json") {
+          try {
+            const info = JSON.parse(d.data);
+            const src = info.path ? rawFileUrl(info.path) : (info.url || "");
+            rendered = renderMediaThumbnailCard({
+              kind: info.kind === "pdf" ? "pdf" : "image",
+              src,
+              path: info.path || null,
+              name: info.name || (info.path ? info.path.split("/").pop() : "Media"),
+              mime: info.mime || "",
+              size: typeof info.size === "number" ? info.size : null,
+            });
+          } catch {
+            rendered = `<pre class="output-stdout">${escapeHtml(d.data)}</pre>`;
+          }
+        } else if (d.mime === "application/pdf") {
+          const dataUrl = d.data.startsWith("data:") ? d.data : `data:application/pdf;base64,${d.data}`;
+          rendered = renderMediaThumbnailCard({
+            kind: "pdf",
+            src: dataUrl,
+            path: null,
+            name: `document_${idx + 1}.pdf`,
+            mime: "application/pdf",
+          });
+        } else if (d.mime === "image/svg+xml") {
+          const svgTrim = (d.data || "").trim();
+          const dataUrl = svgTrim.startsWith("data:")
+            ? svgTrim
+            : `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgTrim)}`;
+          rendered = renderMediaThumbnailCard({
+            kind: "image",
+            src: dataUrl,
+            path: null,
+            name: `graphic_${idx + 1}.svg`,
+            mime: "image/svg+xml",
+          });
+        } else if (d.mime && d.mime.startsWith("image/")) {
+          const dataUrl = d.data.startsWith("data:") ? d.data : `data:${d.mime};base64,${d.data}`;
+          const ext = d.mime.split("/")[1]?.split("+")[0] || "png";
+          rendered = renderMediaThumbnailCard({
+            kind: "image",
+            src: dataUrl,
+            path: null,
+            name: `image_${idx + 1}.${ext}`,
+            mime: d.mime,
+          });
+        } else if (d.mime === "text/html") {
           rendered = `<div class="output-rich-html">${d.data}</div>`;
         } else if (d.mime === "text/markdown") {
           rendered = `<div class="md-rendered" style="padding:2px 0">${renderMarkdown(d.data)}</div>`;
@@ -1416,6 +1732,7 @@
         const mdDiv = document.createElement("div");
         mdDiv.className = "md-rendered";
         mdDiv.innerHTML = renderMarkdown(cell.source);
+        hydrateMediaPreviews(mdDiv);
         mdDiv.ondblclick = () => {
           cell._editingMd = true;
           selectCell(cell.id, false);
@@ -1435,6 +1752,7 @@
         const outNode = outWrap.firstElementChild;
         el.appendChild(outNode);
         hydrateUiDisplays(outNode, cell.output);
+        hydrateMediaPreviews(outNode);
       }
     }
 
@@ -2261,6 +2579,7 @@
       });
       outBody.innerHTML = renderOutputHtml(resp, resp.execution_count) || `<span style="color:var(--text-muted)">(no output)</span>`;
       hydrateUiDisplays(outBody, resp);
+      hydrateMediaPreviews(outBody);
     } catch (e) {
       outBody.innerHTML = `<div class="output-error">${escapeHtml(e.message)}</div>`;
     }
@@ -2458,6 +2777,76 @@
       document.body.style.cursor = "";
     });
   })();
+
+  // Media Viewer toolbar & Lightbox event handlers
+  document.getElementById("mtb-zoom-in")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media" || tab.mediaKind !== "image") return;
+    const cur = tab.zoom === "fit" ? 1 : Number(tab.zoom) || 1;
+    tab.zoom = Math.min(8, +(cur * 1.25).toFixed(2));
+    applyMediaImageTransform(tab);
+  });
+
+  document.getElementById("mtb-zoom-out")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media" || tab.mediaKind !== "image") return;
+    const cur = tab.zoom === "fit" ? 1 : Number(tab.zoom) || 1;
+    tab.zoom = Math.max(0.1, +(cur / 1.25).toFixed(2));
+    applyMediaImageTransform(tab);
+  });
+
+  document.getElementById("mtb-zoom-fit")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media") return;
+    tab.zoom = "fit";
+    applyMediaImageTransform(tab);
+  });
+
+  document.getElementById("mtb-zoom-100")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media") return;
+    tab.zoom = 1;
+    applyMediaImageTransform(tab);
+  });
+
+  document.getElementById("mtb-rotate")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media") return;
+    tab.rotation = ((tab.rotation || 0) + 90) % 360;
+    applyMediaImageTransform(tab);
+  });
+
+  document.getElementById("mtb-edit-svg")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "media" || tab.extension !== "svg") return;
+    tab.kind = "file";
+    renderActiveWorkspace();
+  });
+
+  document.getElementById("mtb-open-external")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || !tab.path) return;
+    window.open(rawFileUrl(tab.path), "_blank", "noopener");
+  });
+
+  document.getElementById("mtb-download")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || !tab.path) return;
+    const a = document.createElement("a");
+    a.href = rawFileUrl(tab.path, true);
+    a.download = tab.title;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  document.getElementById("media-lightbox-close")?.addEventListener("click", closeMediaLightbox);
+  document.getElementById("media-lightbox")?.addEventListener("click", (e) => {
+    if (e.target.id === "media-lightbox") closeMediaLightbox();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeMediaLightbox();
+  });
 
   // Auth UI event handlers
   document.getElementById("login-form")?.addEventListener("submit", async (e) => {

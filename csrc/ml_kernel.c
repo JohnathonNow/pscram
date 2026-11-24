@@ -149,6 +149,178 @@ ML_FUNCTION(MLKMarkdown) {
     return mlk_emit_display_value("text/markdown", Args[0]);
 }
 
+static void mlk_json_write_str(ml_stringbuffer_t *sb, const char *s, size_t len);
+static void mlk_write_base64(ml_stringbuffer_t *sb, const unsigned char *data, size_t len);
+
+static const char *mlk_media_mime_for_path(const char *Path) {
+    if (!Path) return NULL;
+    const char *Dot = strrchr(Path, '.');
+    if (!Dot || !Dot[1]) return NULL;
+    const char *Ext = Dot + 1;
+    if (strcasecmp(Ext, "png") == 0) return "image/png";
+    if (strcasecmp(Ext, "jpg") == 0 || strcasecmp(Ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(Ext, "gif") == 0) return "image/gif";
+    if (strcasecmp(Ext, "webp") == 0) return "image/webp";
+    if (strcasecmp(Ext, "svg") == 0) return "image/svg+xml";
+    if (strcasecmp(Ext, "bmp") == 0) return "image/bmp";
+    if (strcasecmp(Ext, "ico") == 0) return "image/x-icon";
+    if (strcasecmp(Ext, "avif") == 0) return "image/avif";
+    if (strcasecmp(Ext, "pdf") == 0) return "application/pdf";
+    return NULL;
+}
+
+static const char *mlk_detect_image_mime(const unsigned char *Data, size_t Len) {
+    if (Len >= 8 && Data[0] == 0x89 && Data[1] == 'P' && Data[2] == 'N' && Data[3] == 'G') return "image/png";
+    if (Len >= 3 && Data[0] == 0xFF && Data[1] == 0xD8 && Data[2] == 0xFF) return "image/jpeg";
+    if (Len >= 6 && memcmp(Data, "GIF8", 4) == 0) return "image/gif";
+    if (Len >= 12 && memcmp(Data, "RIFF", 4) == 0 && memcmp(Data + 8, "WEBP", 4) == 0) return "image/webp";
+    if (Len >= 2 && Data[0] == 'B' && Data[1] == 'M') return "image/bmp";
+    if (Len >= 5 && memcmp(Data, "%PDF-", 5) == 0) return "application/pdf";
+    if (Len >= 4) {
+        size_t i = 0;
+        while (i < Len && (Data[i] == ' ' || Data[i] == '\t' || Data[i] == '\r' || Data[i] == '\n')) i++;
+        if (i + 4 <= Len && (memcmp(Data + i, "<svg", 4) == 0 || memcmp(Data + i, "<?xm", 4) == 0)) {
+            return "image/svg+xml";
+        }
+    }
+    return "image/png";
+}
+
+static ml_value_t *mlk_emit_media_path(const char *Path, const char *ForceKind, const char *ExplicitMime) {
+    char Resolved[4096];
+    const char *Real = realpath(Path, Resolved);
+    if (!Real) {
+        return ml_error("FileError", "Media file '%s' not found", Path);
+    }
+    struct stat St;
+    if (stat(Real, &St) != 0 || !S_ISREG(St.st_mode)) {
+        return ml_error("FileError", "'%s' is not a regular file", Path);
+    }
+
+    const char *Mime = ExplicitMime ? ExplicitMime : mlk_media_mime_for_path(Real);
+    const char *Kind = ForceKind;
+    if (!Kind) {
+        Kind = (Mime && strcmp(Mime, "application/pdf") == 0) ? "pdf" : "image";
+    }
+    if (!Mime) {
+        Mime = (strcmp(Kind, "pdf") == 0) ? "application/pdf" : "image/png";
+    }
+
+    const char *BaseName = strrchr(Real, '/');
+    BaseName = BaseName ? (BaseName + 1) : Real;
+
+    /* If the file resides inside MINILANG_WORKSPACE_ROOT, emit a lightweight workspace media card
+     * so the frontend streams it via /api/file/raw and opens it directly in a viewer tab on click! */
+    const char *WsEnv = getenv("MINILANG_WORKSPACE_ROOT");
+    char WsCanon[4096];
+    if (WsEnv && *WsEnv && realpath(WsEnv, WsCanon)) {
+        size_t WsLen = strlen(WsCanon);
+        if (strncmp(Real, WsCanon, WsLen) == 0 && (Real[WsLen] == '/' || Real[WsLen] == '\0')) {
+            const char *Rel = (Real[WsLen] == '/') ? (Real + WsLen + 1) : "";
+            ml_stringbuffer_t Sb[1] = {ML_STRINGBUFFER_INIT};
+            ml_stringbuffer_write(Sb, "{\"kind\":", 8);
+            mlk_json_write_str(Sb, Kind, strlen(Kind));
+            ml_stringbuffer_write(Sb, ",\"path\":", 8);
+            mlk_json_write_str(Sb, Rel, strlen(Rel));
+            ml_stringbuffer_write(Sb, ",\"mime\":", 8);
+            mlk_json_write_str(Sb, Mime, strlen(Mime));
+            ml_stringbuffer_write(Sb, ",\"name\":", 8);
+            mlk_json_write_str(Sb, BaseName, strlen(BaseName));
+            ml_stringbuffer_printf(Sb, ",\"size\":%" PRId64 "}", (int64_t)St.st_size);
+            size_t Len = Sb->Length;
+            const char *Json = ml_stringbuffer_get_string(Sb);
+            if (g_display_cb) {
+                g_display_cb("application/vnd.minilang.media+json", Json ? Json : "{}", Len, g_cb_ctx);
+            }
+            return MLNil;
+        }
+    }
+
+    /* Outside workspace (e.g., /tmp/plot.png): read & base64-encode directly into display output */
+    if (St.st_size > 20 * 1024 * 1024) {
+        return ml_error("FileError", "Media file '%s' is too large to embed (> 20 MB)", Path);
+    }
+    FILE *Fp = fopen(Real, "rb");
+    if (!Fp) return ml_error("FileError", "Failed to open '%s'", Path);
+    size_t Size = (size_t)St.st_size;
+    unsigned char *Buf = (unsigned char *)malloc(Size > 0 ? Size : 1);
+    if (!Buf) { fclose(Fp); return ml_error("MemoryError", "Out of memory reading '%s'", Path); }
+    size_t N = Size > 0 ? fread(Buf, 1, Size, Fp) : 0;
+    fclose(Fp);
+
+    if (strcmp(Mime, "image/svg+xml") == 0) {
+        if (g_display_cb) g_display_cb("image/svg+xml", (const char *)Buf, N, g_cb_ctx);
+        free(Buf);
+        return MLNil;
+    }
+
+    ml_stringbuffer_t B64[1] = {ML_STRINGBUFFER_INIT};
+    mlk_write_base64(B64, Buf, N);
+    free(Buf);
+    size_t B64Len = B64->Length;
+    const char *B64Str = ml_stringbuffer_get_string(B64);
+    if (g_display_cb) {
+        g_display_cb(Mime, B64Str ? B64Str : "", B64Len, g_cb_ctx);
+    }
+    return MLNil;
+}
+
+static ml_value_t *mlk_emit_media_bytes(const unsigned char *Data, size_t Len, const char *ForceMime) {
+    const char *Mime = ForceMime ? ForceMime : mlk_detect_image_mime(Data, Len);
+    if (strcmp(Mime, "image/svg+xml") == 0) {
+        if (g_display_cb) g_display_cb("image/svg+xml", (const char *)Data, Len, g_cb_ctx);
+        return MLNil;
+    }
+    ml_stringbuffer_t B64[1] = {ML_STRINGBUFFER_INIT};
+    mlk_write_base64(B64, Data, Len);
+    size_t B64Len = B64->Length;
+    const char *B64Str = ml_stringbuffer_get_string(B64);
+    if (g_display_cb) {
+        g_display_cb(Mime, B64Str ? B64Str : "", B64Len, g_cb_ctx);
+    }
+    return MLNil;
+}
+
+ML_FUNCTION(MLKImage) {
+    ML_CHECK_ARG_COUNT(1);
+    ml_value_t *Arg = ml_deref(Args[0]);
+    const char *ExplicitMime = NULL;
+    if (Count >= 2 && ml_is(ml_deref(Args[1]), MLStringT)) {
+        ExplicitMime = ml_string_value(ml_deref(Args[1]));
+    }
+    if (ml_is(Arg, MLStringT)) {
+        return mlk_emit_media_path(ml_string_value(Arg), "image", ExplicitMime);
+    }
+    if (ml_is(Arg, MLAddressT)) {
+        return mlk_emit_media_bytes((const unsigned char *)ml_address_value(Arg), (size_t)ml_address_length(Arg), ExplicitMime);
+    }
+    return ml_error("TypeError", "image() expects a file path string or raw bytes (address)");
+}
+
+ML_FUNCTION(MLKPdf) {
+    ML_CHECK_ARG_COUNT(1);
+    ml_value_t *Arg = ml_deref(Args[0]);
+    if (ml_is(Arg, MLStringT)) {
+        return mlk_emit_media_path(ml_string_value(Arg), "pdf", "application/pdf");
+    }
+    if (ml_is(Arg, MLAddressT)) {
+        return mlk_emit_media_bytes((const unsigned char *)ml_address_value(Arg), (size_t)ml_address_length(Arg), "application/pdf");
+    }
+    return ml_error("TypeError", "pdf() expects a file path string or raw bytes (address)");
+}
+
+ML_FUNCTION(MLKPreview) {
+    ML_CHECK_ARG_COUNT(1);
+    ml_value_t *Arg = ml_deref(Args[0]);
+    if (ml_is(Arg, MLStringT)) {
+        return mlk_emit_media_path(ml_string_value(Arg), NULL, NULL);
+    }
+    if (ml_is(Arg, MLAddressT)) {
+        return mlk_emit_media_bytes((const unsigned char *)ml_address_value(Arg), (size_t)ml_address_length(Arg), NULL);
+    }
+    return ml_error("TypeError", "preview() expects a file path string or raw bytes (address)");
+}
+
 ML_FUNCTION(MLKDisplay) {
     ML_CHECK_ARG_COUNT(2);
     ML_CHECK_ARG_TYPE(0, MLStringT);
@@ -307,6 +479,9 @@ void mlk_init(const char *exec_name) {
     stringmap_insert(MLGlobals, "html", MLKHtml);
     stringmap_insert(MLGlobals, "svg", MLKSvg);
     stringmap_insert(MLGlobals, "markdown", MLKMarkdown);
+    stringmap_insert(MLGlobals, "image", MLKImage);
+    stringmap_insert(MLGlobals, "pdf", MLKPdf);
+    stringmap_insert(MLGlobals, "preview", MLKPreview);
     stringmap_insert(MLGlobals, "display", MLKDisplay);
     stringmap_insert(MLGlobals, "locale", MLKLocale);
     stringmap_insert(MLGlobals, "halt", MLKHalt);
@@ -374,6 +549,9 @@ void mlk_init(const char *exec_name) {
     ml_externals_default_add("html", MLKHtml);
     ml_externals_default_add("svg", MLKSvg);
     ml_externals_default_add("markdown", MLKMarkdown);
+    ml_externals_default_add("image", MLKImage);
+    ml_externals_default_add("pdf", MLKPdf);
+    ml_externals_default_add("preview", MLKPreview);
     ml_externals_default_add("json", MLJsonT);
     ml_externals_default_add("time", MLTimeT);
     ml_externals_default_add("uuid", MLUUIDT);
