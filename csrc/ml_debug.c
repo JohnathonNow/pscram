@@ -209,6 +209,14 @@ void ml_dbg_init(const char *exec_name, const char *ws_root) {
     ml_context_set_static(g_dbg_ctx, ML_DEBUGGER_INDEX, &g_debugger);
 }
 
+void ml_dbg_define_global(const char *name, void *val) {
+    if (!name || !*name) return;
+    size_t n = strlen(name);
+    char *copy = snew(n + 1);
+    memcpy(copy, name, n + 1);
+    stringmap_insert(MLGlobals, copy, (ml_value_t *)val);
+}
+
 void ml_dbg_set_breakpoints(const char *source, const int *lines, size_t count) {
     char norm[4096];
     dbg_normalize_source(source, norm, sizeof(norm));

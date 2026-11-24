@@ -28,6 +28,7 @@ typedef void (*mld_local_cb)(const char *name, const char *type_name, const char
 #define ML_DBG_ACTION_STEP_OUT  3
 
 void ml_dbg_init(const char *exec_name, const char *ws_root);
+void ml_dbg_define_global(const char *name, void *val);
 void ml_dbg_set_breakpoints(const char *source, const int *lines, size_t count);
 void ml_dbg_clear_all_breakpoints(void);
 void ml_dbg_set_break_on_error(int enabled);

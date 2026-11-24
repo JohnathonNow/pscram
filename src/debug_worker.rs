@@ -1,4 +1,5 @@
-use crate::kernel_proc::{DisplayItem, EvalError, EvalValue};
+use crate::kernel_proc::{bind_minilang_params, DisplayItem, EvalError, EvalValue};
+use crate::tagged::TaggedValue;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -26,6 +27,7 @@ extern "C" {
     fn mlk_add_library_path(path: *const c_char);
 
     fn ml_dbg_init(exec_name: *const c_char, ws_root: *const c_char);
+    fn ml_dbg_define_global(name: *const c_char, val: *mut c_void);
     fn ml_dbg_set_breakpoints(source: *const c_char, lines: *const c_int, count: usize);
     fn ml_dbg_clear_all_breakpoints();
     fn ml_dbg_set_break_on_error(enabled: c_int);
@@ -116,6 +118,8 @@ pub enum DebugWorkerRequest {
         stop_on_entry: bool,
         #[serde(default)]
         break_on_error: bool,
+        #[serde(default)]
+        params: BTreeMap<String, TaggedValue>,
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
@@ -552,6 +556,7 @@ pub fn run_debug_worker_process() -> io::Result<()> {
                 breakpoints,
                 stop_on_entry,
                 break_on_error,
+                params,
                 env,
             } => {
                 for (k, v) in env {
@@ -565,6 +570,27 @@ pub fn run_debug_worker_process() -> io::Result<()> {
                             }
                         }
                     }
+                }
+                if let Err(msg) = bind_minilang_params(&params, ml_dbg_define_global) {
+                    let resp = DebugWorkerResponse::State {
+                        status: "error".to_string(),
+                        reason: Some("error".to_string()),
+                        source: Some(source),
+                        line: None,
+                        frames: Vec::new(),
+                        locals: Vec::new(),
+                        stdout_chunk: String::new(),
+                        displays: Vec::new(),
+                        result: None,
+                        error: Some(EvalError {
+                            error_type: "ParameterError".to_string(),
+                            message: msg,
+                            traceback: String::new(),
+                        }),
+                    };
+                    writeln!(out, "{}", serde_json::to_string(&resp).unwrap())?;
+                    out.flush()?;
+                    continue;
                 }
                 unsafe {
                     ml_dbg_clear_all_breakpoints();

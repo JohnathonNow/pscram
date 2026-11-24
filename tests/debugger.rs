@@ -314,10 +314,90 @@ fn test_debug_imported_module_terminate_and_ui_assets() {
     let list_after = srv.get("/api/debug/sessions").json();
     assert_eq!(list_after["active"], 0);
 
-    // Verify UI assets expose debugger drawer & controls
+    // Verify UI assets expose debugger drawer & controls + Params editors
     let html = srv.get("/").text();
     assert!(html.contains("id=\"debug-drawer\""));
     assert!(html.contains("id=\"btn-toggle-debug\""));
     assert!(html.contains("id=\"ftb-debug\""));
+    assert!(html.contains("id=\"ftb-params\""));
+    assert!(html.contains("id=\"file-params-panel\""));
+    assert!(html.contains("id=\"dbg-params-textarea\""));
     assert!(html.contains("id=\"dbg-eval-form\""));
+}
+
+#[test]
+fn test_run_and_debug_with_params() {
+    let srv = TestServer::start(&[]);
+
+    let script = [
+        "let who := Params[\"name\"] or \"world\"",
+        "let n := repeat or 1",
+        "var msg := who",
+        "for i in 1 .. n do msg := msg + \"!\" end",
+        "println(msg)",
+        "msg",
+    ]
+    .join("\n");
+    write_ws_file(&srv, "scripts/param_test.mini", &script);
+
+    // 1. Run via POST /api/kernels/:id/execute with plain + tagged JSON Params
+    srv.create_kernel("param-run-k", "minilang");
+    let run_resp = srv.post_json(
+        "/api/kernels/param-run-k/execute",
+        &json!({
+            "code": script,
+            "source": "param_test.mini",
+            "language": "minilang",
+            "params": {
+                "name": "Ada",
+                "repeat": { "type": "integer", "value": 3 }
+            }
+        }),
+    );
+    assert_eq!(run_resp.status, 200, "execute with params failed: {}", run_resp.text());
+    let run_body = run_resp.json();
+    assert!(run_body["error"].is_null(), "unexpected error: {:?}", run_body["error"]);
+    assert!(run_body["stdout"].as_str().unwrap_or("").contains("Ada!!!"));
+
+    // 2. Debug via POST /api/debug/start with Params, inspect locals + eval Params at breakpoint
+    let dbg_resp = srv.post_json(
+        "/api/debug/start",
+        &json!({
+            "path": "scripts/param_test.mini",
+            "params": {
+                "name": "Grace",
+                "repeat": 2
+            },
+            "breakpoints": { "scripts/param_test.mini": [5] },
+            "stop_on_entry": false,
+            "break_on_error": true
+        }),
+    );
+    assert_eq!(dbg_resp.status, 200, "debug start with params failed: {}", dbg_resp.text());
+    let sess = &dbg_resp.json()["session"];
+    let id = sess["id"].as_str().unwrap().to_string();
+    assert_eq!(sess["status"], "paused");
+    assert_eq!(sess["current_line"], 5);
+
+    let locals = sess["locals"].as_array().unwrap();
+    assert_eq!(find_local(locals, "who").unwrap()["value"], "Grace");
+    assert_eq!(find_local(locals, "msg").unwrap()["value"], "Grace!!");
+
+    // Debug Console can also inspect Params directly
+    let ev = srv
+        .post_json(
+            &format!("/api/debug/{}/eval", id),
+            &json!({ "expr": "Params[\"name\"]", "depth": 0 }),
+        )
+        .json();
+    assert_eq!(ev["ok"], true);
+    assert_eq!(ev["result"]["repr"], "Grace");
+
+    // Continue to completion
+    let fin = srv
+        .post_json(&format!("/api/debug/{}/step", id), &json!({ "action": "continue" }))
+        .json();
+    assert_eq!(fin["session"]["status"], "completed");
+    assert_eq!(fin["session"]["result"]["repr"], "Grace!!");
+    assert!(fin["session"]["stdout"].as_str().unwrap().contains("Grace!!"));
 }

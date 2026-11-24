@@ -304,6 +304,21 @@
               </svg>
               <span>Debug</span>
             </button>
+            <button id="ftb-params" class="tb-btn hidden" title="Configure Params passed to Run &amp; Debug">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="4" y1="21" x2="4" y2="14"/>
+                <line x1="4" y1="10" x2="4" y2="3"/>
+                <line x1="12" y1="21" x2="12" y2="12"/>
+                <line x1="12" y1="8" x2="12" y2="3"/>
+                <line x1="20" y1="21" x2="20" y2="16"/>
+                <line x1="20" y1="12" x2="20" y2="3"/>
+                <line x1="1" y1="14" x2="7" y2="14"/>
+                <line x1="9" y1="8" x2="15" y2="8"/>
+                <line x1="17" y1="16" x2="23" y2="16"/>
+              </svg>
+              <span>Params</span>
+              <span id="ftb-params-badge" class="params-count-badge hidden">0</span>
+            </button>
             <button id="ftb-invoke-mini" class="tb-btn" title="Invoke via POST /invoke with tagged JSON parameters">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
@@ -412,6 +427,22 @@
 
         <!-- Text File Viewer/Editor -->
         <div id="file-view" class="file-editor-pane hidden">
+          <div id="file-params-panel" class="file-params-panel hidden">
+            <div class="file-params-header">
+              <div class="toolbar-group">
+                <strong>Params (JSON)</strong>
+                <span id="file-params-status" class="tb-meta">Bound as <code>Params</code> map &amp; top-level identifiers for Run &amp; Debug</span>
+              </div>
+              <div class="toolbar-group">
+                <button id="btn-file-params-detect" type="button" class="tb-btn" style="height:22px;font-size:11px;padding:0 8px" title="Scan script for Params[...] keys">Detect</button>
+                <button id="btn-file-params-run" type="button" class="tb-btn primary" style="height:22px;font-size:11px;padding:0 8px">Run</button>
+                <button id="btn-file-params-debug" type="button" class="tb-btn" style="height:22px;font-size:11px;padding:0 8px">Debug</button>
+                <button id="btn-file-params-clear" type="button" class="tb-btn" style="height:22px;font-size:11px;padding:0 8px">Clear</button>
+                <button id="btn-file-params-close" type="button" class="icon-btn sm" title="Hide Params">&times;</button>
+              </div>
+            </div>
+            <textarea id="file-params-textarea" class="file-params-textarea" rows="3" spellcheck="false" placeholder='Plain or tagged JSON object, e.g. {"name": "Ada", "repeat": 3}'></textarea>
+          </div>
           <div id="file-editor-shell" class="file-editor-shell">
             <div id="file-editor-gutter" class="file-editor-gutter" aria-hidden="true"></div>
             <div class="file-editor-surface">
@@ -576,6 +607,16 @@
           <label class="dbg-check"><input id="dbg-opt-stop-entry" type="checkbox" checked /><span>Stop on entry</span></label>
           <label class="dbg-check"><input id="dbg-opt-break-error" type="checkbox" checked /><span>Break on error</span></label>
         </div>
+        <details id="dbg-params-details" class="dbg-params-details">
+          <summary class="dbg-params-summary">
+            <span>Params (JSON)</span>
+            <span id="dbg-params-badge" class="params-count-badge hidden">0</span>
+          </summary>
+          <div class="dbg-params-body">
+            <textarea id="dbg-params-textarea" class="dbg-params-textarea" rows="3" spellcheck="false" placeholder='e.g. {"name": "Ada", "repeat": 3}'></textarea>
+            <div id="dbg-params-status" class="dbg-params-status"></div>
+          </div>
+        </details>
         <div id="dbg-loc-banner" class="dbg-loc-banner hidden"></div>
         <div class="dbg-body">
           <section class="dbg-section">

@@ -2195,10 +2195,16 @@
       document.getElementById("ftb-run-mini").classList.toggle("hidden", !(isScript || isUi));
       document.getElementById("ftb-run-mini").querySelector("span").textContent =
         isUi ? "Preview UI" : (fileLang ? `Run in ${fileLang.name}` : "Run");
+      const isMiniScript = !!(isScript && fileLang && fileLang.id === "minilang");
       const ftbDebug = document.getElementById("ftb-debug");
       if (ftbDebug) {
-        ftbDebug.classList.toggle("hidden", !(isScript && fileLang && fileLang.id === "minilang"));
+        ftbDebug.classList.toggle("hidden", !isMiniScript);
       }
+      const ftbParams = document.getElementById("ftb-params");
+      if (ftbParams) {
+        ftbParams.classList.toggle("hidden", !(isMiniScript || isUi));
+      }
+      syncFileParamsPanelForTab(tab);
       document.getElementById("ftb-invoke-mini").classList.toggle("hidden", !isScript);
       document.getElementById("ftb-launch-ui").classList.toggle("hidden", !(isUi || (fileLang && fileLang.supports_ui)));
       document.getElementById("ftb-open-as-nb").classList.toggle("hidden", !isScript);
@@ -3533,6 +3539,16 @@
     const outPane = document.getElementById("file-run-output");
     const outBody = document.getElementById("file-run-output-body");
     const fileLang = tab.extension === "ui" ? langInfo("minilang") : (langByExtension(tab.extension) || langInfo("minilang"));
+    let runParams = undefined;
+    if (fileLang.id === "minilang") {
+      const parsed = parseRunParamsJson(tab._paramsText || "");
+      if (!parsed.ok) {
+        toast(`Invalid Params JSON: ${parsed.error}`, "error");
+        openFileParamsPanel(tab, true);
+        return;
+      }
+      runParams = parsed.params || {};
+    }
     outPane.classList.remove("hidden");
     outBody.innerHTML = `<span style="color:var(--text-muted)">Running ${escapeHtml(tab.title)} (${escapeHtml(fileLang.name)})...</span>`;
     try {
@@ -3540,9 +3556,11 @@
       const dir = tab.path && tab.path.includes("/") ? tab.path.slice(0, tab.path.lastIndexOf("/")) : "";
       await ensureKernel(kId, dir, fileLang.id);
       await api(`/api/kernels/${encodeURIComponent(kId)}/restart`, { method: "POST" });
+      const reqBody = { code: tab.content, source: tab.title, language: fileLang.id };
+      if (runParams !== undefined) reqBody.params = runParams;
       const resp = await api(`/api/kernels/${encodeURIComponent(kId)}/execute`, {
         method: "POST",
-        body: JSON.stringify({ code: tab.content, source: tab.title, language: fileLang.id }),
+        body: JSON.stringify(reqBody),
       });
       tab._lastRunOutput = resp;
       outBody.innerHTML = renderOutputHtml(resp, resp.execution_count) || `<span style="color:var(--text-muted)">(no output)</span>`;
@@ -5511,6 +5529,13 @@
       } catch { /* ignore */ }
     }
     openDebugDrawer(true);
+    const parsedParams = parseRunParamsJson(getActiveRunParamsText());
+    if (!parsedParams.ok) {
+      toast(`Invalid Params JSON: ${parsedParams.error}`, "error");
+      const det = document.getElementById("dbg-params-details");
+      if (det) det.open = true;
+      return;
+    }
     debugState.busy = true;
     debugState.evalHistory = [];
     const stopOnEntry = document.getElementById("dbg-opt-stop-entry")?.checked ?? true;
@@ -5520,6 +5545,7 @@
         method: "POST",
         body: JSON.stringify({
           ...payload,
+          params: parsedParams.params || {},
           breakpoints: debugState.breakpoints,
           stop_on_entry: stopOnEntry,
           break_on_error: breakOnError,
@@ -5963,6 +5989,171 @@
       if (e.shiftKey) debugStep("step_out");
       else debugStep("step_in");
     }
+  });
+
+  // =====================================================================
+  // Run & Debug Params Helpers (Shared between Run in Minilang & Debugger)
+  // =====================================================================
+  function parseRunParamsJson(rawText) {
+    const trimmed = (rawText || "").trim();
+    if (!trimmed) return { ok: true, params: {}, count: 0 };
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, error: "Params must be a JSON object (e.g. {\"name\": \"Ada\"})", count: 0 };
+      }
+      // If user pasted a full /invoke wrapper `{"params": {...}}`, unwrap automatically
+      const keys = Object.keys(parsed);
+      if (
+        keys.length === 1 &&
+        keys[0] === "params" &&
+        parsed.params &&
+        typeof parsed.params === "object" &&
+        !Array.isArray(parsed.params)
+      ) {
+        return { ok: true, params: parsed.params, count: Object.keys(parsed.params).length };
+      }
+      return { ok: true, params: parsed, count: keys.length };
+    } catch (e) {
+      return { ok: false, error: e.message, count: 0 };
+    }
+  }
+
+  function detectParamsTemplateFromCode(code) {
+    const found = {};
+    const re = /\bParams\s*\[\s*["']([^"']+)["']\s*\]/g;
+    let m;
+    while ((m = re.exec(code || "")) !== null) {
+      if (!(m[1] in found)) found[m[1]] = "";
+    }
+    return found;
+  }
+
+  function getActiveRunParamsText() {
+    const tab = activeTab();
+    if (tab && tab.kind === "file") {
+      return tab._paramsText || "";
+    }
+    const dbgTa = document.getElementById("dbg-params-textarea");
+    return dbgTa ? dbgTa.value : "";
+  }
+
+  function updateParamsBadgesAndStatus(rawText) {
+    const parsed = parseRunParamsJson(rawText);
+    const ftbBadge = document.getElementById("ftb-params-badge");
+    const dbgBadge = document.getElementById("dbg-params-badge");
+    const fileTa = document.getElementById("file-params-textarea");
+    const dbgTa = document.getElementById("dbg-params-textarea");
+    const fileStatus = document.getElementById("file-params-status");
+    const dbgStatus = document.getElementById("dbg-params-status");
+
+    if (fileTa) fileTa.classList.toggle("is-invalid", !parsed.ok);
+    if (dbgTa) dbgTa.classList.toggle("is-invalid", !parsed.ok);
+
+    if (ftbBadge) {
+      ftbBadge.textContent = parsed.ok ? String(parsed.count) : "!";
+      ftbBadge.classList.toggle("hidden", parsed.ok && parsed.count === 0);
+    }
+    if (dbgBadge) {
+      dbgBadge.textContent = parsed.ok ? String(parsed.count) : "!";
+      dbgBadge.classList.toggle("hidden", parsed.ok && parsed.count === 0);
+    }
+    if (fileStatus) {
+      if (!parsed.ok) {
+        fileStatus.textContent = `Invalid JSON: ${parsed.error}`;
+        fileStatus.style.color = "var(--accent-red)";
+      } else if (parsed.count > 0) {
+        fileStatus.textContent = `${parsed.count} parameter${parsed.count === 1 ? "" : "s"} active for Run & Debug`;
+        fileStatus.style.color = "";
+      } else {
+        fileStatus.innerHTML = "Bound as <code>Params</code> map &amp; top-level identifiers for Run &amp; Debug";
+        fileStatus.style.color = "";
+      }
+    }
+    if (dbgStatus) {
+      dbgStatus.classList.toggle("is-err", !parsed.ok);
+      dbgStatus.textContent = !parsed.ok
+        ? `Invalid JSON: ${parsed.error}`
+        : parsed.count > 0
+          ? `${parsed.count} parameter${parsed.count === 1 ? "" : "s"} will be bound on Start`
+          : "Plain or tagged JSON object (bound as Params + identifiers)";
+    }
+  }
+
+  function syncFileParamsPanelForTab(tab) {
+    const panel = document.getElementById("file-params-panel");
+    const fileTa = document.getElementById("file-params-textarea");
+    const dbgTa = document.getElementById("dbg-params-textarea");
+    const btn = document.getElementById("ftb-params");
+    const txt = (tab && tab._paramsText) || "";
+    if (panel) panel.classList.toggle("hidden", !(tab && tab._paramsOpen));
+    if (btn) btn.classList.toggle("active", !!(tab && tab._paramsOpen));
+    if (fileTa && fileTa.value !== txt) fileTa.value = txt;
+    if (dbgTa && dbgTa.value !== txt) dbgTa.value = txt;
+    updateParamsBadgesAndStatus(txt);
+  }
+
+  function openFileParamsPanel(tab, open) {
+    if (!tab || tab.kind !== "file") return;
+    tab._paramsOpen = open;
+    if (open && !tab._paramsText) {
+      const detected = detectParamsTemplateFromCode(tab.content || "");
+      if (Object.keys(detected).length > 0) {
+        tab._paramsText = JSON.stringify(detected, null, 2);
+      }
+    }
+    syncFileParamsPanelForTab(tab);
+    if (open) document.getElementById("file-params-textarea")?.focus();
+  }
+
+  function setRunParamsText(nextText) {
+    const tab = activeTab();
+    if (tab && tab.kind === "file") {
+      tab._paramsText = nextText;
+    }
+    const fileTa = document.getElementById("file-params-textarea");
+    const dbgTa = document.getElementById("dbg-params-textarea");
+    if (fileTa && fileTa.value !== nextText) fileTa.value = nextText;
+    if (dbgTa && dbgTa.value !== nextText) dbgTa.value = nextText;
+    updateParamsBadgesAndStatus(nextText);
+  }
+
+  document.getElementById("ftb-params")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "file") return;
+    openFileParamsPanel(tab, !tab._paramsOpen);
+  });
+  document.getElementById("btn-file-params-close")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab && tab.kind === "file") openFileParamsPanel(tab, false);
+  });
+  document.getElementById("btn-file-params-clear")?.addEventListener("click", () => {
+    setRunParamsText("");
+  });
+  document.getElementById("btn-file-params-detect")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "file") return;
+    const detected = detectParamsTemplateFromCode(tab.content || "");
+    const keys = Object.keys(detected);
+    if (!keys.length) {
+      toast('No Params["..."] references found in script', "info");
+      if (!tab._paramsText) setRunParamsText("{\n  \n}");
+      return;
+    }
+    setRunParamsText(JSON.stringify(detected, null, 2));
+    toast(`Detected ${keys.length} param key${keys.length === 1 ? "" : "s"}: ${keys.join(", ")}`, "success");
+  });
+  document.getElementById("btn-file-params-run")?.addEventListener("click", () => {
+    document.getElementById("ftb-run-mini")?.click();
+  });
+  document.getElementById("btn-file-params-debug")?.addEventListener("click", () => {
+    document.getElementById("ftb-debug")?.click();
+  });
+  document.getElementById("file-params-textarea")?.addEventListener("input", (e) => {
+    setRunParamsText(e.target.value);
+  });
+  document.getElementById("dbg-params-textarea")?.addEventListener("input", (e) => {
+    setRunParamsText(e.target.value);
   });
 
   // --- Initialization ---

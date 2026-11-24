@@ -3791,3 +3791,96 @@ html[data-theme="light"] .sidebar-dropzone {
   color: #22c55e;
   margin-top: 4px;
 }
+
+/* --- Run & Debug Params Editor --- */
+.params-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #0b1020;
+  margin-left: 3px;
+}
+
+.file-params-panel {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.file-params-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.file-params-textarea,
+.dbg-params-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 6px 8px;
+  resize: vertical;
+  outline: none;
+}
+
+.file-params-textarea:focus,
+.dbg-params-textarea:focus {
+  border-color: var(--accent);
+}
+
+.file-params-textarea.is-invalid,
+.dbg-params-textarea.is-invalid {
+  border-color: var(--accent-red);
+}
+
+.dbg-params-details {
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+.dbg-params-summary {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+.dbg-params-summary:hover {
+  color: var(--text-primary);
+}
+
+.dbg-params-body {
+  padding: 0 10px 8px;
+}
+
+.dbg-params-status {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.dbg-params-status.is-err {
+  color: var(--accent-red);
+}

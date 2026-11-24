@@ -1,7 +1,9 @@
 use crate::debug_worker::{DebugFrame, DebugLocal, DebugWorkerRequest, DebugWorkerResponse};
 use crate::files::FileStore;
+use crate::jobs::json_to_tagged_value;
 use crate::kernel_proc::{DisplayItem, EvalError, EvalValue};
 use crate::secrets::SecretsVault;
+use crate::tagged::TaggedValue;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,6 +31,8 @@ pub struct StartDebugRequest {
     pub stop_on_entry: bool,
     #[serde(default)]
     pub break_on_error: bool,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -280,6 +284,18 @@ impl DebugManager {
 
         self.sessions.lock().await.insert(id.clone(), session.clone());
 
+        let mut parsed_params: BTreeMap<String, TaggedValue> = BTreeMap::new();
+        if let Some(raw_params) = req.params {
+            if !raw_params.is_null() {
+                let obj = raw_params
+                    .as_object()
+                    .ok_or_else(|| "'params' must be a JSON object".to_string())?;
+                for (k, v) in obj {
+                    parsed_params.insert(k.clone(), json_to_tagged_value(v));
+                }
+            }
+        }
+
         let env_vars: BTreeMap<String, String> = self.secrets.env_map();
 
         let start_req = DebugWorkerRequest::Start {
@@ -289,6 +305,7 @@ impl DebugManager {
             breakpoints: req.breakpoints,
             stop_on_entry: req.stop_on_entry,
             break_on_error: req.break_on_error,
+            params: parsed_params,
             env: env_vars,
         };
 

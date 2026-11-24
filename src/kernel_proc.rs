@@ -73,6 +73,8 @@ pub enum KernelRequest {
     Eval {
         code: String,
         source: Option<String>,
+        #[serde(default)]
+        params: Option<BTreeMap<String, TaggedValue>>,
     },
     EvalStream {
         code: String,
@@ -473,6 +475,34 @@ fn capture_last_tagged_json() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "type": "nil" }))
 }
 
+/// Bind `Params` (map), `Args` (empty list), and each valid-identifier parameter key
+/// using the supplied C binder (`mlk_define` for kernels or `ml_dbg_define_global` for debugger).
+pub fn bind_minilang_params(
+    params: &BTreeMap<String, TaggedValue>,
+    define_fn: unsafe extern "C" fn(*const c_char, *mut c_void),
+) -> Result<(), String> {
+    let params_map = unsafe { mlk_val_map_new() };
+    for (k, v) in params {
+        let ml_val = tagged_to_ml(v).map_err(|msg| format!("Parameter '{}': {}", k, msg))?;
+        unsafe {
+            let mk = mlk_val_string(k.as_ptr() as *const c_char, k.len());
+            mlk_val_map_insert(params_map, mk, ml_val);
+            if is_valid_ml_ident(k) {
+                let cname = CString::new(k.as_str()).unwrap();
+                define_fn(cname.as_ptr(), ml_val);
+            }
+        }
+    }
+    let args_list = unsafe { mlk_val_list_new() };
+    unsafe {
+        let c_params = CString::new("Params").unwrap();
+        let c_args = CString::new("Args").unwrap();
+        define_fn(c_params.as_ptr(), params_map);
+        define_fn(c_args.as_ptr(), args_list);
+    }
+    Ok(())
+}
+
 fn handle_invoke(
     code: String,
     source: String,
@@ -716,9 +746,31 @@ pub fn run_kernel_process() -> io::Result<()> {
                     message: "environment updated".to_string(),
                 }
             }
-            Ok(KernelRequest::Eval { code, source }) => {
+            Ok(KernelRequest::Eval { code, source, params }) => {
                 exec_count += 1;
                 let source_str = source.unwrap_or_else(|| format!("In[{}]", exec_count));
+                let start = Instant::now();
+
+                if let Some(ref param_map) = params {
+                    if let Err(msg) = bind_minilang_params(param_map, mlk_define) {
+                        let resp = KernelResponse::EvalResult {
+                            execution_count: exec_count,
+                            stdout: String::new(),
+                            displays: Vec::new(),
+                            results: Vec::new(),
+                            error: Some(EvalError {
+                                error_type: "ParameterError".to_string(),
+                                message: msg,
+                                traceback: String::new(),
+                            }),
+                            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        };
+                        writeln!(out, "{}", serde_json::to_string(&resp).unwrap())?;
+                        out.flush()?;
+                        continue;
+                    }
+                }
+
                 let c_source = CString::new(source_str.replace('\0', "")).unwrap();
                 let c_code = CString::new(code.replace('\0', "")).unwrap();
 
@@ -730,7 +782,6 @@ pub fn run_kernel_process() -> io::Result<()> {
                     stream: None,
                 };
 
-                let start = Instant::now();
                 unsafe {
                     mlk_eval(
                         c_source.as_ptr(),

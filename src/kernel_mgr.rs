@@ -192,11 +192,22 @@ impl KernelSession {
         }
     }
 
-    pub async fn execute(&self, code: String, source: Option<String>) -> Result<KernelResponse, String> {
+    pub async fn execute_with_params(
+        &self,
+        code: String,
+        source: Option<String>,
+        params: Option<BTreeMap<String, TaggedValue>>,
+    ) -> Result<KernelResponse, String> {
         if !self.alive.load(Ordering::SeqCst) {
             self.start_process().await?;
         }
-        let resp = self.send_request(&KernelRequest::Eval { code, source }).await?;
+        let resp = self
+            .send_request(&KernelRequest::Eval {
+                code,
+                source,
+                params,
+            })
+            .await?;
         if !self.alive.load(Ordering::SeqCst) {
             let _ = self.start_process().await;
         }

@@ -973,6 +973,8 @@ struct ExecuteBody {
     code: String,
     source: Option<String>,
     language: Option<String>,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
 }
 
 async fn api_kernel_execute(
@@ -980,6 +982,19 @@ async fn api_kernel_execute(
     Path(id): Path<String>,
     Json(body): Json<ExecuteBody>,
 ) -> Response {
+    let parsed_params = match body.params {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(map)) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                out.insert(k, crate::jobs::json_to_tagged_value(&v));
+            }
+            Some(out)
+        }
+        Some(_) => {
+            return api_err(StatusCode::BAD_REQUEST, "'params' must be a JSON object");
+        }
+    };
     let session = match st
         .kernels
         .get_or_create(Some(id), body.language.as_deref(), None)
@@ -988,7 +1003,10 @@ async fn api_kernel_execute(
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    match session.execute(body.code, body.source).await {
+    match session
+        .execute_with_params(body.code, body.source, parsed_params)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
