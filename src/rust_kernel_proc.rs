@@ -1,8 +1,10 @@
 use crate::kernel_proc::{
     CompletionItem, EvalError, EvalValue, KernelRequest, KernelResponse, VarInfo,
 };
-use crate::lang::rust_lang::{read_displays_file, split_rust_source};
-use std::collections::HashSet;
+use crate::lang::rust_lang::{
+    build_cargo_project_sync, extract_rust_dependencies, read_displays_file, split_rust_source,
+};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -43,11 +45,16 @@ const RUST_PRELUDE_ITEMS: &[(&str, &str, &str)] = &[
 
 struct RustReplState {
     session_dir: PathBuf,
+    crate_pkg_name: String,
     items: Vec<String>,
     /// Prior committed cell bodies (executed with stdout suppressed when replaying)
     past_statements: Vec<String>,
     /// Tracked variable names (`let [mut] <ident>`) for the Variable Inspector
     tracked_vars: Vec<String>,
+    /// Accumulated Cargo dependencies (`:dep ...`, `---cargo`, `//! ```cargo`)
+    dependencies: BTreeMap<String, String>,
+    /// Cached Cargo.toml contents so mtime stays untouched when deps don't change
+    last_cargo_toml: String,
     /// Last inspected variable snapshot (updated automatically after each successful cell!)
     last_vars: Vec<VarInfo>,
     exec_count: u64,
@@ -55,13 +62,18 @@ struct RustReplState {
 
 impl RustReplState {
     fn new() -> io::Result<Self> {
-        let dir = std::env::temp_dir().join(format!("mlnb-rust-repl-{}", uuid::Uuid::new_v4()));
+        let id = uuid::Uuid::new_v4().to_string();
+        let short = id.split('-').next().unwrap_or("session");
+        let dir = std::env::temp_dir().join(format!("mlnb-rust-repl-{}", id));
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
             session_dir: dir,
+            crate_pkg_name: format!("mlnb_repl_{}", short),
             items: Vec::new(),
             past_statements: Vec::new(),
             tracked_vars: Vec::new(),
+            dependencies: BTreeMap::new(),
+            last_cargo_toml: String::new(),
             last_vars: Vec::new(),
             exec_count: 0,
         })
@@ -70,12 +82,39 @@ impl RustReplState {
     fn eval_cell(&mut self, code: &str) -> KernelResponse {
         self.exec_count += 1;
         let start = Instant::now();
-        let split = split_rust_source(code);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let extracted = extract_rust_dependencies(code, &cwd);
+        let split = split_rust_source(&extracted.code);
 
-        if split.items.is_empty() && split.statements.is_empty() && split.trailing_expr.is_none() {
+        // Merge any newly declared Cargo dependencies into a candidate map (only committed on success!)
+        let mut merged_deps = self.dependencies.clone();
+        let mut added_deps = Vec::new();
+        for (name, spec) in &extracted.dependencies {
+            if merged_deps.get(name) != Some(spec) {
+                added_deps.push(format!("{} = {}", name, spec));
+            }
+            merged_deps.insert(name.clone(), spec.clone());
+        }
+
+        let has_code = !split.items.is_empty()
+            || !split.statements.is_empty()
+            || split.trailing_expr.is_some();
+
+        if !has_code && added_deps.is_empty() {
+            let mut stdout = String::new();
+            if extracted.show_deps {
+                if self.dependencies.is_empty() {
+                    stdout.push_str("No Cargo dependencies loaded. Add one with: :dep serde_json = \"1.0\"\n");
+                } else {
+                    stdout.push_str("Loaded Cargo dependencies:\n");
+                    for (k, v) in &self.dependencies {
+                        stdout.push_str(&format!("  {} = {}\n", k, v));
+                    }
+                }
+            }
             return KernelResponse::EvalResult {
                 execution_count: self.exec_count,
-                stdout: String::new(),
+                stdout,
                 displays: Vec::new(),
                 results: Vec::new(),
                 error: None,
@@ -94,38 +133,58 @@ impl RustReplState {
 
         let harness = self.build_repl_harness(&split, &all_vars);
         let src_path = self.session_dir.join(format!("cell_{}.rs", self.exec_count));
-        let bin_path = self.session_dir.join(format!("cell_{}", self.exec_count));
+        let mut bin_path = self.session_dir.join(format!("cell_{}", self.exec_count));
         let res_path = self.session_dir.join(format!("cell_{}_res.json", self.exec_count));
         let vars_path = self.session_dir.join(format!("cell_{}_vars.jsonl", self.exec_count));
         let disp_path = self.session_dir.join(format!("cell_{}_disp.jsonl", self.exec_count));
+        let used_cargo = !merged_deps.is_empty();
 
-        if let Err(e) = std::fs::write(&src_path, &harness) {
-            return KernelResponse::EvalResult {
-                execution_count: self.exec_count,
-                stdout: String::new(),
-                displays: Vec::new(),
-                results: Vec::new(),
-                error: Some(EvalError {
-                    error_type: "IoError".to_string(),
-                    message: format!("Failed to write temporary Rust source: {}", e),
-                    traceback: String::new(),
-                }),
-                duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+        if !used_cargo {
+            if let Err(e) = std::fs::write(&src_path, &harness) {
+                return KernelResponse::EvalResult {
+                    execution_count: self.exec_count,
+                    stdout: String::new(),
+                    displays: Vec::new(),
+                    results: Vec::new(),
+                    error: Some(EvalError {
+                        error_type: "IoError".to_string(),
+                        message: format!("Failed to write temporary Rust source: {}", e),
+                        traceback: String::new(),
+                    }),
+                    duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                };
+            }
+
+            let compile = Command::new("rustc")
+                .args(["--edition", "2021", "-C", "opt-level=0", "-C", "debuginfo=0"])
+                .arg(&src_path)
+                .arg("-o")
+                .arg(&bin_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+
+            let compile_out = match compile {
+                Ok(o) => o,
+                Err(e) => {
+                    return KernelResponse::EvalResult {
+                        execution_count: self.exec_count,
+                        stdout: String::new(),
+                        displays: Vec::new(),
+                        results: Vec::new(),
+                        error: Some(EvalError {
+                            error_type: "CompileError".to_string(),
+                            message: format!("Failed to launch rustc: {}", e),
+                            traceback: String::new(),
+                        }),
+                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    };
+                }
             };
-        }
 
-        let compile = Command::new("rustc")
-            .args(["--edition", "2021", "-C", "opt-level=0", "-C", "debuginfo=0"])
-            .arg(&src_path)
-            .arg("-o")
-            .arg(&bin_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-
-        let compile_out = match compile {
-            Ok(o) => o,
-            Err(e) => {
+            if !compile_out.status.success() {
+                let diag = String::from_utf8_lossy(&compile_out.stderr).into_owned();
+                let _ = std::fs::remove_file(&src_path);
                 return KernelResponse::EvalResult {
                     execution_count: self.exec_count,
                     stdout: String::new(),
@@ -133,29 +192,45 @@ impl RustReplState {
                     results: Vec::new(),
                     error: Some(EvalError {
                         error_type: "CompileError".to_string(),
-                        message: format!("Failed to launch rustc: {}", e),
-                        traceback: String::new(),
+                        message: "Rust compilation failed".to_string(),
+                        traceback: diag,
                     }),
                     duration_ms: start.elapsed().as_secs_f64() * 1000.0,
                 };
             }
-        };
-
-        if !compile_out.status.success() {
-            let diag = String::from_utf8_lossy(&compile_out.stderr).into_owned();
-            let _ = std::fs::remove_file(&src_path);
-            return KernelResponse::EvalResult {
-                execution_count: self.exec_count,
-                stdout: String::new(),
-                displays: Vec::new(),
-                results: Vec::new(),
-                error: Some(EvalError {
-                    error_type: "CompileError".to_string(),
-                    message: "Rust compilation failed".to_string(),
-                    traceback: diag,
-                }),
-                duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-            };
+        } else {
+            let crate_dir = self.session_dir.join("crate");
+            let mut candidate_toml = self.last_cargo_toml.clone();
+            match build_cargo_project_sync(
+                &crate_dir,
+                &self.crate_pkg_name,
+                &merged_deps,
+                &harness,
+                &mut candidate_toml,
+            ) {
+                Ok(built) => {
+                    self.last_cargo_toml = candidate_toml;
+                    bin_path = built;
+                }
+                Err(diag) => {
+                    // Restore previous Cargo.toml if it existed so failed deps don't poison the crate
+                    if !self.last_cargo_toml.is_empty() {
+                        let _ = std::fs::write(crate_dir.join("Cargo.toml"), &self.last_cargo_toml);
+                    }
+                    return KernelResponse::EvalResult {
+                        execution_count: self.exec_count,
+                        stdout: String::new(),
+                        displays: Vec::new(),
+                        results: Vec::new(),
+                        error: Some(EvalError {
+                            error_type: "CompileError".to_string(),
+                            message: "Cargo compilation failed".to_string(),
+                            traceback: diag,
+                        }),
+                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    };
+                }
+            }
         }
 
         let run = Command::new(&bin_path)
@@ -167,8 +242,10 @@ impl RustReplState {
             .stderr(Stdio::piped())
             .output();
 
-        let _ = std::fs::remove_file(&bin_path);
-        let _ = std::fs::remove_file(&src_path);
+        if !used_cargo {
+            let _ = std::fs::remove_file(&bin_path);
+            let _ = std::fs::remove_file(&src_path);
+        }
 
         let run_out = match run {
             Ok(o) => o,
@@ -188,7 +265,7 @@ impl RustReplState {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&run_out.stdout).into_owned();
+        let mut stdout = String::from_utf8_lossy(&run_out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&run_out.stderr).into_owned();
         let displays = read_displays_file(&disp_path);
         let res_raw = std::fs::read_to_string(&res_path).ok();
@@ -219,7 +296,8 @@ impl RustReplState {
             };
         }
 
-        // Commit cell to persistent session history!
+        // Commit dependencies and cell to persistent session history!
+        self.dependencies = merged_deps;
         for item in split.items {
             if !item.trim().starts_with("fn main(") {
                 self.items.push(item);
@@ -229,6 +307,16 @@ impl RustReplState {
             self.past_statements.push(stmt);
         }
         self.tracked_vars = all_vars;
+
+        if !added_deps.is_empty() && !has_code {
+            stdout.push_str(&format!("Loaded Cargo dependencies: {}\n", added_deps.join(", ")));
+        }
+        if extracted.show_deps {
+            stdout.push_str("Loaded Cargo dependencies:\n");
+            for (k, v) in &self.dependencies {
+                stdout.push_str(&format!("  {} = {}\n", k, v));
+            }
+        }
 
         // Parse live variable snapshots
         let mut live_vars = Vec::new();
@@ -359,6 +447,28 @@ impl RustReplState {
                     label: kw.to_string(),
                     kind: "keyword".to_string(),
                     detail: "keyword".to_string(),
+                });
+            }
+        }
+        for (crate_name, spec) in &self.dependencies {
+            let ident = crate_name.replace('-', "_");
+            if ident.starts_with(prefix) && seen.insert(ident.clone()) {
+                items.push(CompletionItem {
+                    label: ident,
+                    kind: "crate".to_string(),
+                    detail: format!("dep {}", spec),
+                });
+            }
+        }
+        for &(label, kind, detail) in &[
+            (":dep", "directive", "Add Cargo dependency (e.g. :dep serde_json = \"1.0\")"),
+            (":deps", "directive", "List loaded Cargo dependencies"),
+        ] {
+            if label.starts_with(prefix) && seen.insert(label.to_string()) {
+                items.push(CompletionItem {
+                    label: label.to_string(),
+                    kind: kind.to_string(),
+                    detail: detail.to_string(),
                 });
             }
         }

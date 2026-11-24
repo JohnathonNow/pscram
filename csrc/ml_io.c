@@ -164,15 +164,22 @@ static int mlio_write_atomic(const char *Path, const void *Data, size_t Len, cha
 }
 
 /* ============================================================================
- * Module 1: store (CBOR file persistence)
- *   store::get(Path)
- *   store::put(Path, Value)
- *   store::create(Path, Fn)
- *   store::exists(Path)
- *   store::delete(Path)
+ * Module 1: store (CBOR, raw bytes, and string file persistence)
+ *   store::get(Path)              / store::put(Path, Value)       / store::create(Path, Fn)
+ *   store::get_raw(Path)          / store::put_raw(Path, Bytes)   / store::create_raw(Path, Fn)
+ *   store::get_bytes(Path)        / store::put_bytes(Path, Bytes) / store::create_bytes(Path, Fn)
+ *   store::get_string(Path)       / store::put_string(Path, Str)  / store::create_string(Path, Fn)
+ *   store::get_text(Path)         / store::put_text(Path, Str)    / store::create_text(Path, Fn)
+ *   store::exists(Path)           / store::delete(Path)
  * ============================================================================ */
 
-static ml_value_t *mlio_store_read(const char *Path) {
+typedef enum {
+    ML_STORE_CBOR = 0,
+    ML_STORE_RAW = 1,
+    ML_STORE_STRING = 2,
+} ml_store_mode_t;
+
+static ml_value_t *mlio_store_read_cbor(const char *Path) {
     size_t Len = 0;
     char ErrBuf[512];
     unsigned char *Raw = mlio_read_entire_file(Path, &Len, ErrBuf, sizeof(ErrBuf));
@@ -193,7 +200,41 @@ static ml_value_t *mlio_store_read(const char *Path) {
     return ml_from_cbor(Cbor, NULL, NULL);
 }
 
-static ml_value_t *mlio_store_write(const char *Path, ml_value_t *Value) {
+static ml_value_t *mlio_store_read_raw(const char *Path) {
+    size_t Len = 0;
+    char ErrBuf[512];
+    unsigned char *Raw = mlio_read_entire_file(Path, &Len, ErrBuf, sizeof(ErrBuf));
+    if (!Raw) {
+        return ml_error("StoreError", "%s", ErrBuf);
+    }
+    char *GcBuf = snew(Len > 0 ? Len : 1);
+    if (Len > 0) memcpy(GcBuf, Raw, Len);
+    free(Raw);
+    return ml_address(GcBuf, (int)Len);
+}
+
+static ml_value_t *mlio_store_read_string(const char *Path) {
+    size_t Len = 0;
+    char ErrBuf[512];
+    unsigned char *Raw = mlio_read_entire_file(Path, &Len, ErrBuf, sizeof(ErrBuf));
+    if (!Raw) {
+        return ml_error("StoreError", "%s", ErrBuf);
+    }
+    ml_value_t *Val = (Len > 0) ? ml_string_copy((const char *)Raw, (int)Len) : ml_string("", 0);
+    free(Raw);
+    return Val;
+}
+
+static ml_value_t *mlio_store_read(const char *Path, ml_store_mode_t Mode) {
+    switch (Mode) {
+        case ML_STORE_RAW: return mlio_store_read_raw(Path);
+        case ML_STORE_STRING: return mlio_store_read_string(Path);
+        case ML_STORE_CBOR:
+        default: return mlio_store_read_cbor(Path);
+    }
+}
+
+static ml_value_t *mlio_store_write_cbor(const char *Path, ml_value_t *Value) {
     ml_value_t *Deref = ml_deref(Value);
     ml_cbor_t Cbor = ml_cbor_encode(Deref);
     if (!Cbor.Length) {
@@ -210,23 +251,101 @@ static ml_value_t *mlio_store_write(const char *Path, ml_value_t *Value) {
     return Deref;
 }
 
+static ml_value_t *mlio_store_write_raw(const char *Path, ml_value_t *Value) {
+    ml_value_t *Deref = ml_deref(Value);
+    const void *Data = NULL;
+    size_t Len = 0;
+
+    if (ml_is(Deref, MLAddressT)) {
+        Data = ml_address_value(Deref);
+        Len = (size_t)ml_address_length(Deref);
+    } else if (ml_is(Deref, MLStringT)) {
+        Data = ml_string_value(Deref);
+        Len = ml_string_length(Deref);
+    } else {
+        return ml_error("TypeError", "store::put_raw expects an address/buffer or string, got %s",
+            ml_typeof(Deref)->Name);
+    }
+
+    char ErrBuf[512];
+    if (mlio_write_atomic(Path, Data ? Data : "", Len, ErrBuf, sizeof(ErrBuf)) != 0) {
+        return ml_error("StoreError", "%s", ErrBuf);
+    }
+    return Deref;
+}
+
+static ml_value_t *mlio_store_write_string(const char *Path, ml_value_t *Value) {
+    ml_value_t *Deref = ml_deref(Value);
+    const char *Str = NULL;
+    size_t Len = 0;
+
+    if (ml_is(Deref, MLStringT)) {
+        Str = ml_string_value(Deref);
+        Len = ml_string_length(Deref);
+    } else {
+        ml_stringbuffer_t Sb[1] = {ML_STRINGBUFFER_INIT};
+        ml_value_t *Res = ml_stringbuffer_simple_append(Sb, Deref);
+        if (ml_is_error(Res)) return Res;
+        Len = Sb->Length;
+        Str = ml_stringbuffer_get_string(Sb);
+    }
+
+    char ErrBuf[512];
+    if (mlio_write_atomic(Path, Str ? Str : "", Len, ErrBuf, sizeof(ErrBuf)) != 0) {
+        return ml_error("StoreError", "%s", ErrBuf);
+    }
+    return Deref;
+}
+
+static ml_value_t *mlio_store_write(const char *Path, ml_value_t *Value, ml_store_mode_t Mode) {
+    switch (Mode) {
+        case ML_STORE_RAW: return mlio_store_write_raw(Path, Value);
+        case ML_STORE_STRING: return mlio_store_write_string(Path, Value);
+        case ML_STORE_CBOR:
+        default: return mlio_store_write_cbor(Path, Value);
+    }
+}
+
 ML_FUNCTION(MLStoreGet) {
     ML_CHECK_ARG_COUNT(1);
     ML_CHECK_ARG_TYPE(0, MLStringT);
-    const char *Path = ml_string_value(Args[0]);
-    return mlio_store_read(Path);
+    return mlio_store_read(ml_string_value(Args[0]), ML_STORE_CBOR);
 }
 
 ML_FUNCTION(MLStorePut) {
     ML_CHECK_ARG_COUNT(2);
     ML_CHECK_ARG_TYPE(0, MLStringT);
-    const char *Path = ml_string_value(Args[0]);
-    return mlio_store_write(Path, Args[1]);
+    return mlio_store_write(ml_string_value(Args[0]), Args[1], ML_STORE_CBOR);
+}
+
+ML_FUNCTION(MLStoreGetRaw) {
+    ML_CHECK_ARG_COUNT(1);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    return mlio_store_read(ml_string_value(Args[0]), ML_STORE_RAW);
+}
+
+ML_FUNCTION(MLStorePutRaw) {
+    ML_CHECK_ARG_COUNT(2);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    return mlio_store_write(ml_string_value(Args[0]), Args[1], ML_STORE_RAW);
+}
+
+ML_FUNCTION(MLStoreGetString) {
+    ML_CHECK_ARG_COUNT(1);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    return mlio_store_read(ml_string_value(Args[0]), ML_STORE_STRING);
+}
+
+ML_FUNCTION(MLStorePutString) {
+    ML_CHECK_ARG_COUNT(2);
+    ML_CHECK_ARG_TYPE(0, MLStringT);
+    return mlio_store_write(ml_string_value(Args[0]), Args[1], ML_STORE_STRING);
 }
 
 typedef struct {
     ml_state_t Base;
     const char *Path;
+    ml_store_mode_t Mode;
 } ml_store_create_state_t;
 
 static void ml_store_create_run(ml_store_create_state_t *State, ml_value_t *Value) {
@@ -235,11 +354,11 @@ static void ml_store_create_run(ml_store_create_state_t *State, ml_value_t *Valu
     if (ml_is_error(Value)) {
         ML_RETURN(Value);
     }
-    ml_value_t *Written = mlio_store_write(State->Path, Value);
+    ml_value_t *Written = mlio_store_write(State->Path, Value, State->Mode);
     ML_RETURN(Written);
 }
 
-ML_FUNCTIONX(MLStoreCreate) {
+static void mlio_store_create_impl(ml_state_t *Caller, int Count, ml_value_t **Args, ml_store_mode_t Mode) {
     ML_CHECKX_ARG_COUNT(2);
     ML_CHECKX_ARG_TYPE(0, MLStringT);
     ml_value_t *PathVal = ml_deref(Args[0]);
@@ -248,7 +367,7 @@ ML_FUNCTIONX(MLStoreCreate) {
 
     struct stat St;
     if (stat(Path, &St) == 0 && S_ISREG(St.st_mode)) {
-        ML_RETURN(mlio_store_read(Path));
+        ML_RETURN(mlio_store_read(Path, Mode));
     }
 
     ml_store_create_state_t *State = new(ml_store_create_state_t);
@@ -257,10 +376,23 @@ ML_FUNCTIONX(MLStoreCreate) {
     State->Base.Context = Caller->Context;
     State->Base.run = (ml_state_fn)ml_store_create_run;
     State->Path = Path;
+    State->Mode = Mode;
 
     ml_value_t **CallArgs = ml_alloc_args(1);
     CallArgs[0] = PathVal;
     return ml_call((ml_state_t *)State, Fn, 1, CallArgs);
+}
+
+ML_FUNCTIONX(MLStoreCreate) {
+    mlio_store_create_impl(Caller, Count, Args, ML_STORE_CBOR);
+}
+
+ML_FUNCTIONX(MLStoreCreateRaw) {
+    mlio_store_create_impl(Caller, Count, Args, ML_STORE_RAW);
+}
+
+ML_FUNCTIONX(MLStoreCreateString) {
+    mlio_store_create_impl(Caller, Count, Args, ML_STORE_STRING);
 }
 
 ML_FUNCTION(MLStoreExists) {
@@ -1076,6 +1208,18 @@ void ml_io_init(stringmap_t *Globals) {
         "get", MLStoreGet,
         "put", MLStorePut,
         "create", MLStoreCreate,
+        "get_raw", MLStoreGetRaw,
+        "put_raw", MLStorePutRaw,
+        "create_raw", MLStoreCreateRaw,
+        "get_bytes", MLStoreGetRaw,
+        "put_bytes", MLStorePutRaw,
+        "create_bytes", MLStoreCreateRaw,
+        "get_string", MLStoreGetString,
+        "put_string", MLStorePutString,
+        "create_string", MLStoreCreateString,
+        "get_text", MLStoreGetString,
+        "put_text", MLStorePutString,
+        "create_text", MLStoreCreateString,
         "exists", MLStoreExists,
         "delete", MLStoreDelete,
         NULL

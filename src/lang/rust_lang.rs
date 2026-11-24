@@ -2,6 +2,7 @@ use crate::kernel_mgr::InvokeExecError;
 use crate::kernel_proc::{DisplayItem, EvalError, KernelResponse};
 use crate::lang::{BoxFuture, InvokeScriptRequest, LanguageBackend, LanguageInfo};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -72,11 +73,16 @@ impl LanguageBackend for RustBackend {
         let cache_dir = self.cache_dir.clone();
         Box::pin(async move {
             let start = Instant::now();
-            let generated = generate_invoke_harness(&req.code, req.function.as_deref());
+            let extracted = extract_rust_dependencies(&req.code, &req.cwd);
+            let generated = generate_invoke_harness(&extracted.code, req.function.as_deref());
 
-            // Content-hash cache key so repeated invocations skip rustc completely (~2-5ms)!
+            // Content-hash cache key (source + dependencies) so repeated invocations skip rustc/cargo (~5ms)!
             let mut hasher = DefaultHasher::new();
             generated.hash(&mut hasher);
+            for (k, v) in &extracted.dependencies {
+                k.hash(&mut hasher);
+                v.hash(&mut hasher);
+            }
             let hash = format!("{:016x}", hasher.finish());
             let bin_path = cache_dir.join(format!("invoke_{}", hash));
             let src_path = cache_dir.join(format!("invoke_{}.rs", hash));
@@ -85,54 +91,103 @@ impl LanguageBackend for RustBackend {
                 if let Err(e) = std::fs::create_dir_all(&cache_dir) {
                     return Err(InvokeExecError::Internal(format!("cache mkdir failed: {}", e)));
                 }
-                if let Err(e) = std::fs::write(&src_path, &generated) {
-                    return Err(InvokeExecError::Internal(format!("write src failed: {}", e)));
-                }
                 let tmp_bin = cache_dir.join(format!("invoke_{}_{}.tmp", hash, uuid::Uuid::new_v4()));
 
-                let compile_fut = Command::new("rustc")
-                    .args(["--edition", "2021", "-C", "opt-level=0", "-C", "debuginfo=0"])
-                    .arg(&src_path)
-                    .arg("-o")
-                    .arg(&tmp_bin)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output();
-
-                let compile_out = match tokio::time::timeout(
-                    Duration::from_millis(req.timeout_ms),
-                    compile_fut,
-                )
-                .await
-                {
-                    Ok(Ok(out)) => out,
-                    Ok(Err(e)) => {
-                        return Err(InvokeExecError::Internal(format!(
-                            "Failed to spawn rustc: {}",
-                            e
-                        )));
+                if extracted.dependencies.is_empty() {
+                    if let Err(e) = std::fs::write(&src_path, &generated) {
+                        return Err(InvokeExecError::Internal(format!("write src failed: {}", e)));
                     }
-                    Err(_) => return Err(InvokeExecError::Timeout(req.timeout_ms)),
-                };
 
-                if !compile_out.status.success() {
-                    let _ = std::fs::remove_file(&tmp_bin);
-                    let diag = String::from_utf8_lossy(&compile_out.stderr).into_owned();
-                    return Ok(KernelResponse::InvokeResult {
-                        result: serde_json::json!({ "type": "nil" }),
-                        type_name: "error".to_string(),
-                        repr: String::new(),
-                        stdout: String::new(),
-                        displays: Vec::new(),
-                        error: Some(EvalError {
-                            error_type: "CompileError".to_string(),
-                            message: format!("rustc failed for '{}'", req.source),
-                            traceback: diag,
-                        }),
-                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
-                    });
+                    let compile_fut = Command::new("rustc")
+                        .args(["--edition", "2021", "-C", "opt-level=0", "-C", "debuginfo=0"])
+                        .arg(&src_path)
+                        .arg("-o")
+                        .arg(&tmp_bin)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output();
+
+                    let compile_out = match tokio::time::timeout(
+                        Duration::from_millis(req.timeout_ms),
+                        compile_fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok(out)) => out,
+                        Ok(Err(e)) => {
+                            return Err(InvokeExecError::Internal(format!(
+                                "Failed to spawn rustc: {}",
+                                e
+                            )));
+                        }
+                        Err(_) => return Err(InvokeExecError::Timeout(req.timeout_ms)),
+                    };
+
+                    if !compile_out.status.success() {
+                        let _ = std::fs::remove_file(&tmp_bin);
+                        let diag = String::from_utf8_lossy(&compile_out.stderr).into_owned();
+                        return Ok(KernelResponse::InvokeResult {
+                            result: serde_json::json!({ "type": "nil" }),
+                            type_name: "error".to_string(),
+                            repr: String::new(),
+                            stdout: String::new(),
+                            displays: Vec::new(),
+                            error: Some(EvalError {
+                                error_type: "CompileError".to_string(),
+                                message: format!("rustc failed for '{}'", req.source),
+                                traceback: diag,
+                            }),
+                            duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        });
+                    }
+                    let _ = std::fs::rename(&tmp_bin, &bin_path);
+                } else {
+                    let pkg_name = format!("mlnb_invoke_{}", &hash[..8]);
+                    let proj_dir = cache_dir.join(format!("proj_{}_{}", hash, uuid::Uuid::new_v4()));
+                    let build_res = build_cargo_project_async(
+                        &proj_dir,
+                        &pkg_name,
+                        &extracted.dependencies,
+                        &generated,
+                        req.timeout_ms,
+                    )
+                    .await;
+
+                    match build_res {
+                        Ok(Ok(built_bin)) => {
+                            let copy_res = std::fs::copy(&built_bin, &tmp_bin)
+                                .and_then(|_| std::fs::rename(&tmp_bin, &bin_path));
+                            let _ = std::fs::remove_dir_all(&proj_dir);
+                            if let Err(e) = copy_res {
+                                let _ = std::fs::remove_file(&tmp_bin);
+                                return Err(InvokeExecError::Internal(format!(
+                                    "Failed to cache compiled cargo binary: {}",
+                                    e
+                                )));
+                            }
+                        }
+                        Ok(Err(diag)) => {
+                            let _ = std::fs::remove_dir_all(&proj_dir);
+                            return Ok(KernelResponse::InvokeResult {
+                                result: serde_json::json!({ "type": "nil" }),
+                                type_name: "error".to_string(),
+                                repr: String::new(),
+                                stdout: String::new(),
+                                displays: Vec::new(),
+                                error: Some(EvalError {
+                                    error_type: "CompileError".to_string(),
+                                    message: format!("cargo build failed for '{}'", req.source),
+                                    traceback: diag,
+                                }),
+                                duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = std::fs::remove_dir_all(&proj_dir);
+                            return Err(err);
+                        }
+                    }
                 }
-                let _ = std::fs::rename(&tmp_bin, &bin_path);
             }
 
             // Prepare tagged JSON input payload on stdin for the compiled Rust binary
@@ -1266,3 +1321,543 @@ mod __ml_rt {
     }
 }
 "#;
+
+// ============================================================================
+// Cargo Dependency Extraction & Fast Shared-Target Building
+// ============================================================================
+
+#[derive(Debug, Default, Clone)]
+pub struct ExtractedRustCode {
+    pub code: String,
+    pub dependencies: BTreeMap<String, String>,
+    pub show_deps: bool,
+}
+
+/// Extract Cargo dependencies declared via any of the 3 supported Rust script/notebook conventions:
+/// 1. Evcxr-style directives: `:dep serde_json = "1.0"` or `//:dep chrono = { version = "0.4", features = ["serde"] }`
+/// 2. Cargo script RFC 3424 frontmatter:
+///    ```
+///    ---cargo
+///    [dependencies]
+///    serde_json = "1.0"
+///    ---
+///    ```
+/// 3. Doc-comment manifest block:
+///    ```
+///    //! ```cargo
+///    //! [dependencies]
+///    //! serde_json = "1.0"
+///    //! ```
+///    ```
+/// Relative `path = "..."` entries are automatically resolved against `cwd`.
+pub fn extract_rust_dependencies(code: &str, cwd: &Path) -> ExtractedRustCode {
+    let mut out = ExtractedRustCode::default();
+    let lines: Vec<&str> = code.lines().collect();
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+
+    // 1. Optional leading shebang + RFC 3424 `---cargo` / `---` frontmatter
+    while i < lines.len() && lines[i].trim().is_empty() {
+        kept.push(lines[i].to_string());
+        i += 1;
+    }
+    if i < lines.len() && lines[i].starts_with("#!") && !lines[i].starts_with("#![") {
+        // Skip shebang line
+        i += 1;
+        while i < lines.len() && lines[i].trim().is_empty() {
+            kept.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+    if i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed == "---cargo" || trimmed == "---" {
+            // Find matching closing `---`
+            if let Some(rel_end) = lines[i + 1..].iter().position(|l| l.trim() == "---") {
+                let end_idx = i + 1 + rel_end;
+                let block = lines[i + 1..end_idx].join("\n");
+                parse_cargo_toml_deps(&block, cwd, &mut out.dependencies);
+                i = end_idx + 1;
+            }
+        }
+    }
+
+    // 2. Scan remaining lines for `//! ```cargo ... //! ``` ` blocks and `:dep` / `:deps` lines
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Check `//! ```cargo` doc-comment manifest block
+        if let Some(doc) = trimmed.strip_prefix("//!") {
+            let doc_t = doc.trim();
+            if doc_t == "```cargo" || doc_t == "```toml" {
+                let mut manifest_lines = Vec::new();
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < lines.len() {
+                    let lt = lines[j].trim();
+                    if let Some(d) = lt.strip_prefix("//!") {
+                        let dt = d.trim();
+                        if dt == "```" {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                        manifest_lines.push(d.trim_start());
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if closed {
+                    let block = manifest_lines.join("\n");
+                    parse_cargo_toml_deps(&block, cwd, &mut out.dependencies);
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        // Check Evcxr-style `:dep ...` / `//:dep ...` / `//! :dep ...` and `:deps`
+        let directive = trimmed
+            .strip_prefix("//!")
+            .or_else(|| trimmed.strip_prefix("//"))
+            .unwrap_or(trimmed)
+            .trim_start();
+
+        if directive == ":deps" {
+            out.show_deps = true;
+            i += 1;
+            continue;
+        }
+
+        if let Some(spec) = directive.strip_prefix(":dep") {
+            if spec.is_empty() || spec.starts_with(char::is_whitespace) {
+                let spec = spec.trim();
+                if !spec.is_empty() {
+                    if let Some((name, val)) = parse_dep_entry(spec, cwd) {
+                        out.dependencies.insert(name, val);
+                    }
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        kept.push(line.to_string());
+        i += 1;
+    }
+
+    out.code = kept.join("\n");
+    out
+}
+
+fn parse_cargo_toml_deps(toml_block: &str, cwd: &Path, deps: &mut BTreeMap<String, String>) {
+    // Support both `[dependencies]` section and bare `crate = "ver"` lines when no section header is present
+    let mut in_deps = true;
+    let mut saw_section = false;
+    let mut pending_line = String::new();
+    let mut brace_depth: i32 = 0;
+
+    let flush = |line: &str, cwd: &Path, deps: &mut BTreeMap<String, String>| {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            return;
+        }
+        if let Some((k, v)) = parse_dep_entry(t, cwd) {
+            deps.insert(k, v);
+        }
+    };
+
+    for raw_line in toml_block.lines() {
+        let line = strip_toml_line_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if brace_depth == 0 && line.starts_with('[') && line.ends_with(']') {
+            if !pending_line.is_empty() {
+                if in_deps {
+                    flush(&pending_line, cwd, deps);
+                }
+                pending_line.clear();
+            }
+            let section = line[1..line.len() - 1].trim();
+            saw_section = true;
+            in_deps = section == "dependencies";
+            continue;
+        }
+        if saw_section && !in_deps {
+            continue;
+        }
+
+        if !pending_line.is_empty() {
+            pending_line.push(' ');
+        }
+        pending_line.push_str(line);
+
+        let mut in_str = false;
+        let mut prev_esc = false;
+        for ch in line.chars() {
+            if in_str {
+                if prev_esc {
+                    prev_esc = false;
+                } else if ch == '\\' {
+                    prev_esc = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+            } else {
+                match ch {
+                    '"' => in_str = true,
+                    '{' | '[' => brace_depth += 1,
+                    '}' | ']' => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+
+        if brace_depth <= 0 {
+            brace_depth = 0;
+            flush(&pending_line, cwd, deps);
+            pending_line.clear();
+        }
+    }
+
+    if !pending_line.is_empty() && in_deps {
+        flush(&pending_line, cwd, deps);
+    }
+}
+
+fn strip_toml_line_comment(line: &str) -> &str {
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut esc = false;
+    for (idx, ch) in line.char_indices() {
+        if in_dq {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_dq = false;
+            }
+        } else if in_sq {
+            if ch == '\'' {
+                in_sq = false;
+            }
+        } else {
+            match ch {
+                '"' => in_dq = true,
+                '\'' => in_sq = true,
+                '#' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
+fn parse_dep_entry(entry: &str, cwd: &Path) -> Option<(String, String)> {
+    let entry = strip_toml_line_comment(entry).trim();
+    if entry.is_empty() {
+        return None;
+    }
+    let (raw_name, raw_val) = match entry.split_once('=') {
+        Some((n, v)) => (n.trim(), v.trim()),
+        None => (entry, "\"*\""),
+    };
+    let name = raw_name.trim_matches('"').trim_matches('\'').to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let val = if raw_val.is_empty() {
+        "\"*\"".to_string()
+    } else {
+        resolve_relative_path_dep(raw_val, cwd)
+    };
+    Some((name, val))
+}
+
+/// If a TOML inline table dependency contains `path = "relative/dir"`, resolve it against `cwd`.
+fn resolve_relative_path_dep(spec: &str, cwd: &Path) -> String {
+    let bytes = spec.as_bytes();
+    let mut i = 0;
+    let mut out = String::with_capacity(spec.len());
+
+    while i < bytes.len() {
+        // Look for `path` key followed by optional whitespace, `=`, optional whitespace, `"`
+        if spec[i..].starts_with("path")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_')
+        {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let str_start = j + 1;
+                    let mut k = str_start;
+                    while k < bytes.len() && bytes[k] != quote {
+                        if quote == b'"' && bytes[k] == b'\\' && k + 1 < bytes.len() {
+                            k += 2;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    if k < bytes.len() {
+                        let raw_path = &spec[str_start..k];
+                        let p = Path::new(raw_path);
+                        let resolved = if p.is_relative() {
+                            let joined = cwd.join(p);
+                            std::fs::canonicalize(&joined).unwrap_or(joined)
+                        } else {
+                            p.to_path_buf()
+                        };
+                        let resolved_str = resolved.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+                        out.push_str(&spec[i..j]);
+                        out.push('"');
+                        out.push_str(&resolved_str);
+                        out.push('"');
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = spec[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+pub fn cargo_shared_target_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join("minilang-notebook-rust-cache")
+        .join("cargo-target")
+}
+
+pub fn generate_cargo_toml(pkg_name: &str, deps: &BTreeMap<String, String>) -> String {
+    let mut s = format!(
+        "[package]\nname = {:?}\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[profile.dev]\nopt-level = 0\ndebug = 0\nincremental = true\n\n[dependencies]\n",
+        pkg_name
+    );
+    for (name, spec) in deps {
+        s.push_str(name);
+        s.push_str(" = ");
+        s.push_str(spec);
+        s.push('\n');
+    }
+    s
+}
+
+fn should_retry_cargo_online(stderr: &str) -> bool {
+    if std::env::var("MINILANG_RUST_OFFLINE").as_deref() == Ok("1") {
+        return false;
+    }
+    let lower = stderr.to_lowercase();
+    lower.contains("--offline")
+        || lower.contains("offline")
+        || lower.contains("failed to select a version")
+        || lower.contains("no matching package")
+        || lower.contains("not found in")
+        || lower.contains("cannot update")
+}
+
+/// Synchronous Cargo build helper (used by the Rust REPL kernel subprocess).
+/// Tries `--offline` first (0ms network overhead for cached crates), then automatically
+/// retries online if a requested dependency isn't in the local cargo cache yet.
+pub fn build_cargo_project_sync(
+    proj_dir: &Path,
+    pkg_name: &str,
+    deps: &BTreeMap<String, String>,
+    src_code: &str,
+    last_cargo_toml: &mut String,
+) -> Result<PathBuf, String> {
+    let src_dir = proj_dir.join("src");
+    std::fs::create_dir_all(&src_dir).map_err(|e| format!("Failed to create crate dir: {}", e))?;
+    let target_dir = cargo_shared_target_dir();
+    let _ = std::fs::create_dir_all(&target_dir);
+
+    let manifest_path = proj_dir.join("Cargo.toml");
+    let toml_text = generate_cargo_toml(pkg_name, deps);
+    if toml_text != *last_cargo_toml || !manifest_path.exists() {
+        std::fs::write(&manifest_path, &toml_text)
+            .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
+        *last_cargo_toml = toml_text;
+    }
+
+    let main_rs = src_dir.join("main.rs");
+    std::fs::write(&main_rs, src_code)
+        .map_err(|e| format!("Failed to write src/main.rs: {}", e))?;
+
+    let run_cargo = |offline: bool| -> Result<std::process::Output, String> {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("build")
+            .arg("--manifest-path")
+            .arg(&manifest_path)
+            .arg("--color=never")
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if offline {
+            cmd.arg("--offline");
+        }
+        cmd.output().map_err(|e| format!("Failed to launch cargo: {}", e))
+    };
+
+    let mut out = run_cargo(true)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if should_retry_cargo_online(&stderr) {
+            out = run_cargo(false)?;
+        }
+    }
+
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+
+    let bin_path = target_dir.join("debug").join(pkg_name);
+    if !bin_path.exists() {
+        return Err(format!("Cargo succeeded but binary not found at {}", bin_path.display()));
+    }
+    Ok(bin_path)
+}
+
+/// Async Cargo build helper with timeout (used by `RustBackend::invoke_script`).
+pub async fn build_cargo_project_async(
+    proj_dir: &Path,
+    pkg_name: &str,
+    deps: &BTreeMap<String, String>,
+    src_code: &str,
+    timeout_ms: u64,
+) -> Result<Result<PathBuf, String>, InvokeExecError> {
+    let src_dir = proj_dir.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|e| InvokeExecError::Internal(format!("Failed to create crate dir: {}", e)))?;
+    let target_dir = cargo_shared_target_dir();
+    let _ = std::fs::create_dir_all(&target_dir);
+
+    let manifest_path = proj_dir.join("Cargo.toml");
+    let toml_text = generate_cargo_toml(pkg_name, deps);
+    std::fs::write(&manifest_path, &toml_text)
+        .map_err(|e| InvokeExecError::Internal(format!("Failed to write Cargo.toml: {}", e)))?;
+    std::fs::write(src_dir.join("main.rs"), src_code)
+        .map_err(|e| InvokeExecError::Internal(format!("Failed to write src/main.rs: {}", e)))?;
+
+    let start = Instant::now();
+    let run_cargo = |offline: bool, rem_ms: u64| {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+            .arg("--manifest-path")
+            .arg(&manifest_path)
+            .arg("--color=never")
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if offline {
+            cmd.arg("--offline");
+        }
+        async move {
+            match tokio::time::timeout(Duration::from_millis(rem_ms.max(100)), cmd.output()).await {
+                Ok(Ok(o)) => Ok(o),
+                Ok(Err(e)) => Err(InvokeExecError::Internal(format!("Failed to spawn cargo: {}", e))),
+                Err(_) => Err(InvokeExecError::Timeout(timeout_ms)),
+            }
+        }
+    };
+
+    let mut out = run_cargo(true, timeout_ms).await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if should_retry_cargo_online(&stderr) {
+            let elapsed = start.elapsed().as_millis() as u64;
+            if elapsed >= timeout_ms {
+                return Err(InvokeExecError::Timeout(timeout_ms));
+            }
+            out = run_cargo(false, timeout_ms - elapsed).await?;
+        }
+    }
+
+    if !out.status.success() {
+        return Ok(Err(String::from_utf8_lossy(&out.stderr).into_owned()));
+    }
+
+    let bin_path = target_dir.join("debug").join(pkg_name);
+    if !bin_path.exists() {
+        return Err(InvokeExecError::Internal(format!(
+            "Cargo succeeded but binary not found at {}",
+            bin_path.display()
+        )));
+    }
+    Ok(Ok(bin_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_evcxr_dep_directives() {
+        let src = r#"
+:dep serde_json = "1.0"
+//:dep chrono = { version = "0.4", features = ["serde"] }
+//! :dep mylib = { path = "local_crate" }
+let v = serde_json::json!({"ok": true});
+v
+"#;
+        let cwd = Path::new("/tmp/workspace");
+        let ext = extract_rust_dependencies(src, cwd);
+        assert_eq!(ext.dependencies.get("serde_json").map(String::as_str), Some("\"1.0\""));
+        assert_eq!(
+            ext.dependencies.get("chrono").map(String::as_str),
+            Some("{ version = \"0.4\", features = [\"serde\"] }")
+        );
+        assert_eq!(
+            ext.dependencies.get("mylib").map(String::as_str),
+            Some("{ path = \"/tmp/workspace/local_crate\" }")
+        );
+        assert!(!ext.code.contains(":dep"));
+        assert!(ext.code.contains("serde_json::json!"));
+    }
+
+    #[test]
+    fn test_extract_frontmatter_and_doc_block() {
+        let fm = r#"---cargo
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+---
+let id = uuid::Uuid::new_v4();
+id.to_string()
+"#;
+        let ext1 = extract_rust_dependencies(fm, Path::new("/tmp"));
+        assert_eq!(ext1.dependencies.len(), 2);
+        assert!(ext1.dependencies.contains_key("serde"));
+        assert!(ext1.dependencies.contains_key("uuid"));
+        assert!(!ext1.code.contains("---cargo"));
+
+        let doc = r#"//! ```cargo
+//! [dependencies]
+//! rand = "0.8"
+//! ```
+let x: u8 = rand::random();
+x
+"#;
+        let ext2 = extract_rust_dependencies(doc, Path::new("/tmp"));
+        assert_eq!(ext2.dependencies.get("rand").map(String::as_str), Some("\"0.8\""));
+        assert!(!ext2.code.contains("```cargo"));
+    }
+}
+
