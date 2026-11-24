@@ -1187,11 +1187,46 @@
         if (fnName) payload.function = fnName;
 
         const cleanPath = scriptPath.replace(/^\/+/, "");
-        fetch(`/invoke/${encodeURI(cleanPath)}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        })
+        const doInvokeFetch = async (retryOn401) => {
+          const headers = { "Content-Type": "application/json" };
+          try {
+            const tok = window.MlnbAuth
+              ? await window.MlnbAuth.getAccessToken()
+              : window.localStorage?.getItem("mlnb_access_token");
+            if (tok) headers["Authorization"] = `Bearer ${tok}`;
+          } catch { /* ignore */ }
+          const res = await fetch(`/invoke/${encodeURI(cleanPath)}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload),
+          });
+          if (res.status === 401 && retryOn401) {
+            let refreshed = false;
+            try {
+              if (window.MlnbAuth) {
+                refreshed = await window.MlnbAuth.refresh();
+              } else {
+                const rt = window.localStorage?.getItem("mlnb_refresh_token");
+                const rRes = await fetch("/api/auth/refresh", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(rt ? { refresh_token: rt } : {}),
+                });
+                if (rRes.ok) {
+                  const rData = await rRes.json();
+                  if (rData.access_token) window.localStorage?.setItem("mlnb_access_token", rData.access_token);
+                  if (rData.refresh_token) window.localStorage?.setItem("mlnb_refresh_token", rData.refresh_token);
+                  if (rData.expires_at) window.localStorage?.setItem("mlnb_access_exp", String(rData.expires_at));
+                  refreshed = true;
+                }
+              }
+            } catch { /* ignore */ }
+            if (refreshed) return doInvokeFetch(false);
+          }
+          return res;
+        };
+
+        doInvokeFetch(true)
           .then(async (res) => {
             const data = await res.json().catch(() => ({}));
             if (!res.ok || data.error || data.ok === false) {

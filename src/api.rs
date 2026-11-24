@@ -1,3 +1,4 @@
+use crate::auth::{self, AuthManager, AuthenticatedUser};
 use crate::files::FileStore;
 use crate::kernel_mgr::{InvokeExecError, KernelManager};
 use crate::kernel_proc::KernelResponse;
@@ -5,10 +6,11 @@ use crate::lang::LanguageRegistry;
 use crate::notebook::NotebookDocument;
 use crate::tagged::TaggedValue;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -24,16 +26,26 @@ pub struct AppState {
     pub files: FileStore,
     pub kernels: KernelManager,
     pub languages: Arc<LanguageRegistry>,
+    pub auth: Arc<AuthManager>,
     pub web_dir: Option<PathBuf>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let public_routes = Router::new()
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
         .route("/minijs_vm.js", get(serve_minijs_vm))
+        // Authentication & token lifecycle endpoints (always accessible)
+        .route("/api/auth/status", get(api_auth_status))
+        .route("/api/auth/login", post(api_auth_login))
+        .route("/api/auth/refresh", post(api_auth_refresh))
+        .route("/api/auth/logout", post(api_auth_logout));
+
+    let protected_routes = Router::new()
         .route("/ui/*script", get(serve_standalone_ui))
+        .route("/api/auth/me", get(api_auth_me))
+        .route("/api/auth/logout-all", post(api_auth_logout_all))
         .route("/api/info", get(api_info))
         .route("/api/languages", get(api_languages))
         // File browser API
@@ -46,7 +58,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notebook/to-mini", post(api_notebook_to_script))
         .route("/api/notebook/from-script", post(api_notebook_from_script))
         .route("/api/notebook/to-script", post(api_notebook_to_script))
-        // Custom .mini script invocation API
+        // Custom script invocation API
         .route("/invoke", post(api_invoke_root))
         .route("/invoke/*script", post(api_invoke_path))
         .route("/api/scripts", get(api_list_scripts))
@@ -61,7 +73,74 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/kernels/:id/inspect", get(api_kernel_inspect))
         .route("/api/kernels/:id/complete", post(api_kernel_complete))
         .route("/api/kernels/:id/chdir", post(api_kernel_chdir))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    public_routes.merge(protected_routes).with_state(state)
+}
+
+async fn auth_middleware<B>(
+    State(st): State<Arc<AppState>>,
+    mut req: Request<B>,
+    next: Next<B>,
+) -> Response {
+    if !st.auth.is_enabled() {
+        return next.run(req).await;
+    }
+
+    let token = auth::extract_access_token(req.headers(), req.uri().query());
+    let auth_res = match token {
+        Some(t) => st.auth.verify_access_token(&t),
+        None => Err(auth::AuthError::Unauthorized(
+            "Authentication required. Sign in via POST /api/auth/login.".to_string(),
+        )),
+    };
+
+    match auth_res {
+        Ok(user) => {
+            req.extensions_mut().insert(user);
+            next.run(req).await
+        }
+        Err(err) => {
+            let path = req.uri().path();
+            let wants_html = req
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("text/html"))
+                .unwrap_or(false);
+            if path.starts_with("/ui/") && wants_html {
+                let target = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or(path);
+                let encoded: String = target
+                    .bytes()
+                    .flat_map(|b| match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                            vec![b as char]
+                        }
+                        _ => format!("%{:02X}", b).chars().collect(),
+                    })
+                    .collect();
+                return Redirect::temporary(&format!("/?next={}", encoded)).into_response();
+            }
+
+            (
+                err.status_code(),
+                [(
+                    header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"minilang-notebook\"",
+                )],
+                Json(json!({
+                    "error": err.message(),
+                    "code": err.code(),
+                    "auth_required": true,
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn load_asset(web_dir: &Option<PathBuf>, filename: &str, fallback: &'static str) -> String {
@@ -316,10 +395,183 @@ async fn api_info(State(st): State<Arc<AppState>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "minilang_version": "2.17.0",
         "languages": st.languages.list_info(),
+        "auth_required": st.auth.is_enabled(),
+        "required_group": st.auth.required_group(),
         "root_name": root_name,
         "root_path": st.files.root().display().to_string(),
     }))
     .into_response()
+}
+
+// --- Authentication & Refreshable Token Routes ---
+
+async fn api_auth_status(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let user = auth::extract_access_token(&headers, None)
+        .and_then(|tok| st.auth.verify_access_token(&tok).ok());
+    let authenticated = if st.auth.is_enabled() {
+        user.is_some()
+    } else {
+        true
+    };
+    Json(json!({
+        "auth_required": st.auth.is_enabled(),
+        "required_group": st.auth.required_group(),
+        "authenticated": authenticated,
+        "user": user,
+        "access_token_ttl": st.auth.access_token_ttl(),
+        "refresh_token_ttl": st.auth.refresh_token_ttl(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+async fn api_auth_login(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    match st.auth.login(body.username, body.password).await {
+        Ok(pair) => {
+            let mut resp = Json(&pair).into_response();
+            auth::append_auth_cookies(resp.headers_mut(), &pair);
+            resp
+        }
+        Err(err) => (
+            err.status_code(),
+            Json(json!({
+                "error": err.message(),
+                "code": err.code(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RefreshBody {
+    refresh_token: Option<String>,
+}
+
+async fn api_auth_refresh(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Response {
+    let body_token = if raw_body.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<RefreshBody>(&raw_body)
+            .ok()
+            .and_then(|b| b.refresh_token)
+    };
+    let refresh_token = body_token
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| auth::parse_cookie(&headers, auth::REFRESH_COOKIE_NAME));
+
+    let Some(token) = refresh_token else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "Missing refresh token",
+                "code": "missing_refresh_token",
+            })),
+        )
+            .into_response();
+    };
+
+    match st.auth.refresh(&token).await {
+        Ok(pair) => {
+            let mut resp = Json(&pair).into_response();
+            auth::append_auth_cookies(resp.headers_mut(), &pair);
+            resp
+        }
+        Err(err) => {
+            let mut resp = (
+                err.status_code(),
+                Json(json!({
+                    "error": err.message(),
+                    "code": err.code(),
+                })),
+            )
+                .into_response();
+            auth::append_clear_auth_cookies(resp.headers_mut());
+            resp
+        }
+    }
+}
+
+async fn api_auth_logout(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw_body: String,
+) -> Response {
+    let body_token = if raw_body.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<RefreshBody>(&raw_body)
+            .ok()
+            .and_then(|b| b.refresh_token)
+    };
+    let refresh_token = body_token
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| auth::parse_cookie(&headers, auth::REFRESH_COOKIE_NAME));
+
+    let revoked = refresh_token
+        .map(|t| st.auth.logout(&t))
+        .unwrap_or(false);
+
+    let mut resp = Json(json!({ "ok": true, "revoked": revoked })).into_response();
+    auth::append_clear_auth_cookies(resp.headers_mut());
+    resp
+}
+
+async fn api_auth_me(
+    State(st): State<Arc<AppState>>,
+    user: Option<Extension<AuthenticatedUser>>,
+) -> Response {
+    match user {
+        Some(Extension(u)) => {
+            let active_sessions = st.auth.active_sessions_for_user(&u.username);
+            Json(json!({
+                "auth_required": st.auth.is_enabled(),
+                "authenticated": true,
+                "user": u,
+                "active_sessions": active_sessions,
+            }))
+            .into_response()
+        }
+        None => Json(json!({
+            "auth_required": st.auth.is_enabled(),
+            "authenticated": !st.auth.is_enabled(),
+            "user": null,
+            "active_sessions": 0,
+        }))
+        .into_response(),
+    }
+}
+
+async fn api_auth_logout_all(
+    State(st): State<Arc<AppState>>,
+    user: Option<Extension<AuthenticatedUser>>,
+) -> Response {
+    let revoked_sessions = match user {
+        Some(Extension(u)) => st.auth.logout_all_for_user(&u.username),
+        None => 0,
+    };
+    let mut resp = Json(json!({
+        "ok": true,
+        "revoked_sessions": revoked_sessions,
+    }))
+    .into_response();
+    auth::append_clear_auth_cookies(resp.headers_mut());
+    resp
 }
 
 async fn api_languages(State(st): State<Arc<AppState>>) -> Response {

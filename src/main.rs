@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod files;
 mod kernel_mgr;
 mod kernel_proc;
@@ -38,6 +39,30 @@ struct Cli {
     /// Optional directory to serve frontend assets from disk (for live editing)
     #[arg(long)]
     web_dir: Option<PathBuf>,
+
+    /// Require local machine login (PAM) + refreshable Bearer tokens for API, /invoke, and /ui
+    #[arg(long, default_value_t = false)]
+    require_login: bool,
+
+    /// Require authenticated local users to belong to this Unix group (implies --require-login)
+    #[arg(long, value_name = "GROUP")]
+    require_group: Option<String>,
+
+    /// PAM service name used to authenticate local users (from /etc/pam.d/<service>)
+    #[arg(long, default_value = "login")]
+    pam_service: String,
+
+    /// Access token lifetime in seconds (default: 900 = 15 minutes)
+    #[arg(long, default_value_t = 900)]
+    access_token_ttl: i64,
+
+    /// Refresh token lifetime in seconds (default: 604800 = 7 days)
+    #[arg(long, default_value_t = 604_800)]
+    refresh_token_ttl: i64,
+
+    /// HMAC signing secret for access tokens (or set MINILANG_AUTH_SECRET env var; random if omitted)
+    #[arg(long)]
+    auth_secret: Option<String>,
 }
 
 fn main() {
@@ -68,11 +93,25 @@ fn main() {
         let root_canon = files.root().to_path_buf();
         let languages = Arc::new(lang::LanguageRegistry::with_defaults());
         let kernels = kernel_mgr::KernelManager::new(root_canon.clone(), languages.clone());
+        let auth_config = auth::AuthConfig::new(
+            cli.require_login,
+            cli.require_group.clone(),
+            cli.pam_service.clone(),
+            cli.access_token_ttl,
+            cli.refresh_token_ttl,
+            cli.auth_secret.clone(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to initialize auth config: {}", e);
+            std::process::exit(1);
+        });
+        let auth = Arc::new(auth::AuthManager::new(auth_config));
 
         let state = Arc::new(api::AppState {
             files,
             kernels,
             languages,
+            auth: auth.clone(),
             web_dir: cli.web_dir,
         });
 
@@ -84,6 +123,17 @@ fn main() {
         println!("Minilang Notebook Server v{}", env!("CARGO_PKG_VERSION"));
         println!("  Workspace: {}", root_canon.display());
         println!("  URL:       http://{}", addr);
+        if auth.is_enabled() {
+            println!(
+                "  Auth:      ENABLED (PAM service '{}', group: {}, access TTL: {}s, refresh TTL: {}s)",
+                cli.pam_service,
+                auth.required_group().unwrap_or("<any local user>"),
+                auth.access_token_ttl(),
+                auth.refresh_token_ttl()
+            );
+        } else {
+            println!("  Auth:      disabled (pass --require-login or --require-group <GROUP> to enable)");
+        }
 
         axum::Server::bind(&addr)
             .serve(app.into_make_service())

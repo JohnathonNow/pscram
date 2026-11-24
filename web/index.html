@@ -50,6 +50,22 @@
             <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
           </svg>
         </button>
+        <div id="auth-user-menu" class="auth-user-menu hidden">
+          <span id="auth-user-badge" class="auth-user-badge" title="Signed-in local user">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            <span id="auth-username">user</span>
+          </span>
+          <button id="btn-auth-refresh" class="icon-btn sm" title="Refresh Auth Token">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button id="btn-auth-logout" class="toolbar-chip" title="Sign Out">Sign Out</button>
+        </div>
       </div>
     </header>
 
@@ -343,6 +359,32 @@
 
   <!-- Toast Container -->
   <div id="toast-container" class="toast-container"></div>
+
+  <!-- Local Login Overlay (shown only when server requires login) -->
+  <div id="login-overlay" class="login-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-logo">λ</span>
+        <div>
+          <h2 id="login-title" class="login-title">Sign In</h2>
+          <div class="login-subtitle">Authenticate with your local machine account</div>
+        </div>
+      </div>
+      <div id="login-group-banner" class="login-group-banner hidden"></div>
+      <form id="login-form" class="login-form" autocomplete="on">
+        <label class="login-field">
+          <span>Username</span>
+          <input id="login-username" type="text" name="username" autocomplete="username" required placeholder="Local Unix username" />
+        </label>
+        <label class="login-field">
+          <span>Password</span>
+          <input id="login-password" type="password" name="password" autocomplete="current-password" required placeholder="Local account password" />
+        </label>
+        <div id="login-error" class="login-error hidden"></div>
+        <button id="login-submit" type="submit" class="tb-btn primary login-submit">Sign In</button>
+      </form>
+    </div>
+  </div>
 
   <script src="/minijs_vm.js"></script>
   <script src="/app.js"></script>

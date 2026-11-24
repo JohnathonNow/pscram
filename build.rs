@@ -59,6 +59,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/ml_kernel.c");
     println!("cargo:rerun-if-changed=csrc/ml_ui.c");
     println!("cargo:rerun-if-changed=csrc/ml_ui.h");
+    println!("cargo:rerun-if-changed=csrc/ml_io.c");
+    println!("cargo:rerun-if-changed=csrc/ml_io.h");
     println!(
         "cargo:rerun-if-changed={}",
         minilang_src.join("ml_minijs.c").display()
@@ -73,6 +75,7 @@ fn main() {
     cc::Build::new()
         .file("csrc/ml_kernel.c")
         .file("csrc/ml_ui.c")
+        .file("csrc/ml_io.c")
         .file(minilang_src.join("ml_minijs.c"))
         .include(&minilang_src)
         .include(&minilang_obj)
@@ -96,5 +99,6 @@ fn main() {
     println!("cargo:rustc-link-lib=gc");
     println!("cargo:rustc-link-lib=uuid");
     println!("cargo:rustc-link-lib=m");
+    println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=pthread");
 }

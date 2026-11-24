@@ -17,6 +17,7 @@
 #include "ml_base64.h"
 #include "ml_minijs.h"
 #include "ml_ui.h"
+#include "ml_io.h"
 #include "stringmap.h"
 
 #include <stdio.h>
@@ -247,6 +248,7 @@ void mlk_init(const char *exec_name) {
     ml_externals_default_add("uuid", MLUUIDT);
 
     ml_ui_init(MLGlobals, mlk_emit_ui_display);
+    ml_io_init(MLGlobals);
 
     g_compiler = ml_compiler2((ml_getter_t)ml_stringmap_global_get, MLGlobals, 1);
     g_parser = ml_parser(NULL, NULL);

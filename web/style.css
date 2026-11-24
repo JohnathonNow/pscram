@@ -1757,3 +1757,132 @@ html, body {
   .vars-drawer { position: absolute; z-index: 50; top: 42px; bottom: 26px; right: 0; }
   .shortcut-hint { display: none; }
 }
+
+/* Authentication UI & Login Overlay */
+.auth-user-menu {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.auth-user-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-badge);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(9, 11, 18, 0.82);
+  backdrop-filter: blur(8px);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 390px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 26px 28px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.login-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.login-subtitle {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.login-group-banner {
+  padding: 8px 11px;
+  border-radius: 7px;
+  background: var(--bg-badge);
+  border: 1px solid rgba(122, 162, 247, 0.35);
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.login-group-banner code {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.login-field input {
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13.5px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.login-field input:focus {
+  border-color: var(--border-focus);
+}
+
+.login-error {
+  padding: 8px 11px;
+  border-radius: 7px;
+  background: rgba(248, 113, 113, 0.13);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: var(--accent-red);
+  font-size: 12.5px;
+}
+
+.login-submit {
+  width: 100%;
+  height: 36px;
+  justify-content: center;
+  font-size: 13.5px;
+  font-weight: 600;
+  margin-top: 4px;
+}

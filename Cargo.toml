@@ -8,6 +8,7 @@ description = "Jupyter-like notebook webapp for the Minilang REPL with file brow
 axum = { version = "0.6", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.3", features = ["derive"] }
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync", "time", "fs", "signal"] }
