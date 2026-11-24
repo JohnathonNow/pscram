@@ -91,6 +91,7 @@ fn main() {
             std::process::exit(1);
         });
         let root_canon = files.root().to_path_buf();
+        std::env::set_var("MINILANG_WORKSPACE_ROOT", &root_canon);
         let languages = Arc::new(lang::LanguageRegistry::with_defaults());
         let kernels = kernel_mgr::KernelManager::new(root_canon.clone(), languages.clone());
         let auth_config = auth::AuthConfig::new(

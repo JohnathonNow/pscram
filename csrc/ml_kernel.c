@@ -16,6 +16,8 @@
 #include "ml_base16.h"
 #include "ml_base64.h"
 #include "ml_minijs.h"
+#include "ml_module.h"
+#include "ml_library.h"
 #include "ml_ui.h"
 #include "ml_io.h"
 #include "stringmap.h"
@@ -27,6 +29,8 @@
 #include <math.h>
 #include <time.h>
 #include <locale.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef void (*mlk_stdout_cb)(const char *data, size_t len, void *ctx);
 typedef void (*mlk_display_cb)(const char *mime, const char *data, size_t len, void *ctx);
@@ -182,6 +186,115 @@ static ml_value_t *mlk_globals(stringmap_t *Globals, int Count, ml_value_t **Arg
     return Result;
 }
 
+/* --- Module / Import Support for .mini Scripts & Notebooks --- */
+
+extern const char *ml_load_file_read(void *Data);
+
+static int mlk_test_exact_mini(const char *FileName) {
+    if (!FileName) return 0;
+    size_t Len = strlen(FileName);
+    if (Len < 5 || strcmp(FileName + Len - 5, ".mini") != 0) return 0;
+    struct stat St;
+    return stat(FileName, &St) == 0 && S_ISREG(St.st_mode);
+}
+
+static void mlk_load_exact_mini(ml_state_t *Caller, const char *FileName, ml_value_t **Slot) {
+    FILE *File = fopen(FileName, "r");
+    if (!File) ML_ERROR("LoadError", "error opening %s", FileName);
+    ml_parser_t *Parser = ml_parser(ml_load_file_read, File);
+    int LineNo = 1;
+    const char *Line = ml_load_file_read(File);
+    if (!Line) ML_ERROR("LoadError", "empty file %s", FileName);
+    if (Line[0] == '#' && Line[1] == '!') {
+        LineNo = 2;
+        Line = ml_load_file_read(File);
+        if (!Line) ML_ERROR("LoadError", "empty file %s", FileName);
+    }
+    ml_parser_source(Parser, (ml_source_t){FileName, LineNo});
+    ml_parser_input(Parser, Line, 0);
+    const mlc_expr_t *Expr = ml_accept_file(Parser);
+    if (!Expr) ML_RETURN(ml_parser_value(Parser));
+    ml_compiler_t *Compiler = ml_compiler((ml_getter_t)ml_stringmap_global_get, MLGlobals);
+    ml_compiler_define(Compiler, "import", ml_library_importer(FileName));
+    return ml_module_compile(Caller, FileName, Expr, Compiler, Slot);
+}
+
+/* Dynamic top-level importer:
+ * - Calling `import(Name)` resolves relative `./` / `../` paths against current working directory
+ *   (so notebooks and `/invoke` scripts always resolve relative imports accurately even after `chdir`),
+ *   absolute `/...` paths directly, and bare names via `library::get_path()` search paths.
+ * - Stringifying `import` (`string(import)`, `'{import}/file.cbor'`, `print(import)`) appends the
+ *   current directory path, matching Minilang's built-in `MLImporterT` in `ml_library.c`. */
+typedef struct {
+    ml_type_t *Type;
+} mlk_importer_t;
+
+static void mlk_importer_call(ml_state_t *Caller, mlk_importer_t *Importer, int Count, ml_value_t **Args) {
+    (void)Importer;
+    ML_CHECKX_ARG_COUNT(1);
+    ml_value_t *NameArg = ml_deref(Args[0]);
+    if (!ml_is(NameArg, MLStringT)) {
+        ML_ERROR("TypeError", "Expected string for import path");
+    }
+    const char *Name = ml_string_value(NameArg);
+    if (Name[0] == '.') {
+        char *Cwd = getcwd(NULL, 0);
+        if (!Cwd) ML_ERROR("ModuleError", "Could not determine working directory");
+        char *GcCwd = snew(strlen(Cwd) + 1);
+        strcpy(GcCwd, Cwd);
+        free(Cwd);
+        return ml_library_load(Caller, GcCwd, Name);
+    }
+    if (Name[0] == '/') {
+        return ml_library_load(Caller, "/", Name + 1);
+    }
+    return ml_library_load(Caller, NULL, Name);
+}
+
+static ml_value_t *mlk_importer_append(void *Data, int Count, ml_value_t **Args) {
+    (void)Data;
+    (void)Count;
+    ml_stringbuffer_t *Buffer = (ml_stringbuffer_t *)Args[0];
+    char *Cwd = getcwd(NULL, 0);
+    if (!Cwd) return MLNil;
+    ml_stringbuffer_write(Buffer, Cwd, strlen(Cwd));
+    free(Cwd);
+    return MLSome;
+}
+
+ML_TYPE(MLKImporterT, (MLFunctionT), "importer",
+    .call = (void *)mlk_importer_call
+);
+
+static mlk_importer_t MLKImportObj[1] = {{MLKImporterT}};
+
+/* Top-level fallback `export`: allows `.mini` library modules using `export: fun ...` / `export: let ...`
+ * to also be executed directly via `/invoke` or the editor Run button without failing.
+ * When imported as a module, `ml_module_compile` shadows `export` with `ml_mini_module_export`. */
+ML_FUNCTIONX(MLKTopLevelExport) {
+    if (Count == 0) ML_RETURN(MLNil);
+    ml_value_t *Last = MLNil;
+    if (ml_is(ml_deref(Args[0]), MLNamesT)) {
+        for (int I = 1; I < Count; ++I) {
+            Last = ml_deref(Args[I]);
+        }
+    } else {
+        Last = ml_deref(Args[Count - 1]);
+    }
+    ML_RETURN(Last);
+}
+
+void mlk_add_library_path(const char *path) {
+    if (!path || !*path) return;
+    struct stat St;
+    if (stat(path, &St) == 0 && S_ISDIR(St.st_mode)) {
+        size_t len = strlen(path);
+        char *gc_copy = snew(len + 1);
+        memcpy(gc_copy, path, len + 1);
+        ml_library_path_add(gc_copy);
+    }
+}
+
 void mlk_init(const char *exec_name) {
     ml_init(exec_name ? exec_name : "minilang", MLGlobals);
     ml_time_init(MLGlobals);
@@ -235,6 +348,24 @@ void mlk_init(const char *exec_name) {
     ml_base16_init(MLGlobals);
     ml_base64_init(MLGlobals);
     ml_minijs_init(MLGlobals);
+    ml_module_init(MLGlobals);
+    ml_library_init(MLGlobals);
+
+    /* Allow both `import("foo")` and `import("foo.mini")` (and relative `./foo.mini`) */
+    ml_library_loader_add("", mlk_test_exact_mini, mlk_load_exact_mini, NULL);
+    /* Initialize MLKImporterT + its `append` method so string(import) yields the current script/notebook directory */
+    ml_type_init(MLKImporterT, MLFunctionT, NULL);
+    ml_method_definev(
+        ml_method("append"),
+        ml_cfunction(NULL, (ml_callback_t)mlk_importer_append),
+        NULL,
+        MLStringBufferT,
+        MLKImporterT,
+        NULL
+    );
+    /* Use dynamic CWD-aware importer at top-level (modules loaded via ml_library still get per-file importers) */
+    stringmap_insert(MLGlobals, "import", MLKImportObj);
+    stringmap_insert(MLGlobals, "export", MLKTopLevelExport);
 
     ml_externals_default_add("print", MLKPrint);
     ml_externals_default_add("println", MLKPrintln);
@@ -246,6 +377,8 @@ void mlk_init(const char *exec_name) {
     ml_externals_default_add("json", MLJsonT);
     ml_externals_default_add("time", MLTimeT);
     ml_externals_default_add("uuid", MLUUIDT);
+    ml_externals_default_add("import", MLKImportObj);
+    ml_externals_default_add("library", stringmap_search(MLGlobals, "library"));
 
     ml_ui_init(MLGlobals, mlk_emit_ui_display);
     ml_io_init(MLGlobals);

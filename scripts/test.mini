@@ -1,0 +1,2 @@
+import: math("math")              :> workspace-relative path
+math::square(5)

@@ -14,6 +14,7 @@ type MlkVarCb = extern "C" fn(*const c_char, *const c_char, *const c_char, c_int
 
 extern "C" {
     fn mlk_init(exec_name: *const c_char);
+    fn mlk_add_library_path(path: *const c_char);
     fn mlk_eval(
         source_name: *const c_char,
         code: *const c_char,
@@ -566,10 +567,42 @@ fn handle_invoke(
     }
 }
 
+fn register_library_path(path: &std::path::Path) {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        if let Ok(c_path) = CString::new(canon.to_string_lossy().as_bytes()) {
+            unsafe {
+                mlk_add_library_path(c_path.as_ptr());
+            }
+        }
+    }
+}
+
 pub fn run_kernel_process() -> io::Result<()> {
     let exec_name = CString::new("minilang-notebook").unwrap();
     unsafe {
         mlk_init(exec_name.as_ptr());
+    }
+
+    // Add search paths in reverse priority order (`ml_library_path_add` pushes to front):
+    // 1. current working directory (highest priority)
+    // 2. workspace root
+    // 3. <workspace_root>/scripts
+    if let Ok(ws_root) = std::env::var("MINILANG_WORKSPACE_ROOT") {
+        let root_path = std::path::PathBuf::from(&ws_root);
+        let scripts_dir = root_path.join("scripts");
+        if scripts_dir.is_dir() {
+            register_library_path(&scripts_dir);
+        }
+        if root_path.is_dir() {
+            register_library_path(&root_path);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let local_scripts = cwd.join("scripts");
+        if local_scripts.is_dir() {
+            register_library_path(&local_scripts);
+        }
+        register_library_path(&cwd);
     }
 
     let stdin = io::stdin();
@@ -592,9 +625,14 @@ pub fn run_kernel_process() -> io::Result<()> {
                 message: "pong".to_string(),
             },
             Ok(KernelRequest::Chdir { path }) => match std::env::set_current_dir(&path) {
-                Ok(()) => KernelResponse::Ok {
-                    message: format!("changed directory to {}", path),
-                },
+                Ok(()) => {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        register_library_path(&cwd);
+                    }
+                    KernelResponse::Ok {
+                        message: format!("changed directory to {}", path),
+                    }
+                }
                 Err(e) => KernelResponse::Err {
                     message: format!("chdir failed: {}", e),
                 },
