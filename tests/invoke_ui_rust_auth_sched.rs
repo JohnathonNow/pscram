@@ -348,4 +348,33 @@ fn test_rust_script_execute_with_params_and_table_chart_example_notebooks() {
     }
     assert!(chart_displays >= 6, "expected >= 6 chart displays, got {}", chart_displays);
     assert!(chart_ui_displays >= 1, "expected >= 1 ui::chart display, got {}", chart_ui_displays);
+
+    // 5. Verify sample_workspace/notebooks/sqlite_db.mnb executes cleanly & emits table, chart, and UI displays
+    let db_nb: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root.join("sample_workspace/notebooks/sqlite_db.mnb")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(db_nb["format"], "minilang-notebook");
+    srv.create_kernel("nb-sqlite-db", "minilang");
+    let mut db_tables = 0usize;
+    let mut db_charts = 0usize;
+    let mut db_uis = 0usize;
+    for cell in db_nb["cells"].as_array().unwrap() {
+        if cell["cell_type"] == "code" {
+            let code = cell["source"].as_str().unwrap();
+            let ev = srv.eval("nb-sqlite-db", code);
+            assert!(ev["error"].is_null(), "sqlite_db.mnb cell {} failed: {:?}", cell["id"], ev["error"]);
+            for d in ev["displays"].as_array().unwrap() {
+                match d["mime"].as_str().unwrap_or("") {
+                    "application/vnd.minilang.table+json" => db_tables += 1,
+                    "application/vnd.minilang.chart+json" => db_charts += 1,
+                    "application/vnd.minilang.ui+json" => db_uis += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(db_tables >= 3, "expected >= 3 table displays in sqlite_db.mnb, got {}", db_tables);
+    assert!(db_charts >= 4, "expected >= 4 chart displays in sqlite_db.mnb, got {}", db_charts);
+    assert!(db_uis >= 1, "expected >= 1 UI display in sqlite_db.mnb, got {}", db_uis);
 }
