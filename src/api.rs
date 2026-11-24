@@ -53,6 +53,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/files/search", get(api_search_files))
         .route("/api/file", get(api_read_file).put(api_write_file).delete(api_delete_file))
         .route("/api/file/raw", get(api_read_file_raw))
+        .route("/api/log", get(api_read_log))
         .route("/api/file/new", post(api_create_file))
         .route("/api/file/rename", post(api_rename_file))
         .route("/api/notebook/from-mini", post(api_notebook_from_script))
@@ -649,6 +650,54 @@ async fn api_read_file_raw(
                 .into_response()
         }
         Err(e) => api_err(StatusCode::NOT_FOUND, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    path: String,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    reverse: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn api_read_log(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<LogQuery>,
+) -> Response {
+    let abs = match st.files.resolve_existing(&q.path) {
+        Ok(p) => p,
+        Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+    };
+    let rel = abs
+        .strip_prefix(st.files.root())
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let reverse = matches!(
+        q.reverse.as_deref().map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500);
+    match crate::log_reader::read_log_file(
+        &abs,
+        &rel,
+        q.q.as_deref(),
+        q.r#type.as_deref(),
+        reverse,
+        offset,
+        limit,
+    ) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => api_err(StatusCode::BAD_REQUEST, e),
     }
 }
 

@@ -20,6 +20,7 @@
 #include "ml_library.h"
 #include "ml_ui.h"
 #include "ml_io.h"
+#include "ml_log.h"
 #include "stringmap.h"
 
 #include <stdio.h>
@@ -560,6 +561,7 @@ void mlk_init(const char *exec_name) {
 
     ml_ui_init(MLGlobals, mlk_emit_ui_display);
     ml_io_init(MLGlobals);
+    ml_log_init(MLGlobals);
 
     g_compiler = ml_compiler2((ml_getter_t)ml_stringmap_global_get, MLGlobals, 1);
     g_parser = ml_parser(NULL, NULL);

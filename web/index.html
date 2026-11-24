@@ -267,6 +267,36 @@
           <span id="mtb-meta" class="tb-meta"></span>
         </div>
 
+        <!-- Markdown Viewer Toolbar -->
+        <div id="md-toolbar" class="editor-toolbar hidden">
+          <div class="toolbar-group">
+            <button id="mdtb-save" class="tb-btn primary" title="Save Markdown (Ctrl+S)">Save</button>
+            <span class="tb-sep"></span>
+            <div class="tb-segmented" role="group" aria-label="Markdown view mode">
+              <button id="mdtb-mode-preview" class="tb-seg-btn active" data-mode="preview">Preview</button>
+              <button id="mdtb-mode-split" class="tb-seg-btn" data-mode="split">Split</button>
+              <button id="mdtb-mode-edit" class="tb-seg-btn" data-mode="edit">Edit</button>
+            </div>
+          </div>
+          <span id="mdtb-meta" class="tb-meta"></span>
+        </div>
+
+        <!-- Log Viewer Toolbar -->
+        <div id="log-toolbar" class="editor-toolbar hidden">
+          <div class="toolbar-group">
+            <input id="ltb-search" class="log-filter-input" type="text" placeholder="Filter log entries..." autocomplete="off" />
+            <select id="ltb-type-select" class="tb-lang-select" title="Filter by value type">
+              <option value="all">All types</option>
+            </select>
+            <button id="ltb-order" class="tb-btn" title="Toggle Newest / Oldest First">Newest First</button>
+            <button id="ltb-refresh" class="tb-btn" title="Reload Log File">Refresh</button>
+            <button id="ltb-live" class="tb-btn" title="Auto-refresh every 2 seconds">Live Tail: Off</button>
+            <button id="ltb-edit-raw" class="tb-btn hidden" title="Open Plain-Text Log in Editor">Edit Text</button>
+            <button id="ltb-download" class="tb-btn" title="Download Log File">Download</button>
+          </div>
+          <span id="ltb-meta" class="tb-meta"></span>
+        </div>
+
         <!-- Notebook Canvas -->
         <div id="notebook-view" class="notebook-scroll">
           <div id="cells-container" class="cells-container"></div>
@@ -328,6 +358,21 @@
           <div id="media-pdf-stage" class="media-pdf-stage hidden">
             <iframe id="media-pdf-frame" class="media-pdf-frame" title="PDF Viewer"></iframe>
           </div>
+        </div>
+
+        <!-- Markdown Document Viewer / Split Editor -->
+        <div id="markdown-view" class="markdown-viewer-pane hidden">
+          <div id="md-editor-pane" class="md-editor-pane hidden">
+            <textarea id="md-editor-textarea" class="md-doc-textarea" spellcheck="true" placeholder="Write Markdown..."></textarea>
+          </div>
+          <div id="md-preview-pane" class="md-preview-pane">
+            <article id="md-preview-content" class="md-rendered md-doc-article"></article>
+          </div>
+        </div>
+
+        <!-- Structured & Plain-Text Log Viewer -->
+        <div id="log-view" class="log-viewer-pane hidden">
+          <div id="log-entries-list" class="log-entries-list"></div>
         </div>
       </main>
 

@@ -4,6 +4,7 @@ mod files;
 mod kernel_mgr;
 mod kernel_proc;
 mod lang;
+mod log_reader;
 mod notebook;
 mod rust_kernel_proc;
 mod tagged;

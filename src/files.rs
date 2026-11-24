@@ -23,6 +23,14 @@ pub fn is_image_ext(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif")
 }
 
+pub fn is_markdown_ext(ext: &str) -> bool {
+    matches!(ext, "md" | "markdown")
+}
+
+pub fn is_log_ext(ext: &str) -> bool {
+    matches!(ext, "log" | "mlog")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -37,6 +45,8 @@ pub struct FileEntry {
     pub is_ui: bool,
     pub is_image: bool,
     pub is_pdf: bool,
+    pub is_markdown: bool,
+    pub is_log: bool,
     pub mime_type: Option<String>,
     pub language: Option<String>,
 }
@@ -58,6 +68,8 @@ pub struct FileReadResult {
     pub is_binary: bool,
     pub is_image: bool,
     pub is_pdf: bool,
+    pub is_markdown: bool,
+    pub is_log: bool,
     pub mime_type: Option<String>,
 }
 
@@ -170,6 +182,8 @@ impl FileStore {
 
             let is_image = !is_dir && is_image_ext(&ext);
             let is_pdf = !is_dir && ext == "pdf";
+            let is_markdown = !is_dir && is_markdown_ext(&ext);
+            let is_log = !is_dir && (is_log_ext(&ext) || crate::log_reader::has_mlog_magic(&path));
             let mime_type = if is_dir {
                 None
             } else {
@@ -188,6 +202,8 @@ impl FileStore {
                 is_ui: ext == "ui",
                 is_image,
                 is_pdf,
+                is_markdown,
+                is_log,
                 mime_type,
                 language,
                 extension: ext,
@@ -266,6 +282,8 @@ impl FileStore {
                     };
                     let is_image = !is_dir && is_image_ext(&ext);
                     let is_pdf = !is_dir && ext == "pdf";
+                    let is_markdown = !is_dir && is_markdown_ext(&ext);
+                    let is_log = !is_dir && is_log_ext(&ext);
                     let mime_type = if is_dir {
                         None
                     } else {
@@ -283,6 +301,8 @@ impl FileStore {
                         is_ui: ext == "ui",
                         is_image,
                         is_pdf,
+                        is_markdown,
+                        is_log,
                         mime_type,
                         language,
                         extension: ext,
@@ -311,10 +331,13 @@ impl FileStore {
             .to_lowercase();
         let is_image = is_image_ext(&ext);
         let is_pdf = ext == "pdf";
+        let is_markdown = is_markdown_ext(&ext);
+        let is_mlog = crate::log_reader::has_mlog_magic(&abs);
+        let is_log = is_log_ext(&ext) || is_mlog;
         let mime_type = media_mime_for_ext(&ext).map(|s| s.to_string());
 
-        // For binary images/PDFs (other than editable UTF-8 SVG), return metadata directly without UTF-8 decoding
-        if (is_image && ext != "svg") || is_pdf {
+        // For binary images, PDFs, or binary MLOG files, return metadata directly without UTF-8 decoding
+        if (is_image && ext != "svg") || is_pdf || is_mlog {
             return Ok(FileReadResult {
                 path: self.to_rel_string(&abs),
                 name,
@@ -324,6 +347,8 @@ impl FileStore {
                 is_binary: true,
                 is_image,
                 is_pdf,
+                is_markdown,
+                is_log,
                 mime_type,
             });
         }
@@ -343,6 +368,8 @@ impl FileStore {
                 is_binary: false,
                 is_image,
                 is_pdf,
+                is_markdown,
+                is_log,
                 mime_type,
             }),
             Err(_) => Ok(FileReadResult {
@@ -354,6 +381,8 @@ impl FileStore {
                 is_binary: true,
                 is_image,
                 is_pdf,
+                is_markdown,
+                is_log,
                 mime_type,
             }),
         }

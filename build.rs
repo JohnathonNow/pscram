@@ -70,6 +70,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/ml_ui.h");
     println!("cargo:rerun-if-changed=csrc/ml_io.c");
     println!("cargo:rerun-if-changed=csrc/ml_io.h");
+    println!("cargo:rerun-if-changed=csrc/ml_log.c");
+    println!("cargo:rerun-if-changed=csrc/ml_log.h");
     println!(
         "cargo:rerun-if-changed={}",
         minilang_src.join("ml_minijs.c").display()
@@ -113,6 +115,7 @@ fn main() {
         .file("csrc/ml_kernel.c")
         .file("csrc/ml_ui.c")
         .file("csrc/ml_io.c")
+        .file("csrc/ml_log.c")
         .file(minilang_src.join("ml_minijs.c"))
         .file(minilang_src.join("ml_module.c"))
         .file(minilang_src.join("ml_library.c"))

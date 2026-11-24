@@ -28,7 +28,7 @@
     "address", "any", "array", "base16", "base64", "boolean", "buffer", "cbor",
     "chained", "channel", "compiler", "complex", "condition", "context", "decimal",
     "dir", "double", "enum", "error", "external", "file", "flags", "function",
-    "integer", "json", "list", "logger", "macro", "map", "matrix", "method",
+    "integer", "json", "list", "log", "logger", "macro", "map", "matrix", "method",
     "minijs", "mmap", "module", "number", "object", "parser", "permutation",
     "polynomial", "popen", "pqueue", "property", "random", "real", "regex",
     "rwlock", "semaphore", "sequence", "set", "slice", "socket", "stream", "string",
@@ -394,22 +394,22 @@
     return highlightMinilang(code);
   }
 
-  // --- Lightweight Markdown Renderer ---
+  // --- Markdown Renderer (GFM Tables, Code Highlighting, Lists, Media Previews) ---
   function renderMarkdown(md) {
     if (!md || !md.trim()) {
-      return `<div class="md-placeholder">Double-click to edit Markdown cell...</div>`;
+      return `<div class="md-placeholder">Double-click to edit Markdown...</div>`;
     }
     const lines = md.replace(/\r\n/g, "\n").split("\n");
     let html = "";
     let inCode = false;
     let codeLang = "";
     let codeBuf = [];
-    let inList = false;
+    let listTag = null; // "ul" | "ol"
 
     const flushList = () => {
-      if (inList) {
-        html += "</ul>";
-        inList = false;
+      if (listTag) {
+        html += `</${listTag}>`;
+        listTag = null;
       }
     };
 
@@ -417,27 +417,44 @@
       let s = escapeHtml(text);
       s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
       s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
       s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
       // Markdown image thumbnail preview: ![alt](path-or-url)
       s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, href) => {
         const isExt = /^https?:\/\/|^data:/i.test(href);
         const rel = isExt ? null : resolveWorkspaceRelPath(href, activeTab()?.path || "");
-        const src = isExt ? href : rawFileUrl(rel);
+        const srcUrl = isExt ? href : rawFileUrl(rel);
         const label = alt || (rel ? rel.split("/").pop() : href.split("/").pop()) || "Image";
-        return renderMediaThumbnailCard({ kind: "image", src, path: rel, name: label, mime: "image/*" });
+        return renderMediaThumbnailCard({ kind: "image", src: srcUrl, path: rel, name: label, mime: "image/*" });
       });
       // Markdown PDF thumbnail preview: [label](path/to/doc.pdf)
       s = s.replace(/\[([^\]]+)\]\(([^)\s]+\.pdf)\)/gi, (_, label, href) => {
         const isExt = /^https?:\/\//i.test(href);
         const rel = isExt ? null : resolveWorkspaceRelPath(href, activeTab()?.path || "");
-        const src = isExt ? href : rawFileUrl(rel);
-        return renderMediaThumbnailCard({ kind: "pdf", src, path: rel, name: label || (rel ? rel.split("/").pop() : "Document.pdf"), mime: "application/pdf" });
+        const srcUrl = isExt ? href : rawFileUrl(rel);
+        return renderMediaThumbnailCard({ kind: "pdf", src: srcUrl, path: rel, name: label || (rel ? rel.split("/").pop() : "Document.pdf"), mime: "application/pdf" });
       });
+      // External links
       s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      // Workspace relative links (e.g. [greet.mini](scripts/greet.mini))
+      s = s.replace(/\[([^\]]+)\]\(([^)\s#][^)\s]*)\)/g, (_, label, href) => {
+        if (/^[a-z]+:/i.test(href)) return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
+        const rel = resolveWorkspaceRelPath(href, activeTab()?.path || "");
+        return `<a href="#" class="md-ws-link" data-ws-path="${escapeHtml(rel)}">${label}</a>`;
+      });
       return s;
     };
 
-    for (const line of lines) {
+    const isTableSep = (line) => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+    const splitTableRow = (line) => {
+      let t = line.trim();
+      if (t.startsWith("|")) t = t.slice(1);
+      if (t.endsWith("|")) t = t.slice(0, -1);
+      return t.split("|").map((c) => c.trim());
+    };
+
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
       if (line.trim().startsWith("```")) {
         flushList();
         if (!inCode) {
@@ -446,10 +463,16 @@
           codeBuf = [];
         } else {
           const raw = codeBuf.join("\n");
-          const body = (codeLang === "minilang" || codeLang === "mini" || codeLang === "")
-            ? highlightMinilang(raw)
-            : escapeHtml(raw);
-          html += `<pre><code>${body}</code></pre>`;
+          let body;
+          if (codeLang === "minilang" || codeLang === "mini") {
+            body = highlightMinilang(raw);
+          } else if (codeLang === "rust" || codeLang === "rs") {
+            body = highlightRust(raw);
+          } else {
+            body = escapeHtml(raw);
+          }
+          const langTag = codeLang ? `<span class="md-code-lang">${escapeHtml(codeLang)}</span>` : "";
+          html += `<pre>${langTag}<code>${body}</code></pre>`;
           inCode = false;
         }
         continue;
@@ -464,12 +487,36 @@
         flushList();
         continue;
       }
-      if (/^---+$/.test(trimmed)) {
+
+      // GFM Table detection
+      if (trimmed.includes("|") && idx + 1 < lines.length && isTableSep(lines[idx + 1])) {
+        flushList();
+        const headers = splitTableRow(line);
+        idx += 2;
+        let tbl = "<table><thead><tr>";
+        for (const h of headers) tbl += `<th>${inlineFmt(h)}</th>`;
+        tbl += "</tr></thead><tbody>";
+        while (idx < lines.length && lines[idx].trim().includes("|") && lines[idx].trim() !== "") {
+          const cells = splitTableRow(lines[idx]);
+          tbl += "<tr>";
+          for (let c = 0; c < headers.length; c++) {
+            tbl += `<td>${inlineFmt(cells[c] || "")}</td>`;
+          }
+          tbl += "</tr>";
+          idx++;
+        }
+        idx--;
+        tbl += "</tbody></table>";
+        html += tbl;
+        continue;
+      }
+
+      if (/^---+$/.test(trimmed) || /^\*\*\*+$/.test(trimmed)) {
         flushList();
         html += "<hr/>";
         continue;
       }
-      const hMatch = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+      const hMatch = /^(#{1,6})\s+(.*)$/.exec(trimmed);
       if (hMatch) {
         flushList();
         const lvl = hMatch[1].length;
@@ -482,11 +529,21 @@
         continue;
       }
       if (/^[-*]\s+/.test(trimmed)) {
-        if (!inList) {
+        if (listTag !== "ul") {
+          flushList();
           html += "<ul>";
-          inList = true;
+          listTag = "ul";
         }
         html += `<li>${inlineFmt(trimmed.replace(/^[-*]\s+/, ""))}</li>`;
+        continue;
+      }
+      if (/^\d+\.\s+/.test(trimmed)) {
+        if (listTag !== "ol") {
+          flushList();
+          html += "<ol>";
+          listTag = "ol";
+        }
+        html += `<li>${inlineFmt(trimmed.replace(/^\d+\.\s+/, ""))}</li>`;
         continue;
       }
       flushList();
@@ -802,6 +859,12 @@
     if (entry.is_pdf) {
       return `<span class="file-icon pdf"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg></span>`;
     }
+    if (entry.is_markdown) {
+      return `<span class="file-icon md"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z" rx="2"/><path d="M7 15V9l3 3 3-3v6"/><path d="M17 9v6"/></svg></span>`;
+    }
+    if (entry.is_log) {
+      return `<span class="file-icon log"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg></span>`;
+    }
     return `<span class="file-icon generic"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg></span>`;
   }
 
@@ -959,6 +1022,15 @@
           openMediaLightbox({ kind, src, path, name });
         };
       }
+    });
+    container.querySelectorAll(".md-ws-link").forEach((a) => {
+      if (a.dataset.wsBound) return;
+      a.dataset.wsBound = "1";
+      a.onclick = (e) => {
+        e.preventDefault();
+        const p = a.dataset.wsPath;
+        if (p) openPathInTab(p);
+      };
     });
   }
 
@@ -1174,6 +1246,49 @@
         renderFileList(state.dirEntries, !!state.searchQuery);
         return;
       }
+      if (file.is_log) {
+        const tab = {
+          id: uid(),
+          kind: "log",
+          path: file.path,
+          title: file.name,
+          dirty: false,
+          kernelId: null,
+          extension: file.extension,
+          size: file.size,
+          isBinaryLog: !!file.is_binary,
+          content: file.content || "",
+          logQuery: "",
+          logType: "all",
+          logReverse: true,
+          logOffset: 0,
+          logLimit: 200,
+          logLive: false,
+          logData: null,
+        };
+        state.tabs.push(tab);
+        activateTab(tab.id);
+        renderFileList(state.dirEntries, !!state.searchQuery);
+        return;
+      }
+      if (file.is_markdown) {
+        const tab = {
+          id: uid(),
+          kind: "markdown",
+          path: file.path,
+          title: file.name,
+          dirty: false,
+          kernelId: null,
+          extension: file.extension,
+          size: file.size,
+          content: file.content || "",
+          mdMode: "preview",
+        };
+        state.tabs.push(tab);
+        activateTab(tab.id);
+        renderFileList(state.dirEntries, !!state.searchQuery);
+        return;
+      }
       if (file.is_binary) {
         toast(`Cannot open binary file '${file.name}'`, "error");
         return;
@@ -1335,38 +1450,196 @@
     }
   }
 
+  let logLiveTimer = null;
+
+  function syncLogLiveTimer(tab) {
+    if (logLiveTimer) {
+      clearInterval(logLiveTimer);
+      logLiveTimer = null;
+    }
+    if (tab && tab.kind === "log" && tab.logLive) {
+      logLiveTimer = setInterval(() => {
+        const cur = activeTab();
+        if (cur && cur.id === tab.id && cur.kind === "log" && cur.logLive) {
+          loadLogTabData(cur, true);
+        }
+      }, 2000);
+    }
+  }
+
+  async function loadLogTabData(tab, silent = false) {
+    if (!tab || tab.kind !== "log") return;
+    const listEl = document.getElementById("log-entries-list");
+    const metaEl = document.getElementById("ltb-meta");
+    if (!silent && !tab.logData && listEl) {
+      listEl.innerHTML = `<div class="log-empty">Loading log entries...</div>`;
+    }
+    try {
+      const qs = new URLSearchParams({
+        path: tab.path,
+        reverse: tab.logReverse ? "1" : "0",
+        offset: String(tab.logOffset || 0),
+        limit: String(tab.logLimit || 200),
+      });
+      if (tab.logQuery) qs.set("q", tab.logQuery);
+      if (tab.logType && tab.logType !== "all") qs.set("type", tab.logType);
+      const data = await api(`/api/log?${qs.toString()}`);
+      tab.logData = data;
+      tab.size = data.size;
+      if (activeTab()?.id !== tab.id) return;
+      renderLogEntries(tab);
+    } catch (e) {
+      if (!silent && listEl) {
+        listEl.innerHTML = `<div class="log-empty" style="color:var(--accent-red)">Failed to load log: ${escapeHtml(e.message)}</div>`;
+      }
+      if (metaEl) metaEl.textContent = "Error loading log";
+    }
+  }
+
+  function renderLogEntries(tab) {
+    const data = tab.logData;
+    const listEl = document.getElementById("log-entries-list");
+    const metaEl = document.getElementById("ltb-meta");
+    const typeSel = document.getElementById("ltb-type-select");
+    const editRawBtn = document.getElementById("ltb-edit-raw");
+    if (!data || !listEl) return;
+
+    const fmtBadge = data.format === "mlog" ? "CBOR Log" : "Text Log";
+    metaEl.textContent = `${fmtBadge} · ${data.filtered === data.total ? `${data.total} entries` : `${data.filtered} / ${data.total} entries`} · ${formatSize(data.size)}`;
+    if (editRawBtn) editRawBtn.classList.toggle("hidden", data.format === "mlog");
+
+    if (typeSel) {
+      const prev = tab.logType || "all";
+      const opts = ['<option value="all">All types</option>'].concat(
+        (data.types || []).map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`)
+      );
+      typeSel.innerHTML = opts.join("");
+      typeSel.value = (data.types || []).includes(prev) ? prev : "all";
+    }
+
+    if (!data.entries.length) {
+      listEl.innerHTML = `<div class="log-empty">${data.total === 0 ? "Log is empty." : "No log entries match your filter."}</div>`;
+      return;
+    }
+
+    let html = "";
+    for (const entry of data.entries) {
+      const lvlClass = entry.level ? `lvl-${escapeHtml(entry.level)}` : "";
+      const typeClass = `t-${escapeHtml(entry.type_name)}`;
+      const tsDisplay = entry.timestamp ? entry.timestamp.replace("T", " ").replace("Z", "") : "—";
+      html += `
+        <div class="log-entry-row ${lvlClass}">
+          <span class="log-entry-idx">#${entry.index}</span>
+          <span class="log-entry-ts" title="${escapeHtml(entry.timestamp || "")}">${escapeHtml(tsDisplay)}</span>
+          <span class="log-entry-type ${typeClass}">${escapeHtml(entry.type_name)}</span>
+          <pre class="log-entry-val">${escapeHtml(entry.repr)}</pre>
+          <button type="button" class="media-thumb-btn log-copy-btn" data-copy-idx="${entry.index}" title="Copy value">Copy</button>
+        </div>`;
+    }
+
+    if (data.filtered > data.limit) {
+      const hasPrev = data.offset > 0;
+      const hasNext = data.offset + data.entries.length < data.filtered;
+      html += `
+        <div class="log-pager">
+          <button type="button" class="tb-btn" id="log-page-prev" ${hasPrev ? "" : "disabled"}>&larr; Prev</button>
+          <span>Showing ${data.offset + 1}–${data.offset + data.entries.length} of ${data.filtered}</span>
+          <button type="button" class="tb-btn" id="log-page-next" ${hasNext ? "" : "disabled"}>Next &rarr;</button>
+        </div>`;
+    }
+
+    listEl.innerHTML = html;
+
+    listEl.querySelectorAll(".log-copy-btn").forEach((btn) => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.copyIdx);
+        const found = data.entries.find((e) => e.index === idx);
+        if (found) {
+          navigator.clipboard?.writeText(found.repr).catch(() => {});
+          toast(`Copied log entry #${idx}`, "success");
+        }
+      };
+    });
+
+    document.getElementById("log-page-prev")?.addEventListener("click", () => {
+      tab.logOffset = Math.max(0, (tab.logOffset || 0) - (tab.logLimit || 200));
+      loadLogTabData(tab);
+    });
+    document.getElementById("log-page-next")?.addEventListener("click", () => {
+      tab.logOffset = (tab.logOffset || 0) + (tab.logLimit || 200);
+      loadLogTabData(tab);
+    });
+  }
+
+  function renderMarkdownTabView(tab) {
+    const editorPane = document.getElementById("md-editor-pane");
+    const previewPane = document.getElementById("md-preview-pane");
+    const ta = document.getElementById("md-editor-textarea");
+    const article = document.getElementById("md-preview-content");
+    const metaEl = document.getElementById("mdtb-meta");
+    const mode = tab.mdMode || "preview";
+
+    editorPane.classList.toggle("hidden", mode === "preview");
+    previewPane.classList.toggle("hidden", mode === "edit");
+    document.querySelectorAll(".tb-seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.mode === mode);
+    });
+
+    if (ta.value !== (tab.content || "")) {
+      ta.value = tab.content || "";
+    }
+    if (mode !== "edit") {
+      article.innerHTML = renderMarkdown(tab.content || "");
+      hydrateMediaPreviews(article);
+    }
+    metaEl.textContent = `${tab.path} (${formatSize((tab.content || "").length)})`;
+  }
+
   function renderActiveWorkspace() {
     const tab = activeTab();
     const nbToolbar = document.getElementById("notebook-toolbar");
     const fileToolbar = document.getElementById("file-toolbar");
     const mediaToolbar = document.getElementById("media-toolbar");
+    const mdToolbar = document.getElementById("md-toolbar");
+    const logToolbar = document.getElementById("log-toolbar");
     const nbView = document.getElementById("notebook-view");
     const fileView = document.getElementById("file-view");
     const mediaView = document.getElementById("media-view");
+    const mdView = document.getElementById("markdown-view");
+    const logView = document.getElementById("log-view");
 
     if (!tab) return;
+    syncLogLiveTimer(tab);
+
+    nbToolbar.classList.toggle("hidden", tab.kind !== "notebook");
+    fileToolbar.classList.toggle("hidden", tab.kind !== "file");
+    mediaToolbar.classList.toggle("hidden", tab.kind !== "media");
+    mdToolbar.classList.toggle("hidden", tab.kind !== "markdown");
+    logToolbar.classList.toggle("hidden", tab.kind !== "log");
+
+    nbView.classList.toggle("hidden", tab.kind !== "notebook");
+    fileView.classList.toggle("hidden", tab.kind !== "file");
+    mediaView.classList.toggle("hidden", tab.kind !== "media");
+    mdView.classList.toggle("hidden", tab.kind !== "markdown");
+    logView.classList.toggle("hidden", tab.kind !== "log");
 
     if (tab.kind === "notebook") {
-      nbToolbar.classList.remove("hidden");
-      fileToolbar.classList.add("hidden");
-      mediaToolbar.classList.add("hidden");
-      nbView.classList.remove("hidden");
-      fileView.classList.add("hidden");
-      mediaView.classList.add("hidden");
       const langSel = document.getElementById("tb-lang-select");
       if (langSel) langSel.value = tab.doc.language || "minilang";
       const linfo = langInfo(tab.doc.language || "minilang");
       const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
       document.getElementById("tb-export-mini").querySelector("span").textContent = `Export .${ext}`;
       renderCells();
+    } else if (tab.kind === "markdown") {
+      renderMarkdownTabView(tab);
+    } else if (tab.kind === "log") {
+      document.getElementById("ltb-search").value = tab.logQuery || "";
+      document.getElementById("ltb-order").textContent = tab.logReverse ? "Newest First" : "Oldest First";
+      const liveBtn = document.getElementById("ltb-live");
+      liveBtn.textContent = tab.logLive ? "Live Tail: On" : "Live Tail: Off";
+      liveBtn.classList.toggle("live-on", !!tab.logLive);
+      loadLogTabData(tab);
     } else if (tab.kind === "media") {
-      nbToolbar.classList.add("hidden");
-      fileToolbar.classList.add("hidden");
-      mediaToolbar.classList.remove("hidden");
-      nbView.classList.add("hidden");
-      fileView.classList.add("hidden");
-      mediaView.classList.remove("hidden");
-
       const imgControls = document.getElementById("mtb-image-controls");
       const imgStage = document.getElementById("media-image-stage");
       const pdfStage = document.getElementById("media-pdf-stage");
@@ -1402,12 +1675,6 @@
         applyMediaImageTransform(tab);
       }
     } else {
-      nbToolbar.classList.add("hidden");
-      fileToolbar.classList.remove("hidden");
-      mediaToolbar.classList.add("hidden");
-      nbView.classList.add("hidden");
-      fileView.classList.remove("hidden");
-      mediaView.classList.add("hidden");
 
       const ta = document.getElementById("file-editor-textarea");
       ta.value = tab.content || "";
@@ -2233,7 +2500,7 @@
   // --- Save & Export ---
   async function saveActiveTab() {
     const tab = activeTab();
-    if (!tab) return;
+    if (!tab || tab.kind === "media" || tab.kind === "log") return;
 
     let targetPath = tab.path;
     if (!targetPath) {
@@ -2846,6 +3113,96 @@
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeMediaLightbox();
+  });
+
+  // Markdown Viewer event handlers
+  document.getElementById("mdtb-save")?.addEventListener("click", () => saveActiveTab());
+
+  document.querySelectorAll(".tb-seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tab = activeTab();
+      if (!tab || tab.kind !== "markdown") return;
+      tab.mdMode = btn.dataset.mode;
+      renderMarkdownTabView(tab);
+    });
+  });
+
+  document.getElementById("md-editor-textarea")?.addEventListener("input", (e) => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "markdown") return;
+    tab.content = e.target.value;
+    markDirty(tab);
+    if (tab.mdMode === "split") {
+      const article = document.getElementById("md-preview-content");
+      article.innerHTML = renderMarkdown(tab.content);
+      hydrateMediaPreviews(article);
+    }
+    document.getElementById("mdtb-meta").textContent = `${tab.path} (${formatSize(tab.content.length)})`;
+  });
+
+  // Log Viewer event handlers
+  let logSearchTimer = null;
+  document.getElementById("ltb-search")?.addEventListener("input", (e) => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    tab.logQuery = e.target.value;
+    tab.logOffset = 0;
+    clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(() => loadLogTabData(tab), 180);
+  });
+
+  document.getElementById("ltb-type-select")?.addEventListener("change", (e) => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    tab.logType = e.target.value;
+    tab.logOffset = 0;
+    loadLogTabData(tab);
+  });
+
+  document.getElementById("ltb-order")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    tab.logReverse = !tab.logReverse;
+    tab.logOffset = 0;
+    document.getElementById("ltb-order").textContent = tab.logReverse ? "Newest First" : "Oldest First";
+    loadLogTabData(tab);
+  });
+
+  document.getElementById("ltb-refresh")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    loadLogTabData(tab);
+  });
+
+  document.getElementById("ltb-live")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    tab.logLive = !tab.logLive;
+    const liveBtn = document.getElementById("ltb-live");
+    liveBtn.textContent = tab.logLive ? "Live Tail: On" : "Live Tail: Off";
+    liveBtn.classList.toggle("live-on", tab.logLive);
+    syncLogLiveTimer(tab);
+    if (tab.logLive) loadLogTabData(tab, true);
+  });
+
+  document.getElementById("ltb-edit-raw")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "log") return;
+    tab.logLive = false;
+    syncLogLiveTimer(null);
+    tab.kind = "file";
+    renderActiveWorkspace();
+  });
+
+  document.getElementById("ltb-download")?.addEventListener("click", () => {
+    const tab = activeTab();
+    if (!tab || !tab.path) return;
+    const a = document.createElement("a");
+    a.href = rawFileUrl(tab.path, true);
+    a.download = tab.title;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   });
 
   // Auth UI event handlers
