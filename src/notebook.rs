@@ -38,6 +38,10 @@ pub struct CellOutput {
     pub error: Option<EvalError>,
     #[serde(default)]
     pub duration_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_delta_bytes: Option<i64>,
 }
 
 impl NotebookDocument {

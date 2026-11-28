@@ -114,17 +114,100 @@ fn spawn_mock_gemini_server() -> (
                     })
                     .to_string(),
                 )
+            } else if path.contains(":streamGenerateContent") {
+                let c1 = json!({
+                    "candidates": [{
+                        "content": { "role": "model", "parts": [{ "text": "Hello " }] }
+                    }]
+                });
+                let c2 = json!({
+                    "candidates": [{
+                        "finishReason": "STOP",
+                        "content": { "role": "model", "parts": [{ "text": "streamed Gemini!" }] }
+                    }],
+                    "usageMetadata": { "totalTokenCount": 9 }
+                });
+                let sse_body = format!("data: {}\r\n\r\ndata: {}\r\n\r\n", c1, c2);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse_body.len(),
+                    sse_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                continue;
             } else if path.contains(":generateContent") {
                 let req_json: serde_json::Value = serde_json::from_str(&body_str).unwrap_or(json!({}));
+                let has_tools = req_json
+                    .pointer("/tools/0/functionDeclarations")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                let contents = req_json
+                    .get("contents")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let has_fn_response = body_str.contains("\"functionResponse\"");
+
+                if has_tools && !has_fn_response {
+                    // Round 1: ask Gemini client to execute the `multiply` tool!
+                    let tool_resp = json!({
+                        "candidates": [{
+                            "finishReason": "STOP",
+                            "content": {
+                                "role": "model",
+                                "parts": [{
+                                    "functionCall": {
+                                        "name": "multiply",
+                                        "args": { "a": 6, "b": 7 }
+                                    }
+                                }]
+                            }
+                        }]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        tool_resp.len(),
+                        tool_resp
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+                if has_tools && has_fn_response {
+                    // Round 2: extract computed tool result from last user turn's functionResponse
+                    let tool_val = contents
+                        .last()
+                        .and_then(|t| t.pointer("/parts/0/functionResponse/response/result"))
+                        .cloned()
+                        .unwrap_or(json!(null));
+                    let final_resp = json!({
+                        "candidates": [{
+                            "finishReason": "STOP",
+                            "content": {
+                                "role": "model",
+                                "parts": [{ "text": format!("TOOL_ANSWER={}", tool_val) }]
+                            }
+                        }]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        final_resp.len(),
+                        final_resp
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+
                 let want_json = req_json
                     .pointer("/generationConfig/responseMimeType")
                     .and_then(|v| v.as_str())
                     == Some("application/json");
-                let turn_count = req_json
-                    .get("contents")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
+                let turn_count = contents.len();
                 let has_image = body_str.contains("\"inlineData\"") && body_str.contains("\"image/png\"");
                 let has_sys = req_json.get("systemInstruction").is_some();
 
@@ -192,11 +275,14 @@ conv = None
 model = None
 effort = None
 mode = None
+out_fmt = "json"
 i = 0
 while i < len(args):
     a = args[i]
     if a == "--print" and i + 1 < len(args):
         prompt = args[i + 1]; i += 2
+    elif a == "--output-format" and i + 1 < len(args):
+        out_fmt = args[i + 1]; i += 2
     elif a == "--conversation" and i + 1 < len(args):
         conv = args[i + 1]; i += 2
     elif a == "--model" and i + 1 < len(args):
@@ -208,13 +294,19 @@ while i < len(args):
     else:
         i += 1
 
+out_conv = conv or "conv-mock-123"
+if out_fmt == "stream-json":
+    print(json.dumps({"delta": "Agy "}), flush=True)
+    print(json.dumps({"delta": "streamed!"}), flush=True)
+    print(json.dumps({"result": "Agy streamed!", "conversation_id": out_conv}), flush=True)
+    sys.exit(0)
+
 if "RETURN_JSON" in prompt:
     text = '```json\n{"sum": 99, "provider": "agy"}\n```'
 else:
     text = f"AGY_REPLY conv={conv or 'new'} model={model or 'def'} effort={effort or 'def'} mode={mode or 'def'} :: {prompt}"
     text += "\n```minilang\nlet x := 42\n```"
 
-out_conv = conv or "conv-mock-123"
 print(json.dumps({"result": text, "conversation_id": out_conv}))
 "#,
     )
@@ -367,7 +459,64 @@ let ai_sub := ai::agy::prompt("Via sub-module")
     assert!(gem_repr.contains("ai_auto is GEMINI_OK"), "{}", gem_repr);
     assert!(gem_repr.contains("ai_agy is AGY_REPLY") && gem_repr.contains("ai_sub is AGY_REPLY"), "{}", gem_repr);
 
-    // 4. Error handling: bad API key surfaces clean GeminiError
+    // 4. Test Streaming (`gemini::stream`, `agy::stream`, `ai::stream`) + Gemini Tool Calling!
+    let stream_and_tools_code = r#"
+var gem_chunks := []
+let gs_out := gemini::stream("Stream please", fun(ch) gem_chunks:put(ch))
+
+var agy_chunks := []
+let as_out := agy::stream("Stream agy", fun(ch) agy_chunks:put(ch))
+
+let ai_s := ai::stream("Stream via ai", provider is "gemini", display is false)
+
+let tool_res := gemini::complete(
+    "Multiply 6 and 7",
+    tools is [
+        {
+            "name" is "multiply",
+            "description" is "Multiply two integers",
+            "parameters" is {
+                "type" is "object",
+                "properties" is {"a" is {"type" is "integer"}, "b" is {"type" is "integer"}},
+                "required" is ["a", "b"]
+            },
+            "fn" is fun(args) args["a"] * args["b"]
+        }
+    ]
+)
+{
+    "gs_out" is gs_out,
+    "gem_chunks" is gem_chunks:count,
+    "as_out" is as_out,
+    "agy_chunks" is agy_chunks:count,
+    "ai_s" is ai_s,
+    "tool_text" is tool_res["text"],
+    "tool_calls" is tool_res["tool_calls"]:count,
+    "tool_val" is tool_res["tool_calls"][1]["result"]
+}
+"#;
+    let st_res = srv.eval("ml-ai", stream_and_tools_code);
+    assert!(st_res["error"].is_null(), "stream/tools error: {:?}", st_res["error"]);
+    let st_repr = st_res["results"].as_array().unwrap().last().unwrap()["repr"]
+        .as_str()
+        .unwrap();
+    assert!(st_repr.contains("gs_out is Hello streamed Gemini!"), "{}", st_repr);
+    assert!(st_repr.contains("gem_chunks is 2"), "{}", st_repr);
+    assert!(st_repr.contains("as_out is Agy streamed!"), "{}", st_repr);
+    assert!(st_repr.contains("agy_chunks is 2"), "{}", st_repr);
+    assert!(st_repr.contains("ai_s is Hello streamed Gemini!"), "{}", st_repr);
+    assert!(st_repr.contains("tool_text is TOOL_ANSWER=42"), "{}", st_repr);
+    assert!(st_repr.contains("tool_calls is 1"), "{}", st_repr);
+    assert!(st_repr.contains("tool_val is 42"), "{}", st_repr);
+    // Verify live markdown-stream+json display items were emitted & deduplicated!
+    let displays = st_res["displays"].as_array().unwrap();
+    let md_streams: Vec<_> = displays
+        .iter()
+        .filter(|d| d["mime"] == "application/vnd.minilang.markdown-stream+json")
+        .collect();
+    assert_eq!(md_streams.len(), 2, "expected 2 deduplicated markdown-stream displays: {:?}", displays);
+
+    // 5. Error handling: bad API key surfaces clean GeminiError
     let err_res = srv.eval("ml-ai", r#"gemini::prompt("Should fail", api_key is "bad-key")"#);
     assert!(!err_res["error"].is_null(), "expected GeminiError");
     assert_eq!(err_res["error"]["error_type"], "GeminiError");

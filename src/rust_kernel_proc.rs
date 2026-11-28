@@ -157,6 +157,8 @@ impl RustReplState {
                 results: Vec::new(),
                 error: None,
                 duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                memory_bytes: None,
+                memory_delta_bytes: None,
             };
         }
 
@@ -197,6 +199,8 @@ impl RustReplState {
                         traceback: String::new(),
                     }),
                     duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    memory_bytes: None,
+                    memory_delta_bytes: None,
                 };
             }
 
@@ -223,6 +227,8 @@ impl RustReplState {
                             traceback: String::new(),
                         }),
                         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        memory_bytes: None,
+                        memory_delta_bytes: None,
                     };
                 }
             };
@@ -241,6 +247,8 @@ impl RustReplState {
                         traceback: diag,
                     }),
                     duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    memory_bytes: None,
+                    memory_delta_bytes: None,
                 };
             }
         } else {
@@ -274,6 +282,8 @@ impl RustReplState {
                             traceback: diag,
                         }),
                         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        memory_bytes: None,
+                        memory_delta_bytes: None,
                     };
                 }
             }
@@ -313,6 +323,8 @@ impl RustReplState {
                             traceback: String::new(),
                         }),
                         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        memory_bytes: None,
+                        memory_delta_bytes: None,
                     };
                 }
             };
@@ -426,6 +438,8 @@ impl RustReplState {
                             traceback: String::new(),
                         }),
                         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        memory_bytes: None,
+                        memory_delta_bytes: None,
                     };
                 }
             }
@@ -485,6 +499,8 @@ impl RustReplState {
                     traceback: stderr,
                 }),
                 duration_ms,
+                memory_bytes: None,
+                memory_delta_bytes: None,
             };
         }
 
@@ -535,6 +551,8 @@ impl RustReplState {
             results,
             error: None,
             duration_ms,
+            memory_bytes: None,
+            memory_delta_bytes: None,
         }
     }
 

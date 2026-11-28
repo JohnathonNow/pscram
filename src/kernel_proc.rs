@@ -65,6 +65,7 @@ extern "C" {
         ctx: *mut c_void,
     );
     fn mlk_last_value_tagged_json(cb: MlkStdoutCb, ctx: *mut c_void);
+    fn mlk_memory_used_bytes() -> u64;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,6 +155,10 @@ pub enum KernelResponse {
         results: Vec<EvalValue>,
         error: Option<EvalError>,
         duration_ms: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_delta_bytes: Option<i64>,
     },
     InvokeResult {
         result: serde_json::Value,
@@ -227,17 +232,21 @@ extern "C" fn on_display(mime: *const c_char, data: *const c_char, len: usize, c
             let bytes = std::slice::from_raw_parts(data as *const u8, len);
             String::from_utf8_lossy(bytes).into_owned()
         };
-        if mime_str == "application/vnd.minilang.progress+json" {
+        if mime_str == "application/vnd.minilang.progress+json"
+            || mime_str == "application/vnd.minilang.markdown-stream+json"
+        {
+            let is_progress = mime_str == "application/vnd.minilang.progress+json";
+            let evt_name = if is_progress { "progress" } else { "markdown_stream" };
             let parsed = serde_json::from_str::<serde_json::Value>(&data_str)
-                .unwrap_or_else(|_| serde_json::json!({ "percent": 0 }));
-            emit_stream_line(&mut collector.stream, "progress", parsed);
-            // Update/replace existing progress display with same id so final output stays tidy
+                .unwrap_or_else(|_| serde_json::json!({}));
+            emit_stream_line(&mut collector.stream, evt_name, parsed);
+            // Update/replace existing live display with same id so final output stays tidy
             let new_id = serde_json::from_str::<serde_json::Value>(&data_str)
                 .ok()
                 .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
                 .unwrap_or_else(|| "default".to_string());
             if let Some(existing) = collector.displays.iter_mut().find(|d| {
-                d.mime == "application/vnd.minilang.progress+json"
+                d.mime == mime_str
                     && serde_json::from_str::<serde_json::Value>(&d.data)
                         .ok()
                         .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(String::from))
@@ -764,6 +773,8 @@ pub fn run_kernel_process() -> io::Result<()> {
                                 traceback: String::new(),
                             }),
                             duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                            memory_bytes: None,
+                            memory_delta_bytes: None,
                         };
                         writeln!(out, "{}", serde_json::to_string(&resp).unwrap())?;
                         out.flush()?;
@@ -782,6 +793,7 @@ pub fn run_kernel_process() -> io::Result<()> {
                     stream: None,
                 };
 
+                let mem_before = unsafe { mlk_memory_used_bytes() };
                 unsafe {
                     mlk_eval(
                         c_source.as_ptr(),
@@ -793,6 +805,7 @@ pub fn run_kernel_process() -> io::Result<()> {
                         &mut collector as *mut EvalCollector<'_> as *mut c_void,
                     );
                 }
+                let mem_after = unsafe { mlk_memory_used_bytes() };
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 KernelResponse::EvalResult {
@@ -802,6 +815,8 @@ pub fn run_kernel_process() -> io::Result<()> {
                     results: collector.results,
                     error: collector.error,
                     duration_ms,
+                    memory_bytes: Some(mem_after),
+                    memory_delta_bytes: Some(mem_after as i64 - mem_before as i64),
                 }
             }
             Ok(KernelRequest::EvalStream { code, source }) => {
@@ -818,6 +833,7 @@ pub fn run_kernel_process() -> io::Result<()> {
                     stream: Some(&mut out),
                 };
 
+                let mem_before = unsafe { mlk_memory_used_bytes() };
                 let start = Instant::now();
                 unsafe {
                     mlk_eval(
@@ -830,6 +846,7 @@ pub fn run_kernel_process() -> io::Result<()> {
                         &mut collector as *mut EvalCollector<'_> as *mut c_void,
                     );
                 }
+                let mem_after = unsafe { mlk_memory_used_bytes() };
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 KernelResponse::EvalResult {
@@ -839,6 +856,8 @@ pub fn run_kernel_process() -> io::Result<()> {
                     results: collector.results,
                     error: collector.error,
                     duration_ms,
+                    memory_bytes: Some(mem_after),
+                    memory_delta_bytes: Some(mem_after as i64 - mem_before as i64),
                 }
             }
             Ok(KernelRequest::Invoke {

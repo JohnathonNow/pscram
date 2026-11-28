@@ -170,4 +170,34 @@ fn test_media_markdown_notebook_conversion_and_grep() {
     // Extension filter restricts to .md only
     let grep_md = srv.get("/api/files/grep?q=UniqueTokenAlpha&ext=md").json();
     assert_eq!(grep_md["count"], 1);
+
+    // Feature #9: Notebook Checkpoints CRUD + Minilang execution memory profiling
+    let cp1 = srv.post_json(
+        "/api/notebook/checkpoints",
+        &json!({ "path": "calc.mnb", "label": "Initial snapshot" }),
+    );
+    assert_eq!(cp1.status, 200, "create checkpoint failed: {}", cp1.text());
+    let cp1_id = cp1.json()["checkpoint"]["id"].as_str().unwrap().to_string();
+    assert_eq!(cp1.json()["checkpoint"]["cell_count"], 2);
+
+    let cp_list = srv.get("/api/notebook/checkpoints?path=calc.mnb").json();
+    assert_eq!(cp_list["ok"], true);
+    assert_eq!(cp_list["checkpoints"].as_array().unwrap().len(), 1);
+
+    let cp_detail = srv
+        .get(&format!("/api/notebook/checkpoints/{}?path=calc.mnb", cp1_id))
+        .json();
+    assert_eq!(cp_detail["checkpoint"]["label"], "Initial snapshot");
+    assert_eq!(cp_detail["checkpoint"]["doc"]["cells"].as_array().unwrap().len(), 2);
+
+    let cp_del = srv.delete(&format!("/api/notebook/checkpoints/{}?path=calc.mnb", cp1_id));
+    assert_eq!(cp_del.status, 200);
+    assert_eq!(cp_del.json()["removed"], true);
+
+    // Verify Minilang EvalResult includes Boehm GC memory profiling fields
+    srv.create_kernel("prof-k", "minilang");
+    let eval_res = srv.eval("prof-k", "let big := list(1 .. 5000)\nbig:count");
+    assert!(eval_res["error"].is_null(), "eval error: {:?}", eval_res["error"]);
+    assert!(eval_res["memory_bytes"].as_u64().unwrap_or(0) > 0, "expected memory_bytes: {:?}", eval_res);
+    assert!(eval_res["memory_delta_bytes"].is_i64(), "expected memory_delta_bytes: {:?}", eval_res);
 }

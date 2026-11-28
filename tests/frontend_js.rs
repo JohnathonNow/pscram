@@ -25,6 +25,7 @@ const EXPECTED_JS_MODULES: &[&str] = &[
     "web/js/features/managers.js",
     "web/js/features/agy.js",
     "web/js/features/debugger.js",
+    "web/js/features/editor_tools.js",
 ];
 
 fn normalize_rel(base_file: &Path, rel: &str) -> PathBuf {

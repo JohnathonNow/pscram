@@ -21,6 +21,62 @@ async function ensureKernel(sessionId, cwdPath = "", language = "minilang") {
   return status;
 }
 
+// --- Profiling & Stale Cell Helpers (Feature #9) ---
+function formatDurationMs(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  if (ms >= 10) return `${ms.toFixed(0)} ms`;
+  return `${ms.toFixed(1)} ms`;
+}
+
+function formatMemBytes(bytes) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "";
+  const abs = Math.abs(bytes);
+  const sign = bytes > 0 ? "+" : (bytes < 0 ? "-" : "");
+  if (abs >= 1024 * 1024) return `${sign}${(abs / (1024 * 1024)).toFixed(1)} MB`;
+  if (abs >= 1024) return `${sign}${(abs / 1024).toFixed(0)} KB`;
+  return `${sign}${abs} B`;
+}
+
+function getCellStaleState(tab, cell) {
+  if (!tab || !cell || cell.cell_type !== "code" || cell.execution_count == null) return null;
+  if (cell._lastRunSource != null && cell._lastRunSource !== cell.source) {
+    return "edited";
+  }
+  if (typeof cell._runSeq === "number") {
+    const idx = tab.doc.cells.findIndex((c) => c.id === cell.id);
+    for (let i = 0; i < idx; i++) {
+      const prev = tab.doc.cells[i];
+      if (prev.cell_type === "code" && typeof prev._runSeq === "number" && prev._runSeq > cell._runSeq) {
+        return "upstream";
+      }
+    }
+  }
+  return null;
+}
+
+function updateCellStaleDom(tab, cell) {
+  const el = document.querySelector(`.cell[data-cell-id="${cell.id}"]`);
+  if (!el) return;
+  const badge = el.querySelector(".cell-stale-slot");
+  if (!badge) return;
+  const st = getCellStaleState(tab, cell);
+  if (st === "edited") {
+    badge.innerHTML = `<span class="cell-stale-badge edited" title="Source modified since last run">Edited</span>`;
+  } else if (st === "upstream") {
+    badge.innerHTML = `<span class="cell-stale-badge upstream" title="An earlier cell ran after this cell">Stale</span>`;
+  } else {
+    badge.innerHTML = "";
+  }
+}
+
+function refreshStaleBadges(tab) {
+  if (!tab || tab.kind !== "notebook") return;
+  for (const c of tab.doc.cells) {
+    if (c.cell_type === "code") updateCellStaleDom(tab, c);
+  }
+}
+
 // --- Notebook Cell Rendering ---
 function renderOutputHtml(output, execCount) {
   if (!output) return "";
@@ -66,6 +122,25 @@ function renderOutputHtml(output, execCount) {
             <div class="ml-progress-card">
               <div class="ml-progress-head"><span>${label}</span><span>${escapeHtml(ratio)} (${pct.toFixed(0)}%)</span></div>
               <div class="ml-progress-track"><div class="ml-progress-fill" style="width:${pct}%"></div></div>
+            </div>`;
+        } catch {
+          rendered = `<pre class="output-stdout">${escapeHtml(d.data)}</pre>`;
+        }
+      } else if (d.mime === "application/vnd.minilang.markdown-stream+json") {
+        try {
+          const m = JSON.parse(d.data);
+          const prov = m.provider ? escapeHtml(m.provider) : "ai";
+          const model = m.model ? ` · ${escapeHtml(m.model)}` : "";
+          const badge = m.done
+            ? `<span class="ai-stream-badge done">Done</span>`
+            : `<span class="ai-stream-badge live">Streaming...</span>`;
+          rendered = `
+            <div class="ai-stream-card">
+              <div class="ai-stream-head">
+                <span>✦ ${prov}${model}</span>
+                ${badge}
+              </div>
+              <div class="ai-stream-body md-rendered">${renderMarkdown(m.text || "")}</div>
             </div>`;
         } catch {
           rendered = `<pre class="output-stdout">${escapeHtml(d.data)}</pre>`;
@@ -140,7 +215,10 @@ function renderOutputHtml(output, execCount) {
       : (!output.stdout && (!output.displays || output.displays.length === 0) ? last : null);
 
     if (chosen) {
-      const dur = typeof output.duration_ms === "number" ? `${output.duration_ms.toFixed(1)} ms` : "";
+      const dur = formatDurationMs(output.duration_ms);
+      const mem = typeof output.memory_delta_bytes === "number" && output.memory_delta_bytes !== 0
+        ? formatMemBytes(output.memory_delta_bytes)
+        : "";
       rows += `
         <div class="output-row">
           <div class="output-gutter">${execCount != null ? `Out[${execCount}]:` : ""}</div>
@@ -150,6 +228,7 @@ function renderOutputHtml(output, execCount) {
               <div class="output-meta-badges">
                 <span class="type-badge">${escapeHtml(chosen.type_name)}</span>
                 ${dur ? `<span class="duration-badge">${dur}</span>` : ""}
+                ${mem ? `<span class="memory-badge" title="Heap memory delta">${mem}</span>` : ""}
               </div>
             </div>
           </div>
@@ -265,11 +344,24 @@ function buildCellElement(tab, cell) {
   gutter.className = "cell-gutter";
   if (cell.cell_type === "code") {
     const prompt = cell._running ? "In [*]:" : (cell.execution_count != null ? `In [${cell.execution_count}]:` : "In [ ]:");
+    const stale = getCellStaleState(tab, cell);
+    const staleHtml = stale === "edited"
+      ? `<span class="cell-stale-badge edited" title="Source modified since last run">Edited</span>`
+      : (stale === "upstream" ? `<span class="cell-stale-badge upstream" title="An earlier cell ran after this cell">Stale</span>` : "");
+    const durStr = cell.output ? formatDurationMs(cell.output.duration_ms) : "";
+    const memStr = cell.output && typeof cell.output.memory_delta_bytes === "number" && cell.output.memory_delta_bytes !== 0
+      ? formatMemBytes(cell.output.memory_delta_bytes)
+      : "";
+    const profHtml = durStr
+      ? `<span class="cell-profile-badge" title="Execution duration${memStr ? ` · Heap delta ${memStr}` : ""}">${durStr}${memStr ? ` · ${memStr}` : ""}</span>`
+      : "";
     gutter.innerHTML = `
       <span>${prompt}</span>
       <button class="cell-run-mini" title="Run cell (Shift+Enter)">
         <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>
-      </button>`;
+      </button>
+      <div class="cell-stale-slot">${staleHtml}</div>
+      ${profHtml}`;
     gutter.querySelector(".cell-run-mini").onclick = (e) => {
       e.stopPropagation();
       runCell(cell.id);
@@ -302,6 +394,7 @@ function buildCellElement(tab, cell) {
       cell.source = ta.value;
       pre.innerHTML = highlightCode(ta.value, tab.doc.language || "minilang");
       markDirty(tab);
+      updateCellStaleDom(tab, cell);
       hideAutocomplete();
     });
     ta.addEventListener("keydown", (e) => handleCodeKeydown(e, tab, cell, ta, pre));
@@ -716,6 +809,17 @@ async function runCell(cellId, advance = false) {
     else cell.output.displays.push({ mime: "application/vnd.minilang.progress+json", data: serialized });
   };
 
+  const updateLiveMarkdownStream = (md) => {
+    const id = md.id || "default";
+    const serialized = JSON.stringify(md);
+    const existing = cell.output.displays.find((d) => {
+      if (d.mime !== "application/vnd.minilang.markdown-stream+json") return false;
+      try { return (JSON.parse(d.data).id || "default") === id; } catch { return false; }
+    });
+    if (existing) existing.data = serialized;
+    else cell.output.displays.push({ mime: "application/vnd.minilang.markdown-stream+json", data: serialized });
+  };
+
   try {
     const res = await authFetch(`/api/kernels/${encodeURIComponent(tab.kernelId)}/execute-stream`, {
       method: "POST",
@@ -773,6 +877,10 @@ async function runCell(cellId, advance = false) {
             cell.output._streamStatus = null;
             updateLiveProgress(payload);
             scheduleLiveRender(true);
+          } else if (evName === "markdown_stream") {
+            cell.output._streamStatus = null;
+            updateLiveMarkdownStream(payload);
+            scheduleLiveRender(false);
           } else if (evName === "display" && payload.mime) {
             cell.output._streamStatus = null;
             cell.output.displays.push({ mime: payload.mime, data: payload.data || "" });
@@ -789,12 +897,17 @@ async function runCell(cellId, advance = false) {
     cell._running = false;
     if (finalResp && finalResp.type === "eval_result") {
       cell.execution_count = finalResp.execution_count;
+      cell._lastRunSource = cell.source;
+      tab._runSeqCounter = (tab._runSeqCounter || 0) + 1;
+      cell._runSeq = tab._runSeqCounter;
       cell.output = {
         stdout: finalResp.stdout || "",
         displays: finalResp.displays || [],
         results: finalResp.results || [],
         error: finalResp.error || null,
         duration_ms: finalResp.duration_ms,
+        memory_bytes: finalResp.memory_bytes ?? null,
+        memory_delta_bytes: finalResp.memory_delta_bytes ?? null,
       };
     } else if (finalResp) {
       cell.output = {
@@ -809,6 +922,7 @@ async function runCell(cellId, advance = false) {
 
     markDirty(tab);
     updateSingleCellDom(tab, cell.id);
+    refreshStaleBadges(tab);
     if (advance) focusNextCell(tab, cell.id);
     const lname = langInfo(tab.doc.language || "minilang").name;
     setKernelIndicator("idle", lname);
@@ -835,6 +949,223 @@ async function runAllCells() {
     await runCell(cell.id, false);
     if (cell.output && cell.output.error) break;
   }
+}
+
+async function runCellsAbove() {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "notebook") return;
+  const idx = tab.doc.cells.findIndex((c) => c.id === tab.activeCellId);
+  if (idx <= 0) {
+    toast("No cells above the selected cell", "info");
+    return;
+  }
+  for (let i = 0; i < idx; i++) {
+    const cell = tab.doc.cells[i];
+    await runCell(cell.id, false);
+    if (cell.output && cell.output.error) break;
+  }
+}
+
+async function runCellsBelow() {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "notebook") return;
+  const idx = Math.max(0, tab.doc.cells.findIndex((c) => c.id === tab.activeCellId));
+  for (let i = idx; i < tab.doc.cells.length; i++) {
+    const cell = tab.doc.cells[i];
+    await runCell(cell.id, false);
+    if (cell.output && cell.output.error) break;
+  }
+}
+
+// =========================================================================
+// Notebook Checkpoints, History & Cell-by-Cell Diff (Feature #9)
+// =========================================================================
+let cpSelectedRecord = null;
+
+function buildCleanNotebookDoc(tab) {
+  return {
+    format: tab.doc.format || "minilang-notebook",
+    version: tab.doc.version || 1,
+    language: tab.doc.language || "minilang",
+    title: tab.title,
+    cells: tab.doc.cells.map((c) => ({
+      id: c.id,
+      cell_type: c.cell_type,
+      source: c.source,
+      execution_count: c.execution_count ?? null,
+      output: c.output ?? null,
+    })),
+  };
+}
+
+async function createNotebookCheckpoint(tab, label = "Manual checkpoint", silent = false) {
+  if (!tab || tab.kind !== "notebook") return null;
+  const path = tab.path || tab.title || "Untitled.mnb";
+  try {
+    const res = await api("/api/notebook/checkpoints", {
+      method: "POST",
+      body: JSON.stringify({
+        path,
+        label,
+        doc: buildCleanNotebookDoc(tab),
+      }),
+    });
+    if (!silent) toast(`Saved checkpoint "${label}"`, "success");
+    return res.checkpoint;
+  } catch (err) {
+    if (!silent) toast(`Checkpoint failed: ${err.message}`, "error");
+    return null;
+  }
+}
+
+function renderCheckpointDiff(currentDoc, cpRecord) {
+  const titleEl = document.getElementById("cp-diff-title");
+  const viewEl = document.getElementById("cp-diff-view");
+  const restoreBtn = document.getElementById("cp-restore-btn");
+  if (!viewEl) return;
+
+  cpSelectedRecord = cpRecord;
+  if (!cpRecord) {
+    if (titleEl) titleEl.textContent = "Select a checkpoint to inspect cell diff";
+    restoreBtn?.classList.add("hidden");
+    viewEl.innerHTML = `<div class="log-empty">Select a checkpoint on the left to compare against your current notebook.</div>`;
+    return;
+  }
+
+  const ts = (cpRecord.created_at || "").slice(0, 19).replace("T", " ");
+  if (titleEl) titleEl.textContent = `${cpRecord.label} · ${ts} · ${cpRecord.cell_count} cells`;
+  restoreBtn?.classList.remove("hidden");
+
+  const snapCells = (cpRecord.doc && cpRecord.doc.cells) || [];
+  const curCells = (currentDoc && currentDoc.cells) || [];
+  const curById = new Map(curCells.map((c, idx) => [c.id, { cell: c, idx }]));
+  const snapById = new Map(snapCells.map((c, idx) => [c.id, { cell: c, idx }]));
+
+  const sections = [];
+  snapCells.forEach((sc, i) => {
+    const curMatch = curById.get(sc.id);
+    if (!curMatch) {
+      sections.push({ status: "removed", idx: i + 1, snap: sc, cur: null });
+    } else if (curMatch.cell.source !== sc.source || curMatch.cell.cell_type !== sc.cell_type) {
+      sections.push({ status: "modified", idx: i + 1, snap: sc, cur: curMatch.cell });
+    } else {
+      sections.push({ status: "unchanged", idx: i + 1, snap: sc, cur: curMatch.cell });
+    }
+  });
+  curCells.forEach((cc, i) => {
+    if (!snapById.has(cc.id)) {
+      sections.push({ status: "added", idx: i + 1, snap: null, cur: cc });
+    }
+  });
+
+  const changedCount = sections.filter((s) => s.status !== "unchanged").length;
+  const summaryHtml = `<div class="cp-diff-summary">${changedCount === 0 ? "Identical to current notebook." : `${changedCount} cell${changedCount === 1 ? "" : "s"} differ from current notebook.`}</div>`;
+
+  viewEl.innerHTML = summaryHtml + sections.map((sec) => {
+    const labelMap = {
+      modified: "Modified",
+      removed: "In Checkpoint Only (will be restored)",
+      added: "Only in Current (will be removed on restore)",
+      unchanged: "Unchanged",
+    };
+    if (sec.status === "unchanged") {
+      const preview = (sec.snap.source || "").split("\n")[0].slice(0, 72);
+      return `<div class="cp-diff-cell cp-diff-unchanged"><div class="cp-diff-cell-head"><span>Cell ${sec.idx} (${escapeHtml(sec.snap.cell_type)})</span><span class="tb-meta">Unchanged</span></div><pre class="cp-diff-pre muted">${escapeHtml(preview || "(empty)")}</pre></div>`;
+    }
+    if (sec.status === "modified") {
+      return `
+        <div class="cp-diff-cell cp-diff-modified">
+          <div class="cp-diff-cell-head"><span>Cell ${sec.idx} (${escapeHtml(sec.snap.cell_type)})</span><span class="cp-badge modified">${labelMap.modified}</span></div>
+          <div class="cp-diff-cols">
+            <div><div class="cp-col-lbl">Checkpoint</div><pre class="cp-diff-pre is-snap">${escapeHtml(sec.snap.source || "")}</pre></div>
+            <div><div class="cp-col-lbl">Current</div><pre class="cp-diff-pre is-cur">${escapeHtml(sec.cur.source || "")}</pre></div>
+          </div>
+        </div>`;
+    }
+    const body = sec.snap ? sec.snap.source : sec.cur.source;
+    const ctype = sec.snap ? sec.snap.cell_type : sec.cur.cell_type;
+    return `
+      <div class="cp-diff-cell cp-diff-${sec.status}">
+        <div class="cp-diff-cell-head"><span>Cell ${sec.idx} (${escapeHtml(ctype)})</span><span class="cp-badge ${sec.status}">${labelMap[sec.status]}</span></div>
+        <pre class="cp-diff-pre">${escapeHtml(body || "(empty)")}</pre>
+      </div>`;
+  }).join("");
+}
+
+async function loadCheckpointsList(tab) {
+  const listEl = document.getElementById("cp-list");
+  if (!listEl || !tab) return;
+  const path = tab.path || tab.title || "Untitled.mnb";
+  listEl.innerHTML = `<div class="log-empty">Loading checkpoints...</div>`;
+  try {
+    const res = await api(`/api/notebook/checkpoints?path=${encodeURIComponent(path)}`);
+    const items = res.checkpoints || [];
+    if (!items.length) {
+      listEl.innerHTML = `<div class="log-empty">No checkpoints saved yet. Click <strong>Save Checkpoint</strong> or press <code>Ctrl+S</code>.</div>`;
+      renderCheckpointDiff(tab.doc, null);
+      return;
+    }
+    listEl.innerHTML = items.map((cp) => {
+      const ts = (cp.created_at || "").slice(0, 19).replace("T", " ");
+      const sel = cpSelectedRecord && cpSelectedRecord.id === cp.id ? " active" : "";
+      return `
+        <div class="cp-item${sel}" data-cp-id="${escapeHtml(cp.id)}">
+          <div class="cp-item-main">
+            <div class="cp-item-label">${escapeHtml(cp.label)}</div>
+            <div class="cp-item-meta">${escapeHtml(ts)} · ${cp.cell_count} cells</div>
+          </div>
+          <button type="button" class="icon-btn sm cp-del-btn" data-del-id="${escapeHtml(cp.id)}" title="Delete checkpoint">&times;</button>
+        </div>`;
+    }).join("");
+
+    listEl.querySelectorAll(".cp-item").forEach((row) => {
+      row.onclick = async (e) => {
+        if (e.target.closest(".cp-del-btn")) return;
+        listEl.querySelectorAll(".cp-item").forEach((r) => r.classList.remove("active"));
+        row.classList.add("active");
+        const cpId = row.dataset.cpId;
+        try {
+          const detail = await api(`/api/notebook/checkpoints/${encodeURIComponent(cpId)}?path=${encodeURIComponent(path)}`);
+          renderCheckpointDiff(tab.doc, detail.checkpoint);
+        } catch (err) {
+          toast(`Failed to load checkpoint: ${err.message}`, "error");
+        }
+      };
+    });
+
+    listEl.querySelectorAll(".cp-del-btn").forEach((btn) => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const delId = btn.dataset.delId;
+        await api(`/api/notebook/checkpoints/${encodeURIComponent(delId)}?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+        if (cpSelectedRecord && cpSelectedRecord.id === delId) cpSelectedRecord = null;
+        loadCheckpointsList(tab);
+      };
+    });
+
+    // Auto-select newest checkpoint if none selected
+    if (!cpSelectedRecord && items.length > 0) {
+      const firstRow = listEl.querySelector(".cp-item");
+      if (firstRow) firstRow.click();
+    }
+  } catch (err) {
+    listEl.innerHTML = `<div class="log-empty">Failed to load checkpoints: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function openCheckpointsModal() {
+  const tab = activeTab();
+  if (!tab || tab.kind !== "notebook") {
+    toast("Open a notebook to manage checkpoints", "info");
+    return;
+  }
+  cpSelectedRecord = null;
+  document.getElementById("checkpoints-modal-overlay")?.classList.remove("hidden");
+  loadCheckpointsList(tab);
+}
+
+function closeCheckpointsModal() {
+  document.getElementById("checkpoints-modal-overlay")?.classList.add("hidden");
 }
 
 async function interruptKernel() {
@@ -984,12 +1315,55 @@ export function initNotebook() {
     if (tab && tab.activeCellId) runCell(tab.activeCellId, true);
   };
   document.getElementById("tb-run-all").onclick = runAllCells;
+  document.getElementById("tb-run-above")?.addEventListener("click", runCellsAbove);
+  document.getElementById("tb-run-below")?.addEventListener("click", runCellsBelow);
+  document.getElementById("tb-checkpoints")?.addEventListener("click", openCheckpointsModal);
+  document.getElementById("checkpoints-modal-close")?.addEventListener("click", closeCheckpointsModal);
+  document.getElementById("checkpoints-modal-overlay")?.addEventListener("click", (e) => {
+    if (e.target.id === "checkpoints-modal-overlay") closeCheckpointsModal();
+  });
+  document.getElementById("cp-save-btn")?.addEventListener("click", async () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "notebook") return;
+    const inp = document.getElementById("cp-label-input");
+    const label = (inp?.value || "").trim() || "Manual checkpoint";
+    await createNotebookCheckpoint(tab, label, false);
+    if (inp) inp.value = "";
+    loadCheckpointsList(tab);
+  });
+  document.getElementById("cp-restore-btn")?.addEventListener("click", async () => {
+    const tab = activeTab();
+    if (!tab || tab.kind !== "notebook" || !cpSelectedRecord || !cpSelectedRecord.doc) return;
+    // Save safety snapshot before restoring
+    await createNotebookCheckpoint(tab, "Before restore", true);
+    const restoredCells = (cpSelectedRecord.doc.cells || []).map((c) => ({
+      id: c.id || uid(),
+      cell_type: c.cell_type || "code",
+      source: c.source || "",
+      execution_count: c.execution_count ?? null,
+      output: c.output ?? null,
+    }));
+    tab.doc.cells = restoredCells.length
+      ? restoredCells
+      : [{ id: uid(), cell_type: "code", source: "", execution_count: null, output: null }];
+    tab.activeCellId = tab.doc.cells[0].id;
+    markDirty(tab);
+    renderCells();
+    closeCheckpointsModal();
+    toast(`Restored checkpoint "${cpSelectedRecord.label}"`, "success");
+  });
   document.getElementById("tb-interrupt").onclick = interruptKernel;
   document.getElementById("tb-restart").onclick = restartKernel;
   document.getElementById("tb-clear-outputs").onclick = () => {
     const tab = activeTab();
     if (!tab || tab.kind !== "notebook") return;
-    tab.doc.cells.forEach((c) => { c.output = null; c.execution_count = null; });
+    createNotebookCheckpoint(tab, "Before Clear Outputs", true).catch(() => {});
+    tab.doc.cells.forEach((c) => {
+      c.output = null;
+      c.execution_count = null;
+      c._lastRunSource = null;
+      c._runSeq = null;
+    });
     markDirty(tab);
     renderCells();
   };
@@ -1038,6 +1412,11 @@ export {
   hideAutocomplete,
   runCell,
   runAllCells,
+  runCellsAbove,
+  runCellsBelow,
+  createNotebookCheckpoint,
+  openCheckpointsModal,
+  closeCheckpointsModal,
   interruptKernel,
   restartKernel,
   setKernelIndicator,

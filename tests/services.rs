@@ -291,4 +291,18 @@ ui::card("Service UI", ui::vbox(lbl, btn)):show
     assert!(svc_client_js.contains("service::on"));
     assert!(svc_client_js.contains("service::call"));
     assert!(svc_client_js.contains("service::send"));
+
+    // Verify Feature #7: Live Service Bus Inspector endpoints (/api/services/bus/history & clear)
+    let hist = srv.get("/api/services/bus/history?service=echo").json();
+    assert_eq!(hist["ok"], true);
+    let evs = hist["events"].as_array().unwrap();
+    assert!(evs.iter().any(|e| e["kind"] == "call" && e["topic"] == "ping"), "bus history missing call: {:?}", evs);
+    assert!(evs.iter().any(|e| e["kind"] == "reply"), "bus history missing reply: {:?}", evs);
+    assert!(evs.iter().any(|e| e["kind"] == "lifecycle"), "bus history missing lifecycle: {:?}", evs);
+
+    let cleared = srv.post_json("/api/services/bus/clear", &json!({})).json();
+    assert_eq!(cleared["ok"], true);
+    assert!(cleared["cleared"].as_u64().unwrap() >= 3);
+    let hist_after = srv.get("/api/services/bus/history").json();
+    assert_eq!(hist_after["events"].as_array().unwrap().len(), 0);
 }

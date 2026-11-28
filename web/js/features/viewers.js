@@ -5,15 +5,16 @@
 
 import { escapeHtml, highlightCode } from "../core/highlight.js";
 import { renderMarkdown } from "../core/markdown.js";
-import { api } from "../core/auth.js";
+import { api, authState, getStoredAccessToken } from "../core/auth.js";
 import { toast, showModal, uid, formatSize } from "../core/ui_helpers.js";
 import { state, langInfo, langByExtension, activeTab, markDirty, updateStatusBar } from "../core/state.js";
 import { rawFileUrl, hydrateMediaPreviews, applyMediaImageTransform } from "./media.js";
 import { loadDirectory, renderFileList, downloadFileEntry } from "./files.js";
-import { ensureKernel, renderCells, updateKernelPill, refreshKernelList, refreshVariables } from "./notebook.js";
+import { ensureKernel, renderCells, updateKernelPill, refreshKernelList, refreshVariables, createNotebookCheckpoint } from "./notebook.js";
 import { syncFileParamsPanelForTab } from "./script_tools.js";
 import { renderFileAgyPanel } from "./agy.js";
 import { debugState, getBreakpointsForSource } from "./debugger.js";
+import { renderFileDiagnostics } from "./editor_tools.js";
 import { mountClusterGraph } from "../viz/cluster.js";
 
 async function openPathInTab(relPath) {
@@ -176,6 +177,7 @@ async function openPathInTab(relPath) {
         language: doc.language,
         doc,
         activeCellId: doc.cells[0].id,
+        scrollTop: 0,
       };
       state.tabs.push(tab);
       activateTab(tab.id);
@@ -222,12 +224,18 @@ async function createUntitledNotebook(doc = null, title = "Untitled.mnb", path =
     language: nbDoc.language,
     doc: nbDoc,
     activeCellId: nbDoc.cells[0].id,
+    scrollTop: 0,
   };
   state.tabs.push(tab);
   activateTab(tab.id);
 }
 
 function activateTab(tabId) {
+  const prev = activeTab();
+  if (prev && prev.id !== tabId && prev.kind === "notebook") {
+    const nbView = document.getElementById("notebook-view");
+    if (nbView) prev.scrollTop = nbView.scrollTop;
+  }
   state.activeTabId = tabId;
   renderTabs();
   renderActiveWorkspace();
@@ -463,6 +471,11 @@ function renderActiveWorkspace() {
     const ext = (linfo.extensions && linfo.extensions[0]) || "mini";
     document.getElementById("tb-export-mini").querySelector("span").textContent = `Export .${ext}`;
     renderCells();
+    const targetScroll = tab.scrollTop || 0;
+    nbView.scrollTop = targetScroll;
+    requestAnimationFrame(() => {
+      if (activeTab()?.id === tab.id) nbView.scrollTop = targetScroll;
+    });
   } else if (tab.kind === "sqlite") {
     renderSqliteTabView(tab);
   } else if (tab.kind === "data") {
@@ -543,11 +556,17 @@ function renderActiveWorkspace() {
     syncFileParamsPanelForTab(tab);
     document.getElementById("ftb-invoke-mini").classList.toggle("hidden", !isScript);
     document.getElementById("ftb-launch-ui").classList.toggle("hidden", !(isUi || (fileLang && fileLang.supports_ui)));
+    const splitBtn = document.getElementById("ftb-split-preview");
+    if (splitBtn) {
+      const spSpan = splitBtn.querySelector("span");
+      if (spSpan) spSpan.textContent = isUi ? "Live UI Split" : "Split Preview";
+    }
     document.getElementById("ftb-open-as-nb").classList.toggle("hidden", !isScript);
     document.getElementById("file-run-output").classList.add("hidden");
     document.getElementById("file-invoke-panel").classList.add("hidden");
     document.getElementById("file-agy-panel").classList.toggle("hidden", !tab._agyOpen);
     if (tab._agyOpen) renderFileAgyPanel(tab);
+    renderFileDiagnostics(tab);
   }
 }
 
@@ -570,15 +589,24 @@ function syncFileEditorHighlight(code, highlightLang) {
     debugState.activeSource === tab.path
       ? debugState.activeLine
       : null;
+  const diagMap = new Map();
+  if (tab && tab.kind === "file" && Array.isArray(tab._diagnostics)) {
+    for (const d of tab._diagnostics) {
+      if (!diagMap.has(d.line)) diagMap.set(d.line, d.message);
+    }
+  }
   const lineCount = Math.max(1, code.split("\n").length);
   let html = "";
   for (let i = 1; i <= lineCount; i++) {
+    const diagMsg = diagMap.get(i);
     const cls = [
       "fe-gutter-line",
       bpSet.has(i) ? "bp-active" : "",
       curPausedLine === i ? "dbg-cur-line" : "",
+      diagMsg ? "diag-error" : "",
     ].filter(Boolean).join(" ");
-    html += `<div class="${cls}" data-line="${i}"><span class="fe-bp-dot"></span><span>${i}</span></div>`;
+    const titleAttr = diagMsg ? ` title="${escapeHtml(diagMsg)}"` : "";
+    html += `<div class="${cls}" data-line="${i}"${titleAttr}><span class="fe-bp-dot"></span><span>${i}</span></div>`;
   }
   gutter.innerHTML = html;
 }
@@ -635,6 +663,16 @@ async function saveActiveTab() {
       tab.path = saved.path;
       tab.title = saved.path.split("/").pop();
       tab.dirty = false;
+      createNotebookCheckpoint(tab, "Auto-save", true).catch(() => {});
+    } else if (tab.kind === "markdown") {
+      const content = tab.content || "";
+      const saved = await api("/api/file", {
+        method: "PUT",
+        body: JSON.stringify({ path: targetPath, content }),
+      });
+      tab.path = saved.path;
+      tab.dirty = false;
+      refreshSplitPaneIfAuto(tab.path);
     } else {
       const content = document.getElementById("file-editor-textarea").value;
       tab.content = content;
@@ -644,6 +682,7 @@ async function saveActiveTab() {
       });
       tab.path = saved.path;
       tab.dirty = false;
+      refreshSplitPaneIfAuto(tab.path);
     }
     renderTabs();
     updateStatusBar();
@@ -1029,6 +1068,121 @@ function renderDataTabView(tab) {
   window.MlnbViz?.mountTable(host, { title: tab.title, columns: parsed.columns, rows: parsed.rows }, { pageSize: 100 });
 }
 
+// =========================================================================
+// Split Pane & Live Side-by-Side UI / File Preview (Feature #6)
+// =========================================================================
+const splitState = {
+  open: false,
+  mode: "ui", // "ui" | "file"
+  path: "",
+  autoReload: true,
+};
+
+function buildUiPreviewUrl(relPath) {
+  const clean = (relPath || "").trim().replace(/^\/+/, "");
+  const base = `/ui/${encodeURI(clean)}`;
+  const qs = new URLSearchParams();
+  qs.set("_t", String(Date.now()));
+  const tok = authState.required ? getStoredAccessToken() : null;
+  if (tok) qs.set("token", tok);
+  return `${base}?${qs.toString()}`;
+}
+
+async function reloadSplitPane() {
+  const path = (splitState.path || "").trim();
+  const statusEl = document.getElementById("split-pane-status");
+  const iframeWrap = document.getElementById("split-iframe-wrap");
+  const fileWrap = document.getElementById("split-file-wrap");
+  const frame = document.getElementById("split-ui-frame");
+  const fileBody = document.getElementById("split-file-body");
+  if (!iframeWrap || !fileWrap) return;
+
+  if (!path) {
+    if (statusEl) statusEl.textContent = "Enter a .ui or workspace file path above to preview side-by-side.";
+    iframeWrap.classList.add("hidden");
+    fileWrap.classList.remove("hidden");
+    if (fileBody) fileBody.innerHTML = `<div class="log-empty">Select a <code>.ui</code> file and click <strong>Live UI Split</strong>, or enter any workspace path above.</div>`;
+    return;
+  }
+
+  if (splitState.mode === "ui") {
+    iframeWrap.classList.remove("hidden");
+    fileWrap.classList.add("hidden");
+    if (statusEl) statusEl.textContent = `Live UI: /ui/${path} (auto-reloads on Ctrl+S)`;
+    if (frame) frame.src = buildUiPreviewUrl(path);
+    return;
+  }
+
+  // Side-by-side file preview (Markdown rendered, or syntax-highlighted source)
+  iframeWrap.classList.add("hidden");
+  fileWrap.classList.remove("hidden");
+  if (statusEl) statusEl.textContent = `Loading ${path}...`;
+  try {
+    const file = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    if (statusEl) statusEl.textContent = `${file.path} · ${formatSize(file.size || 0)}`;
+    if (!fileBody) return;
+    if (file.is_markdown) {
+      fileBody.innerHTML = `<article class="md-rendered split-md-article">${renderMarkdown(file.content || "")}</article>`;
+      hydrateMediaPreviews(fileBody);
+    } else if (file.is_image) {
+      fileBody.innerHTML = `<div class="split-img-wrap"><img src="${rawFileUrl(file.path)}" alt="${escapeHtml(file.name)}" /></div>`;
+    } else if (file.is_binary) {
+      fileBody.innerHTML = `<div class="log-empty">Binary file (${formatSize(file.size || 0)})</div>`;
+    } else {
+      const fl = file.extension === "ui" ? { id: "minilang" } : langByExtension(file.extension);
+      const codeHtml = fl ? highlightCode(file.content || "", fl.id) : escapeHtml(file.content || "");
+      fileBody.innerHTML = `<pre class="split-code-pre">${codeHtml}</pre>`;
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+    if (fileBody) fileBody.innerHTML = `<div class="log-empty" style="color:var(--accent-red)">Failed to load ${escapeHtml(path)}: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function openSplitPane(path = "", mode = null) {
+  const pane = document.getElementById("split-pane");
+  const resizer = document.getElementById("split-resizer");
+  const btn = document.getElementById("btn-split-pane");
+  const modeSel = document.getElementById("split-mode-select");
+  const pathInp = document.getElementById("split-path-input");
+  if (!pane) return;
+
+  const tab = activeTab();
+  const targetPath = path || splitState.path || (tab && tab.path) || "";
+  const isUiPath = targetPath.endsWith(".ui") || targetPath.endsWith(".mini");
+  splitState.open = true;
+  splitState.path = targetPath;
+  splitState.mode = mode || (targetPath.endsWith(".ui") ? "ui" : (isUiPath && splitState.mode === "ui" ? "ui" : "file"));
+
+  pane.classList.remove("hidden");
+  resizer?.classList.remove("hidden");
+  btn?.classList.add("active");
+  if (modeSel) modeSel.value = splitState.mode;
+  if (pathInp) pathInp.value = splitState.path;
+  reloadSplitPane();
+}
+
+function closeSplitPane() {
+  splitState.open = false;
+  document.getElementById("split-pane")?.classList.add("hidden");
+  document.getElementById("split-resizer")?.classList.add("hidden");
+  document.getElementById("btn-split-pane")?.classList.remove("active");
+}
+
+function toggleSplitPane() {
+  if (splitState.open) closeSplitPane();
+  else openSplitPane();
+}
+
+function refreshSplitPaneIfAuto(savedPath) {
+  if (!splitState.open || !splitState.autoReload) return;
+  if (!splitState.path) return;
+  // Reload whenever the previewed file itself is saved, or any .mini/.ui helper is saved while previewing a UI
+  if (savedPath === splitState.path || (splitState.mode === "ui" && (savedPath.endsWith(".ui") || savedPath.endsWith(".mini")))) {
+    reloadSplitPane();
+  }
+}
+
 export function initViewers() {
   document.querySelectorAll("#sqlite-toolbar [data-sql-mode]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1219,6 +1373,67 @@ export function initViewers() {
     a.click();
     a.remove();
   });
+
+  // Split Pane & Live Preview controls
+  document.getElementById("btn-split-pane")?.addEventListener("click", () => toggleSplitPane());
+  document.getElementById("ftb-split-preview")?.addEventListener("click", async () => {
+    const tab = activeTab();
+    if (!tab || !tab.path) return;
+    if (tab.dirty) await saveActiveTab();
+    const isUi = tab.extension === "ui";
+    openSplitPane(tab.path, isUi ? "ui" : "file");
+  });
+  document.getElementById("split-close-btn")?.addEventListener("click", closeSplitPane);
+  document.getElementById("split-reload-btn")?.addEventListener("click", reloadSplitPane);
+  document.getElementById("split-open-ext-btn")?.addEventListener("click", () => {
+    if (!splitState.path) return;
+    const url = splitState.mode === "ui"
+      ? `/ui/${encodeURI(splitState.path)}`
+      : rawFileUrl(splitState.path);
+    window.open(url, "_blank", "noopener");
+  });
+  document.getElementById("split-mode-select")?.addEventListener("change", (e) => {
+    splitState.mode = e.target.value;
+    reloadSplitPane();
+  });
+  document.getElementById("split-auto-reload")?.addEventListener("change", (e) => {
+    splitState.autoReload = !!e.target.checked;
+  });
+  document.getElementById("split-path-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      splitState.path = e.target.value.trim();
+      reloadSplitPane();
+    }
+  });
+
+  // Split Pane drag resizer
+  const splitResizer = document.getElementById("split-resizer");
+  const splitPane = document.getElementById("split-pane");
+  if (splitResizer && splitPane) {
+    let draggingSplit = false;
+    splitResizer.addEventListener("mousedown", () => {
+      draggingSplit = true;
+      splitResizer.classList.add("dragging");
+      document.body.style.cursor = "col-resize";
+      const frame = document.getElementById("split-ui-frame");
+      if (frame) frame.style.pointerEvents = "none";
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!draggingSplit) return;
+      const rightEdge = window.innerWidth;
+      const w = Math.max(260, Math.min(window.innerWidth * 0.65, rightEdge - e.clientX));
+      splitPane.style.width = `${w}px`;
+    });
+    window.addEventListener("mouseup", () => {
+      if (!draggingSplit) return;
+      draggingSplit = false;
+      splitResizer.classList.remove("dragging");
+      document.body.style.cursor = "";
+      const frame = document.getElementById("split-ui-frame");
+      if (frame) frame.style.pointerEvents = "";
+    });
+  }
 }
 
 export {
@@ -1242,4 +1457,9 @@ export {
   renderSqliteResult,
   renderSqliteTabView,
   renderDataTabView,
+  openSplitPane,
+  closeSplitPane,
+  toggleSplitPane,
+  reloadSplitPane,
+  refreshSplitPaneIfAuto,
 };

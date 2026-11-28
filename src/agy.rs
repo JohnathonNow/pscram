@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgyStatus {
@@ -375,6 +376,214 @@ impl AgyRunner {
             conversation_id: conv_id.or(req.conversation_id),
             duration_ms: start.elapsed().as_secs_f64() * 1000.0,
         })
+    }
+
+    /// Streaming prompt to `agy --print` yielding incremental text deltas over an unbounded channel.
+    pub async fn prompt_stream(
+        &self,
+        req: AgyPromptRequest,
+        tx: mpsc::UnboundedSender<serde_json::Value>,
+    ) -> Result<(), String> {
+        let start = Instant::now();
+        let bin = self.bin_path.as_ref().ok_or_else(|| {
+            "Google Antigravity CLI (`agy`) was not found. Install `agy` or pass `--agy-bin /path/to/agy`."
+                .to_string()
+        })?;
+
+        let full_prompt = match req.system.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sys) => format!("System instructions:\n{}\n\n{}", sys, req.prompt.trim()),
+            None => req.prompt.trim().to_string(),
+        };
+        let timeout_secs = req
+            .timeout_secs
+            .unwrap_or(self.timeout_secs)
+            .clamp(5, 600);
+        let mode = req
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("plan");
+        let req_id = req
+            .request_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("--print")
+            .arg(full_prompt)
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--disable-slash-commands")
+            .arg("--mode")
+            .arg(mode)
+            .arg("--print-timeout")
+            .arg(format!("{}s", timeout_secs))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(conv_id) = req
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cmd.arg("--conversation").arg(conv_id);
+        }
+        if let Some(model) = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(self.default_model.as_deref())
+        {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(effort) = req
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| matches!(*s, "low" | "medium" | "high" | "xhigh" | "max"))
+        {
+            cmd.arg("--effort").arg(effort);
+        }
+
+        let work_dir = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.workspace_root.clone());
+        if work_dir.is_dir() {
+            cmd.current_dir(&work_dir);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to launch agy ({}): {}", bin.display(), e))?;
+
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        {
+            let mut map = self.inflight.lock().await;
+            map.insert(req_id.clone(), cancel_tx);
+        }
+
+        let stdout = child.stdout.take();
+        let mut accumulated = String::new();
+        let mut conv_id: Option<String> = req.conversation_id.clone();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs + 5);
+        let mut err_out: Option<String> = None;
+
+        if let Some(out) = stdout {
+            let mut reader = BufReader::new(out).lines();
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        let _ = child.kill().await;
+                        err_out = Some("Request cancelled by user".to_string());
+                        break;
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        let _ = child.kill().await;
+                        err_out = Some(format!("agy timed out after {} seconds", timeout_secs));
+                        break;
+                    }
+                    line_res = reader.next_line() => {
+                        match line_res {
+                            Ok(Some(line)) => {
+                                let lt = line.trim();
+                                if lt.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(lt) {
+                                    if let Some(cid) = val
+                                        .get("conversation_id")
+                                        .or_else(|| val.get("conversationId"))
+                                        .or_else(|| val.get("session_id"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        conv_id = Some(cid.to_string());
+                                    }
+                                    if let Some(err_v) = val.get("error").filter(|v| !v.is_null()) {
+                                        let emsg = err_v
+                                            .as_str()
+                                            .map(String::from)
+                                            .or_else(|| err_v.get("message").and_then(|m| m.as_str()).map(String::from))
+                                            .unwrap_or_else(|| err_v.to_string());
+                                        err_out = Some(emsg);
+                                        break;
+                                    }
+                                    if let Some(delta) = val
+                                        .get("delta")
+                                        .or_else(|| val.get("chunk"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !delta.is_empty() {
+                                            accumulated.push_str(delta);
+                                            let _ = tx.send(serde_json::json!({ "delta": delta }));
+                                        }
+                                    } else if let Some(full_txt) = val
+                                        .get("result")
+                                        .or_else(|| val.get("response"))
+                                        .or_else(|| val.get("text"))
+                                        .or_else(|| val.get("content"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if accumulated.is_empty() {
+                                            accumulated.push_str(full_txt);
+                                            let _ = tx.send(serde_json::json!({ "delta": full_txt }));
+                                        } else if full_txt.starts_with(&accumulated) && full_txt.len() > accumulated.len() {
+                                            let tail = &full_txt[accumulated.len()..];
+                                            accumulated.push_str(tail);
+                                            let _ = tx.send(serde_json::json!({ "delta": tail }));
+                                        }
+                                    }
+                                } else {
+                                    let chunk = if accumulated.is_empty() {
+                                        line.clone()
+                                    } else {
+                                        format!("\n{}", line)
+                                    };
+                                    accumulated.push_str(&chunk);
+                                    let _ = tx.send(serde_json::json!({ "delta": chunk }));
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                err_out = Some(format!("agy stream read error: {}", e));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = child.wait().await;
+        {
+            let mut map = self.inflight.lock().await;
+            map.remove(&req_id);
+        }
+
+        if let Some(e) = err_out {
+            let _ = tx.send(serde_json::json!({ "error": e }));
+            return Err(e);
+        }
+
+        let (suggested_code, suggested_lang) = extract_primary_code_block(&accumulated);
+        let _ = tx.send(serde_json::json!({
+            "done": true,
+            "response": accumulated,
+            "conversation_id": conv_id,
+            "suggested_code": suggested_code,
+            "suggested_lang": suggested_lang,
+            "duration_ms": start.elapsed().as_secs_f64() * 1000.0,
+        }));
+        Ok(())
     }
 }
 

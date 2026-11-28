@@ -24,6 +24,7 @@ import { initScriptTools } from "./features/script_tools.js";
 import { openCommandPalette, openGrepModal, initManagers } from "./features/managers.js";
 import { toggleCellAgy, openFileAgyPanel, initAgyControls } from "./features/agy.js";
 import { initDebugger } from "./features/debugger.js";
+import { initEditorTools } from "./features/editor_tools.js";
 
 function initShellChrome() {
   document.getElementById("btn-toggle-sidebar").onclick = () => {
@@ -115,6 +116,7 @@ async function init() {
   initManagers();
   initAgyControls();
   initDebugger();
+  initEditorTools();
 
     try {
       const headers = {};

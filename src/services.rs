@@ -33,6 +33,24 @@ pub struct ServiceMessage {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceBusEvent {
+    pub id: String,
+    /// "send" | "broadcast" | "direct" | "call" | "reply" | "lifecycle"
+    pub kind: String,
+    pub service: String,
+    pub from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    pub topic: String,
+    pub data: Value,
+    pub data_plain: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    pub delivered: usize,
+    pub timestamp: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceInfo {
     pub id: String,
@@ -208,6 +226,8 @@ impl Drop for ServiceSubscription {
 pub struct ServiceManager {
     workspace_root: PathBuf,
     services: Mutex<BTreeMap<String, Arc<ServiceEntry>>>, // keyed by service name
+    bus_history: Mutex<VecDeque<ServiceBusEvent>>,
+    bus_taps: Mutex<Vec<mpsc::UnboundedSender<ServiceBusEvent>>>,
 }
 
 impl ServiceManager {
@@ -215,7 +235,72 @@ impl ServiceManager {
         Self {
             workspace_root,
             services: Mutex::new(BTreeMap::new()),
+            bus_history: Mutex::new(VecDeque::new()),
+            bus_taps: Mutex::new(Vec::new()),
         }
+    }
+
+    async fn record_bus_event(&self, ev: ServiceBusEvent) {
+        {
+            let mut hist = self.bus_history.lock().await;
+            hist.push_back(ev.clone());
+            while hist.len() > 250 {
+                hist.pop_front();
+            }
+        }
+        let mut taps = self.bus_taps.lock().await;
+        taps.retain(|tx| tx.send(ev.clone()).is_ok());
+    }
+
+    pub async fn bus_history(
+        &self,
+        service_filter: Option<&str>,
+        topic_filter: Option<&str>,
+        limit: usize,
+    ) -> Vec<ServiceBusEvent> {
+        let hist = self.bus_history.lock().await;
+        let svc_q = service_filter.map(str::trim).filter(|s| !s.is_empty());
+        let top_q = topic_filter.map(|s| s.trim().to_lowercase());
+        let top_q = top_q.as_deref().filter(|s| !s.is_empty());
+
+        let mut out: Vec<ServiceBusEvent> = hist
+            .iter()
+            .filter(|e| {
+                if let Some(sq) = svc_q {
+                    if e.service != sq {
+                        return false;
+                    }
+                }
+                if let Some(tq) = top_q {
+                    if !e.topic.to_lowercase().contains(tq)
+                        && !e.from.to_lowercase().contains(tq)
+                        && !e.kind.to_lowercase().contains(tq)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let cap = limit.clamp(1, 250);
+        if out.len() > cap {
+            out = out.split_off(out.len() - cap);
+        }
+        out
+    }
+
+    pub async fn subscribe_bus_tap(&self) -> mpsc::UnboundedReceiver<ServiceBusEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.bus_taps.lock().await.push(tx);
+        rx
+    }
+
+    pub async fn clear_bus_history(&self) -> usize {
+        let mut h = self.bus_history.lock().await;
+        let n = h.len();
+        h.clear();
+        n
     }
 
     async fn find(&self, name_or_id: &str) -> Option<Arc<ServiceEntry>> {
@@ -312,7 +397,22 @@ impl ServiceManager {
 
         // Give the child process a brief moment to spawn and populate its PID
         tokio::time::sleep(Duration::from_millis(30)).await;
-        Ok(entry.snapshot().await)
+        let snap = entry.snapshot().await;
+        self.record_bus_event(ServiceBusEvent {
+            id: format!("bus-{}", &Uuid::new_v4().to_string()[..8]),
+            kind: "lifecycle".to_string(),
+            service: snap.name.clone(),
+            from: "system".to_string(),
+            to: Some(snap.name.clone()),
+            topic: "started".to_string(),
+            data: json!({ "type": "string", "value": snap.script }),
+            data_plain: json!({ "script": snap.script, "pid": snap.pid }),
+            reply_to: None,
+            delivered: 0,
+            timestamp: Utc::now().to_rfc3339(),
+        })
+        .await;
+        Ok(snap)
     }
 
     pub async fn stop(&self, name_or_id: &str) -> Result<ServiceInfo, String> {
@@ -335,7 +435,22 @@ impl ServiceManager {
                 st.stopped_at = Some(Utc::now().to_rfc3339());
             }
         }
-        Ok(entry.snapshot().await)
+        let snap = entry.snapshot().await;
+        self.record_bus_event(ServiceBusEvent {
+            id: format!("bus-{}", &Uuid::new_v4().to_string()[..8]),
+            kind: "lifecycle".to_string(),
+            service: snap.name.clone(),
+            from: "system".to_string(),
+            to: Some(snap.name.clone()),
+            topic: "stopped".to_string(),
+            data: json!({ "type": "nil" }),
+            data_plain: Value::Null,
+            reply_to: None,
+            delivered: 0,
+            timestamp: Utc::now().to_rfc3339(),
+        })
+        .await;
+        Ok(snap)
     }
 
     pub async fn restart(
@@ -412,6 +527,20 @@ impl ServiceManager {
         entry.push_recent(msg.clone()).await;
         entry.inbox.lock().await.push_back(msg.clone());
         entry.inbox_notify.notify_one();
+        self.record_bus_event(ServiceBusEvent {
+            id: msg.id.clone(),
+            kind: "send".to_string(),
+            service: msg.service.clone(),
+            from: msg.from.clone(),
+            to: msg.to.clone(),
+            topic: msg.topic.clone(),
+            data: msg.data.clone(),
+            data_plain: tagged_json_to_plain(&msg.data),
+            reply_to: None,
+            delivered: 1,
+            timestamp: msg.timestamp.clone(),
+        })
+        .await;
         Ok(msg)
     }
 
@@ -451,6 +580,20 @@ impl ServiceManager {
 
         entry.messages_in.fetch_add(1, Ordering::SeqCst);
         entry.push_recent(msg.clone()).await;
+        self.record_bus_event(ServiceBusEvent {
+            id: msg.id.clone(),
+            kind: "call".to_string(),
+            service: msg.service.clone(),
+            from: msg.from.clone(),
+            to: msg.to.clone(),
+            topic: msg.topic.clone(),
+            data: msg.data.clone(),
+            data_plain: tagged_json_to_plain(&msg.data),
+            reply_to: msg.reply_to.clone(),
+            delivered: 1,
+            timestamp: msg.timestamp.clone(),
+        })
+        .await;
         entry.inbox.lock().await.push_back(msg);
         entry.inbox_notify.notify_one();
 
@@ -560,6 +703,24 @@ impl ServiceManager {
 
         entry.messages_out.fetch_add(1, Ordering::SeqCst);
         entry.push_recent(msg.clone()).await;
+        self.record_bus_event(ServiceBusEvent {
+            id: msg.id.clone(),
+            kind: if msg.to.is_some() {
+                "direct".to_string()
+            } else {
+                "broadcast".to_string()
+            },
+            service: msg.service.clone(),
+            from: msg.from.clone(),
+            to: msg.to.clone(),
+            topic: msg.topic.clone(),
+            data: msg.data.clone(),
+            data_plain: tagged_json_to_plain(&msg.data),
+            reply_to: None,
+            delivered,
+            timestamp: msg.timestamp.clone(),
+        })
+        .await;
         Ok((delivered, msg))
     }
 
@@ -578,7 +739,23 @@ impl ServiceManager {
         let tx = entry.pending_replies.lock().await.remove(&req.reply_to);
         if let Some(sender) = tx {
             entry.messages_out.fetch_add(1, Ordering::SeqCst);
-            Ok(sender.send(tagged_data).is_ok())
+            let data_plain = tagged_json_to_plain(&tagged_data);
+            let ok = sender.send(tagged_data.clone()).is_ok();
+            self.record_bus_event(ServiceBusEvent {
+                id: format!("rep-{}", &Uuid::new_v4().to_string()[..8]),
+                kind: "reply".to_string(),
+                service: entry.name.clone(),
+                from: entry.name.clone(),
+                to: None,
+                topic: format!("reply:{}", req.reply_to),
+                data: tagged_data,
+                data_plain,
+                reply_to: Some(req.reply_to),
+                delivered: if ok { 1 } else { 0 },
+                timestamp: Utc::now().to_rfc3339(),
+            })
+            .await;
+            Ok(ok)
         } else {
             Ok(false)
         }

@@ -74,6 +74,13 @@
           <span>Debug</span>
           <span id="debug-active-dot" class="debug-active-dot hidden"></span>
         </button>
+        <button id="btn-split-pane" class="toolbar-chip" title="Toggle Split Preview Pane">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <line x1="12" y1="3" x2="12" y2="21"/>
+          </svg>
+          <span>Split</span>
+        </button>
         <button id="btn-toggle-vars" class="toolbar-chip" title="Toggle Variable Inspector">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
@@ -248,6 +255,12 @@
               </svg>
               <span>Run All</span>
             </button>
+            <button id="tb-run-above" class="tb-btn" title="Run All Cells Above Selected Cell">
+              <span>Run Above</span>
+            </button>
+            <button id="tb-run-below" class="tb-btn" title="Run Selected Cell &amp; All Below">
+              <span>Run Below</span>
+            </button>
             <button id="tb-interrupt" class="tb-btn danger-hover" title="Interrupt Kernel">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
                 <rect x="5" y="5" width="14" height="14" rx="2"/>
@@ -264,6 +277,9 @@
             <span class="tb-sep"></span>
             <button id="tb-clear-outputs" class="tb-btn" title="Clear All Outputs">
               <span>Clear Outputs</span>
+            </button>
+            <button id="tb-checkpoints" class="tb-btn" title="Notebook Checkpoints, History &amp; Diff">
+              <span>Checkpoints</span>
             </button>
             <button id="tb-export-mini" class="tb-btn" title="Export notebook as script">
               <span>Export Script</span>
@@ -338,6 +354,13 @@
                 <line x1="3" y1="9" x2="21" y2="9"/>
               </svg>
               <span>Launch UI</span>
+            </button>
+            <button id="ftb-split-preview" class="tb-btn" title="Open Live Side-by-Side Preview">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <line x1="12" y1="3" x2="12" y2="21"/>
+              </svg>
+              <span>Split Preview</span>
             </button>
             <button id="ftb-open-as-nb" class="tb-btn" title="Convert & Open as Interactive Notebook">
               <span>Open as Notebook</span>
@@ -427,6 +450,36 @@
           </div>
           <span id="dtb-meta" class="tb-meta"></span>
         </div>
+
+        <!-- Inline Find & Replace Bar (Ctrl+F / Ctrl+H) -->
+        <div id="find-replace-bar" class="find-replace-bar hidden" role="search">
+          <div class="fr-row">
+            <input id="fr-find-input" class="fr-input" type="text" placeholder="Find..." autocomplete="off" />
+            <button id="fr-case-btn" type="button" class="tb-btn fr-btn" title="Match Case">Aa</button>
+            <span id="fr-count" class="fr-count">0 / 0</span>
+            <button id="fr-prev-btn" type="button" class="tb-btn fr-btn" title="Previous Match (Shift+Enter)">&uarr;</button>
+            <button id="fr-next-btn" type="button" class="tb-btn fr-btn" title="Next Match (Enter)">&darr;</button>
+            <button id="fr-toggle-replace" type="button" class="tb-btn fr-btn" title="Toggle Replace">Replace</button>
+            <button id="fr-close-btn" type="button" class="icon-btn sm" title="Close (Esc)">&times;</button>
+          </div>
+          <div id="fr-replace-row" class="fr-row hidden">
+            <input id="fr-replace-input" class="fr-input" type="text" placeholder="Replace with..." autocomplete="off" />
+            <button id="fr-replace-btn" type="button" class="tb-btn fr-btn">Replace</button>
+            <button id="fr-replace-all-btn" type="button" class="tb-btn fr-btn">Replace All</button>
+          </div>
+        </div>
+
+        <!-- Inline File Diagnostics Banner -->
+        <div id="file-diag-banner" class="file-diag-banner hidden">
+          <span id="file-diag-text"></span>
+          <div class="toolbar-group">
+            <button id="file-diag-jump" type="button" class="tb-btn fr-btn">Jump to Line</button>
+            <button id="file-diag-clear" type="button" class="icon-btn sm" title="Dismiss">&times;</button>
+          </div>
+        </div>
+
+        <!-- Clickable import(...) Go-to-Definition Pill -->
+        <button id="editor-goto-pill" type="button" class="editor-goto-pill hidden" title="Go to imported file (F12 or Ctrl+Click)"></button>
 
         <!-- Notebook Canvas -->
         <div id="notebook-view" class="notebook-scroll">
@@ -625,6 +678,47 @@
           <div id="data-table-host" class="data-table-host"></div>
         </div>
       </main>
+
+      <!-- Split Pane Resize Handle & Side-by-Side Live Preview / File Pane -->
+      <div id="split-resizer" class="resizer hidden" title="Drag to resize split pane"></div>
+      <aside id="split-pane" class="split-pane hidden">
+        <div class="split-pane-header">
+          <div class="split-pane-left">
+            <select id="split-mode-select" class="tb-lang-select" title="Split pane mode">
+              <option value="ui">Live UI Preview</option>
+              <option value="file">File Preview</option>
+            </select>
+            <input id="split-path-input" class="split-path-input" type="text" placeholder="Path (e.g. uis/counter.ui)" autocomplete="off" />
+          </div>
+          <div class="split-pane-actions">
+            <label class="tb-check-label" title="Reload preview automatically on Save (Ctrl+S)">
+              <input id="split-auto-reload" type="checkbox" checked />
+              <span>Auto</span>
+            </label>
+            <button id="split-reload-btn" type="button" class="icon-btn sm" title="Reload Split Preview">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+            </button>
+            <button id="split-open-ext-btn" type="button" class="icon-btn sm" title="Open in New Tab">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                <polyline points="15 3 21 3 21 9"/>
+                <line x1="10" y1="14" x2="21" y2="3"/>
+              </svg>
+            </button>
+            <button id="split-close-btn" type="button" class="icon-btn sm" title="Close Split Pane">&times;</button>
+          </div>
+        </div>
+        <div id="split-pane-status" class="split-pane-status"></div>
+        <div id="split-iframe-wrap" class="split-iframe-wrap">
+          <iframe id="split-ui-frame" class="split-ui-frame" title="Live UI Split Preview"></iframe>
+        </div>
+        <div id="split-file-wrap" class="split-file-wrap hidden">
+          <div id="split-file-body" class="split-file-body"></div>
+        </div>
+      </aside>
 
       <!-- Right Debugger Drawer -->
       <aside id="debug-drawer" class="debug-drawer hidden">
@@ -917,6 +1011,35 @@
             <button type="submit" class="tb-btn primary">Start Service</button>
           </form>
           <div id="services-list" class="manager-list"></div>
+          <div class="bus-inspector">
+            <div class="bus-inspector-head">
+              <div class="bus-inspector-title">
+                <strong>Live Service Bus Inspector</strong>
+                <span id="bus-live-badge" class="status-pill ok">Live</span>
+              </div>
+              <div class="bus-inspector-filters">
+                <input id="bus-filter-service" class="modal-input bus-filter-input" type="text" placeholder="Filter service..." autocomplete="off" />
+                <input id="bus-filter-topic" class="modal-input bus-filter-input" type="text" placeholder="Filter topic..." autocomplete="off" />
+                <button id="bus-toggle-stream" type="button" class="tb-btn" style="height:26px;font-size:11.5px">Pause</button>
+                <button id="bus-clear-btn" type="button" class="tb-btn" style="height:26px;font-size:11.5px">Clear</button>
+              </div>
+            </div>
+            <form id="bus-test-form" class="bus-test-form">
+              <select id="bus-test-mode" class="tb-lang-select" style="height:28px">
+                <option value="send">Send</option>
+                <option value="call">Call (RPC)</option>
+                <option value="broadcast">Broadcast</option>
+              </select>
+              <input id="bus-test-service" class="modal-input" type="text" placeholder="Service name" required />
+              <input id="bus-test-topic" class="modal-input" type="text" placeholder="Topic (e.g. ping)" required />
+              <input id="bus-test-data" class="modal-input" type="text" placeholder='Data JSON (e.g. {"x":1})' />
+              <button type="submit" class="tb-btn primary" style="height:28px;font-size:11.5px">Dispatch</button>
+            </form>
+            <pre id="bus-test-result" class="bus-test-result hidden"></pre>
+            <div id="bus-events-list" class="bus-events-list">
+              <div class="log-empty">No bus events recorded yet.</div>
+            </div>
+          </div>
         </div>
         <div id="jobs-pane-sessions" class="jobs-pane hidden">
           <div id="sessions-list" class="manager-list"></div>
@@ -964,6 +1087,34 @@
           <button type="submit" class="tb-btn primary">Save Secret</button>
         </form>
         <div id="secrets-list" class="manager-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notebook Checkpoints & Diff Modal (Feature #9) -->
+  <div id="checkpoints-modal-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide-modal-card cp-modal-card">
+      <div class="modal-header">
+        <h3>Notebook Checkpoints &amp; History</h3>
+        <div class="toolbar-group">
+          <input id="cp-label-input" class="modal-input" type="text" placeholder="Snapshot label (optional)" style="width:200px;height:28px" />
+          <button id="cp-save-btn" type="button" class="tb-btn primary" style="height:28px">Save Checkpoint</button>
+          <button id="checkpoints-modal-close" type="button" class="icon-btn sm">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body cp-modal-body">
+        <div id="cp-list" class="cp-list">
+          <div class="log-empty">No checkpoints yet.</div>
+        </div>
+        <div class="cp-diff-pane">
+          <div class="cp-diff-head">
+            <span id="cp-diff-title" class="tb-meta">Select a checkpoint to inspect cell diff</span>
+            <button id="cp-restore-btn" type="button" class="tb-btn primary hidden" style="height:26px;font-size:12px">Restore This Checkpoint</button>
+          </div>
+          <div id="cp-diff-view" class="cp-diff-view">
+            <div class="log-empty">Select a checkpoint on the left to compare against your current notebook.</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>

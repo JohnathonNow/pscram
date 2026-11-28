@@ -397,6 +397,18 @@ static ml_value_t *mlk_emit_json_display(const char *Mime, ml_value_t *Payload) 
     return MLNil;
 }
 
+void mlk_emit_display_raw(const char *Mime, const char *Data, size_t Len) {
+    if (g_display_cb && Mime && Data) {
+        g_display_cb(Mime, Data, Len, g_cb_ctx);
+    }
+}
+
+uint64_t mlk_memory_used_bytes(void) {
+    size_t heap = GC_get_heap_size();
+    size_t free_b = GC_get_free_bytes();
+    return (heap >= free_b) ? (uint64_t)(heap - free_b) : (uint64_t)heap;
+}
+
 /* table(data, title?) -> emits application/vnd.minilang.table+json */
 ML_FUNCTION(MLKTable) {
     ML_CHECK_ARG_COUNT(1);
