@@ -24,6 +24,22 @@ ml_value_t *mlio_http_json_raw(
     long *OutStatus
 );
 
+/* Shared streaming HTTP helper (invokes OnChunk incrementally as bytes arrive from libcurl).
+ * Return non-zero from OnChunk to abort streaming early. */
+typedef int (*mlio_stream_chunk_cb)(const char *Data, size_t Len, void *Ctx);
+
+ml_value_t *mlio_http_stream_raw(
+    const char *Method,
+    const char *Url,
+    const char *const *ExtraHeaders,
+    const char *JsonBody,
+    size_t BodyLen,
+    long TimeoutSecs,
+    mlio_stream_chunk_cb OnChunk,
+    void *Ctx,
+    long *OutStatus
+);
+
 #ifdef __cplusplus
 }
 #endif

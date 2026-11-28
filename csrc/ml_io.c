@@ -1315,6 +1315,127 @@ ml_value_t *mlio_http_json_raw(
     return Decoded;
 }
 
+typedef struct {
+    mlio_stream_chunk_cb OnChunk;
+    void *Ctx;
+    int Aborted;
+    char ErrSnippet[512];
+    size_t ErrLen;
+} ml_stream_sink_t;
+
+static size_t mlio_curl_stream_cb(char *Ptr, size_t Size, size_t Nmemb, void *Userdata) {
+    ml_stream_sink_t *Sink = (ml_stream_sink_t *)Userdata;
+    size_t Total = Size * Nmemb;
+    if (Total == 0) return 0;
+    if (Sink->ErrLen < sizeof(Sink->ErrSnippet) - 1) {
+        size_t Copy = Total;
+        size_t Rem = sizeof(Sink->ErrSnippet) - 1 - Sink->ErrLen;
+        if (Copy > Rem) Copy = Rem;
+        memcpy(Sink->ErrSnippet + Sink->ErrLen, Ptr, Copy);
+        Sink->ErrLen += Copy;
+        Sink->ErrSnippet[Sink->ErrLen] = '\0';
+    }
+    if (Sink->OnChunk) {
+        if (Sink->OnChunk(Ptr, Total, Sink->Ctx) != 0) {
+            Sink->Aborted = 1;
+            return 0;
+        }
+    }
+    return Total;
+}
+
+ml_value_t *mlio_http_stream_raw(
+    const char *Method,
+    const char *Url,
+    const char *const *ExtraHeaders,
+    const char *JsonBody,
+    size_t BodyLen,
+    long TimeoutSecs,
+    mlio_stream_chunk_cb OnChunk,
+    void *Ctx,
+    long *OutStatus
+) {
+    if (OutStatus) *OutStatus = 0;
+    char ErrBuf[512];
+    if (mlio_load_curl(ErrBuf, sizeof(ErrBuf)) != 0) {
+        return ml_error("HttpError", "%s", ErrBuf);
+    }
+
+    ML_CURL *Curl = g_curl.easy_init();
+    if (!Curl) {
+        return ml_error("HttpError", "curl_easy_init failed");
+    }
+
+    struct ml_curl_slist *CurlHeaders = NULL;
+    int HasContentType = 0;
+    if (ExtraHeaders) {
+        for (int I = 0; ExtraHeaders[I]; ++I) {
+            if (strncasecmp(ExtraHeaders[I], "Content-Type:", 13) == 0) {
+                HasContentType = 1;
+            }
+            CurlHeaders = g_curl.slist_append(CurlHeaders, ExtraHeaders[I]);
+        }
+    }
+    if (JsonBody && !HasContentType) {
+        CurlHeaders = g_curl.slist_append(CurlHeaders, "Content-Type: application/json");
+    }
+    CurlHeaders = g_curl.slist_append(CurlHeaders, "Accept: text/event-stream");
+    CurlHeaders = g_curl.slist_append(CurlHeaders, "Expect:");
+
+    ml_stream_sink_t Sink;
+    memset(&Sink, 0, sizeof(Sink));
+    Sink.OnChunk = OnChunk;
+    Sink.Ctx = Ctx;
+
+    long EffTimeout = (TimeoutSecs > 0) ? TimeoutSecs : 180L;
+
+    g_curl.easy_setopt(Curl, ML_CURLOPT_URL, Url);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_FOLLOWLOCATION, 1L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_NOSIGNAL, 1L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_CONNECTTIMEOUT, 15L);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_TIMEOUT, EffTimeout);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_USERAGENT, "minilang-notebook/0.1");
+    g_curl.easy_setopt(Curl, ML_CURLOPT_WRITEFUNCTION, mlio_curl_stream_cb);
+    g_curl.easy_setopt(Curl, ML_CURLOPT_WRITEDATA, &Sink);
+    if (CurlHeaders) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_HTTPHEADER, CurlHeaders);
+    }
+
+    if (strcmp(Method, "POST") == 0) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POST, 1L);
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDS, JsonBody ? JsonBody : "");
+        g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDSIZE_LARGE, (int64_t)(JsonBody ? BodyLen : 0));
+    } else if (strcmp(Method, "GET") != 0) {
+        g_curl.easy_setopt(Curl, ML_CURLOPT_CUSTOMREQUEST, Method);
+        if (JsonBody) {
+            g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDS, JsonBody);
+            g_curl.easy_setopt(Curl, ML_CURLOPT_POSTFIELDSIZE_LARGE, (int64_t)BodyLen);
+        }
+    }
+
+    int Res = g_curl.easy_perform(Curl);
+    long StatusCode = 0;
+    if (Res == ML_CURLE_OK || Sink.Aborted) {
+        g_curl.easy_getinfo(Curl, ML_CURLINFO_RESPONSE_CODE, &StatusCode);
+    }
+    const char *CurlErrStr = (Res != ML_CURLE_OK && !Sink.Aborted) ? g_curl.easy_strerror(Res) : NULL;
+
+    g_curl.easy_cleanup(Curl);
+    if (CurlHeaders) g_curl.slist_free_all(CurlHeaders);
+    if (OutStatus) *OutStatus = StatusCode;
+
+    if (CurlErrStr) {
+        return ml_error("HttpError", "HTTP stream %s failed: %s", Method, CurlErrStr);
+    }
+    if (StatusCode >= 400) {
+        if (Sink.ErrSnippet[0] != '\0') {
+            return ml_error("HttpError", "HTTP %ld: %s", StatusCode, Sink.ErrSnippet);
+        }
+        return ml_error("HttpError", "HTTP stream returned status %ld", StatusCode);
+    }
+    return MLNil;
+}
+
 /* ============================================================================
  * Module Registration
  * ============================================================================ */

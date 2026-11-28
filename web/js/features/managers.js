@@ -7,14 +7,24 @@
  */
 
 import { escapeHtml } from "../core/highlight.js";
-import { api, authState } from "../core/auth.js";
+import { api, authState, getStoredAccessToken } from "../core/auth.js";
 import { toast, showModal, copyTextToClipboard } from "../core/ui_helpers.js";
 import { state, langInfo, activeTab } from "../core/state.js";
 import { loadDirectory, promptNewNotebook, promptNewUi, promptNewFile, promptNewFolder } from "./files.js";
-import { openPathInTab, activateTab, saveActiveTab } from "./viewers.js";
-import { runAllCells, restartKernel, interruptKernel, refreshKernelList, selectCell } from "./notebook.js";
+import { openPathInTab, activateTab, saveActiveTab, toggleSplitPane } from "./viewers.js";
+import {
+  runAllCells,
+  runCellsAbove,
+  runCellsBelow,
+  openCheckpointsModal,
+  restartKernel,
+  interruptKernel,
+  refreshKernelList,
+  selectCell,
+} from "./notebook.js";
 import { parseRunParamsJson, openFileParamsPanel } from "./script_tools.js";
 import { toggleDebugDrawer, startDebuggingActive } from "./debugger.js";
+import { openFindReplaceBar } from "./editor_tools.js";
 
 // =========================================================================
 // Background Jobs & Active Sessions Manager
@@ -294,6 +304,105 @@ async function loadJobsAndSessions() {
   }
 }
 
+// =========================================================================
+// Live Service Message Bus Inspector (Feature #7)
+// =========================================================================
+const busState = {
+  events: [],
+  source: null,
+  paused: false,
+  filterService: "",
+  filterTopic: "",
+};
+
+function renderBusEvents() {
+  const listEl = document.getElementById("bus-events-list");
+  if (!listEl) return;
+  const sf = busState.filterService.trim().toLowerCase();
+  const tf = busState.filterTopic.trim().toLowerCase();
+  const filtered = busState.events.filter((ev) => {
+    if (sf && !(ev.service || "").toLowerCase().includes(sf)) return false;
+    if (tf && !(ev.topic || "").toLowerCase().includes(tf)) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="log-empty">No matching bus events${busState.events.length ? " for current filter" : " yet"}. Send a message or interact with a connected UI.</div>`;
+    return;
+  }
+
+  // Show newest first
+  const recent = filtered.slice(-120).reverse();
+  listEl.innerHTML = recent.map((ev) => {
+    const ts = ev.timestamp ? ev.timestamp.slice(11, 23) : "";
+    const kind = ev.kind || ev.direction || "send";
+    const dirCls = `bus-dir-${escapeHtml(kind)}`;
+    const rawPayload = ev.data_plain !== undefined ? ev.data_plain : ev.data;
+    let payloadStr = "";
+    try {
+      payloadStr = typeof rawPayload === "string" ? rawPayload : JSON.stringify(rawPayload);
+    } catch {
+      payloadStr = String(rawPayload ?? "");
+    }
+    const route = [ev.from ? `from:${ev.from}` : "", ev.to ? `to:${ev.to}` : ""].filter(Boolean).join(" → ");
+    return `
+      <div class="bus-event-row">
+        <span class="bus-ev-ts">${escapeHtml(ts)}</span>
+        <span class="bus-dir-badge ${dirCls}">${escapeHtml(kind)}</span>
+        <span class="bus-ev-svc">${escapeHtml(ev.service || "")}</span>
+        <span class="bus-ev-topic">${escapeHtml(ev.topic || "")}</span>
+        <span class="bus-ev-route">${escapeHtml(route)}</span>
+        <code class="bus-ev-data">${escapeHtml(payloadStr)}</code>
+      </div>`;
+  }).join("");
+}
+
+async function loadBusHistory() {
+  try {
+    const res = await api("/api/services/bus/history?limit=150");
+    busState.events = Array.isArray(res.events) ? res.events : [];
+    renderBusEvents();
+  } catch { /* ignore */ }
+}
+
+function disconnectBusStream() {
+  if (busState.source) {
+    busState.source.close();
+    busState.source = null;
+  }
+}
+
+function connectBusStream() {
+  disconnectBusStream();
+  const badge = document.getElementById("bus-live-badge");
+  if (busState.paused) {
+    if (badge) { badge.textContent = "Paused"; badge.className = "status-pill paused"; }
+    return;
+  }
+  const qs = new URLSearchParams();
+  const tok = authState.required ? getStoredAccessToken() : null;
+  if (tok) qs.set("token", tok);
+  const url = `/api/services/bus/stream${qs.toString() ? `?${qs.toString()}` : ""}`;
+  const es = new EventSource(url);
+  busState.source = es;
+
+  es.addEventListener("connected", () => {
+    if (badge) { badge.textContent = "Live"; badge.className = "status-pill ok"; }
+  });
+  es.addEventListener("bus", (evt) => {
+    if (busState.paused) return;
+    try {
+      const ev = JSON.parse(evt.data);
+      busState.events.push(ev);
+      if (busState.events.length > 250) busState.events.shift();
+      renderBusEvents();
+    } catch { /* ignore */ }
+  });
+  es.onerror = () => {
+    if (badge && !busState.paused) { badge.textContent = "Reconnecting"; badge.className = "status-pill paused"; }
+  };
+}
+
 function setJobsModalTab(tabName) {
   jobsActiveTab = (tabName === "sessions" || tabName === "services") ? tabName : "bg";
   document.getElementById("jobs-tab-bg")?.classList.toggle("active", jobsActiveTab === "bg");
@@ -303,6 +412,12 @@ function setJobsModalTab(tabName) {
   document.getElementById("jobs-pane-services")?.classList.toggle("hidden", jobsActiveTab !== "services");
   document.getElementById("jobs-pane-sessions")?.classList.toggle("hidden", jobsActiveTab !== "sessions");
   document.getElementById("jobs-clear-btn")?.classList.toggle("hidden", jobsActiveTab !== "bg");
+  if (jobsActiveTab === "services") {
+    loadBusHistory();
+    connectBusStream();
+  } else {
+    disconnectBusStream();
+  }
 }
 
 function openJobsModal(tabName = "bg") {
@@ -320,6 +435,7 @@ function openJobsModal(tabName = "bg") {
 
 function closeJobsModal() {
   document.getElementById("jobs-modal-overlay")?.classList.add("hidden");
+  disconnectBusStream();
   if (jobsPollTimer) {
     clearInterval(jobsPollTimer);
     jobsPollTimer = null;
@@ -488,13 +604,18 @@ function buildPaletteCommands() {
     { label: "New Folder", meta: "Command", run: () => promptNewFolder() },
     { label: "Upload Files...", meta: "Command", run: () => document.getElementById("file-upload-input")?.click() },
     { label: "Find in Files (Workspace Search)", meta: "Ctrl+Shift+F", run: () => openGrepModal() },
+    { label: "Find & Replace in Active Tab", meta: "Ctrl+F / Ctrl+H", run: () => openFindReplaceBar(false) },
+    { label: "Toggle Split Preview Pane", meta: "View", run: () => toggleSplitPane() },
     { label: "Jobs & Sessions Manager", meta: "Manager", run: () => openJobsModal("bg") },
-    { label: "Background Services Manager", meta: "Manager", run: () => openJobsModal("services") },
+    { label: "Live Service Bus Inspector", meta: "Services", run: () => openJobsModal("services") },
     { label: "Active Kernel Sessions", meta: "Manager", run: () => openJobsModal("sessions") },
     { label: "Scheduled Jobs & Webhooks", meta: "Manager", run: () => openSchedulesModal() },
     { label: "Encrypted Secrets Vault", meta: "Manager", run: () => openSecretsModal() },
     { label: "Save Active Tab", meta: "Ctrl+S", run: () => saveActiveTab() },
+    { label: "Notebook Checkpoints & History", meta: "Notebook", run: () => openCheckpointsModal() },
     { label: "Run All Cells", meta: "Notebook", run: () => runAllCells() },
+    { label: "Run Cells Above", meta: "Notebook", run: () => runCellsAbove() },
+    { label: "Run Cells Below", meta: "Notebook", run: () => runCellsBelow() },
     { label: "Restart Active Kernel", meta: "Kernel", run: () => restartKernel() },
     { label: "Interrupt Active Kernel", meta: "Kernel", run: () => interruptKernel() },
     { label: "Toggle Debugger", meta: "Debug", run: () => toggleDebugDrawer() },
@@ -646,6 +767,76 @@ export function initManagers() {
   document.getElementById("jobs-tab-bg")?.addEventListener("click", () => setJobsModalTab("bg"));
   document.getElementById("jobs-tab-services")?.addEventListener("click", () => setJobsModalTab("services"));
   document.getElementById("jobs-tab-sessions")?.addEventListener("click", () => setJobsModalTab("sessions"));
+
+  // Live Service Bus Inspector controls
+  document.getElementById("bus-filter-service")?.addEventListener("input", (e) => {
+    busState.filterService = e.target.value;
+    renderBusEvents();
+  });
+  document.getElementById("bus-filter-topic")?.addEventListener("input", (e) => {
+    busState.filterTopic = e.target.value;
+    renderBusEvents();
+  });
+  document.getElementById("bus-toggle-stream")?.addEventListener("click", (e) => {
+    busState.paused = !busState.paused;
+    e.target.textContent = busState.paused ? "Resume" : "Pause";
+    if (busState.paused) {
+      disconnectBusStream();
+      const badge = document.getElementById("bus-live-badge");
+      if (badge) { badge.textContent = "Paused"; badge.className = "status-pill paused"; }
+    } else {
+      loadBusHistory();
+      connectBusStream();
+    }
+  });
+  document.getElementById("bus-clear-btn")?.addEventListener("click", async () => {
+    try {
+      await api("/api/services/bus/clear", { method: "POST" });
+      busState.events = [];
+      renderBusEvents();
+      toast("Cleared service bus history", "info");
+    } catch (err) {
+      toast(`Failed to clear bus: ${err.message}`, "error");
+    }
+  });
+  document.getElementById("bus-test-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const mode = document.getElementById("bus-test-mode").value;
+    const svc = document.getElementById("bus-test-service").value.trim();
+    const topic = document.getElementById("bus-test-topic").value.trim();
+    const rawData = document.getElementById("bus-test-data").value.trim();
+    const resEl = document.getElementById("bus-test-result");
+    let data = null;
+    if (rawData) {
+      try { data = JSON.parse(rawData); } catch (err) {
+        toast(`Invalid JSON payload: ${err.message}`, "error");
+        return;
+      }
+    }
+    if (resEl) {
+      resEl.classList.remove("hidden");
+      resEl.textContent = `Dispatching ${mode} -> ${svc}/${topic}...`;
+    }
+    try {
+      let endpoint = `/api/services/${encodeURIComponent(svc)}/send`;
+      let payload = { topic, data, from: "bus-inspector" };
+      if (mode === "call") {
+        endpoint = `/api/services/${encodeURIComponent(svc)}/call`;
+        payload = { topic, data, from: "bus-inspector", timeout_ms: 10000 };
+      } else if (mode === "broadcast") {
+        endpoint = `/api/services/${encodeURIComponent(svc)}/emit`;
+        payload = { topic, data };
+      }
+      const resp = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
+      if (resEl) {
+        resEl.textContent = JSON.stringify(resp, null, 2);
+      }
+      toast(`Dispatched ${mode} to '${svc}'`, "success");
+    } catch (err) {
+      if (resEl) resEl.textContent = `Error: ${err.message}`;
+      toast(`Bus ${mode} failed: ${err.message}`, "error");
+    }
+  });
   document.getElementById("service-launch-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const script = document.getElementById("svc-script").value.trim();

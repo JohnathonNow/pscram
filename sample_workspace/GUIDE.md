@@ -608,6 +608,7 @@ Minilang includes built-in modules for programmatically prompting both the local
 |---|---|---|
 | `agy::prompt(prompt, opts?)` | `agy::ask`, `agy::run` | Prompt `agy` and return the response `string` (or decoded Minilang value if `json is true`, or full metadata map if `full is true`). Options: `system is`, `model is`, `effort is "low" \| "medium" \| "high" \| "xhigh" \| "max"`, `mode is "plan" \| ...`, `conversation_id is`, `timeout is 120`, `json is true`, `full is true`. |
 | `agy::complete(prompt, opts?)` | — | Same as `agy::prompt(..., full is true)` — returns `{"provider", "text", "conversation_id", "suggested_code", "suggested_lang", "duration_ms"}`. |
+| `agy::stream(prompt, on_chunk?, opts?)` | — | Stream incremental chunks from `agy --output-format stream-json` with live progressive Markdown rendering in notebook cells (`display is true` default) and optional `on_chunk` callback (`fun(chunk)`). |
 | `agy::chat(messages, opts?)` | — | Prompt `agy` with a `list` of `{"role" is "system" \| "user" \| "assistant", "content" is "..."}` maps (or call with no message list to create a stateful session). |
 | `agy::session(opts?)` | — | Create a stateful `ai::session` that automatically threads `conversation_id` across turns. |
 | `agy::status()` | — | Returns `{"available" is bool, "bin" is path_or_nil, "default_model" is str_or_nil}`. |
@@ -618,8 +619,9 @@ API keys are resolved automatically from `api_key is "..."`, the **Secrets Vault
 
 | Function | Aliases | Description |
 |---|---|---|
-| `gemini::prompt(prompt, opts?)` | `gemini::ask`, `gemini::generate` | Prompt Gemini (`:generateContent`) and return the text `string` (or decoded Minilang value if `json is true`). Options: `model is`, `system is`, `temperature is`, `top_p is`, `top_k is`, `max_tokens is`, `json is true`, `response_mime_type is`, `response_schema is`, `image is path_or_bytes`, `images is [...]`, `api_key is`, `base_url is`, `timeout is 90`, `full is true`. |
-| `gemini::complete(prompt, opts?)` | — | Same as `gemini::prompt(..., full is true)` — returns `{"provider", "model", "text", "finish_reason", "usage", "raw"}`. |
+| `gemini::prompt(prompt, opts?)` | `gemini::ask`, `gemini::generate` | Prompt Gemini (`:generateContent`) and return the text `string` (or decoded Minilang value if `json is true`). Options: `model is`, `system is`, `temperature is`, `top_p is`, `top_k is`, `max_tokens is`, `json is true`, `response_mime_type is`, `response_schema is`, `image is path_or_bytes`, `images is [...]`, `tools is [...]` (automatic Minilang function-calling loop!), `max_tool_rounds is 8`, `api_key is`, `base_url is`, `timeout is 90`, `full is true`. |
+| `gemini::complete(prompt, opts?)` | — | Same as `gemini::prompt(..., full is true)` — returns `{"provider", "model", "text", "finish_reason", "usage", "tool_calls", "raw"}`. |
+| `gemini::stream(prompt, on_chunk?, opts?)` | — | Stream tokens live via `:streamGenerateContent?alt=sse` with progressive Markdown display in notebook cells (`display is true` default) and optional `on_chunk` callback (`fun(chunk)`). |
 | `gemini::chat(messages, opts?)` | — | Multi-turn chat with a `list` of `{"role" is "system" \| "user" \| "model" \| "assistant", "content" is "..."}` maps. |
 | `gemini::session(opts?)` | — | Create a stateful `ai::session` that automatically maintains conversation history across turns. |
 | `gemini::embed(text_or_list, opts?)` | — | Generate embedding vector(s) via `:embedContent` (default model `text-embedding-004`; supports `task_type is`, `dimensions is`). |
@@ -629,13 +631,30 @@ API keys are resolved automatically from `api_key is "..."`, the **Secrets Vault
 #### Unified `ai` Module & Stateful `ai::session`
 
 - `ai::agy` and `ai::gemini` expose the `agy` and `gemini` sub-modules directly.
-- `ai::prompt(prompt, opts?)` / `ai::ask` / `ai::complete` / `ai::chat` / `ai::session(provider?, opts?)` route to `provider is "agy"` or `provider is "gemini"` (defaulting to `"gemini"` when a Gemini API key is configured, otherwise `"agy"`).
+- `ai::prompt(prompt, opts?)` / `ai::ask` / `ai::complete` / `ai::stream(prompt, on_chunk?, opts?)` / `ai::chat` / `ai::session(provider?, opts?)` route to `provider is "agy"` or `provider is "gemini"` (defaulting to `"gemini"` when a Gemini API key is configured, otherwise `"agy"`).
 - `ai::status()` returns `{"agy" is agy::status(), "gemini" is gemini::status()}`.
 - **Session methods (`ai::session`)**: `s("Hello")` or `s:ask(prompt, opts?)` / `s:prompt(prompt, opts?)`, `s:complete(prompt, opts?)`, `s:history`, `s:provider`, `s:model`, `s:conversation_id`, `s:clear`.
 
 ```minilang
-:> Prompt local agy
-let summary := agy::prompt("Summarize the files in this workspace", effort is "low")
+:> Prompt local agy (or stream tokens live into the cell!)
+let summary := agy::stream("Summarize the files in this workspace", effort is "low")
+
+:> Prompt Gemini with automatic Minilang tool calling
+let answer := gemini::prompt(
+    "What is 19 * 23?",
+    tools is [
+        {
+            "name" is "multiply",
+            "description" is "Multiply two numbers",
+            "parameters" is {
+                "type" is "object",
+                "properties" is {"a" is {"type" is "number"}, "b" is {"type" is "number"}},
+                "required" is ["a", "b"]
+            },
+            "fn" is fun(args) args["a"] * args["b"]
+        }
+    ]
+)
 
 :> Prompt Gemini with structured JSON output (reads GEMINI_API_KEY from Secrets Vault)
 let items := gemini::prompt(

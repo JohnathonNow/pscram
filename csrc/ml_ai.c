@@ -16,6 +16,9 @@
 #define MLAI_DEFAULT_GEMINI_MODEL "gemini-2.5-flash"
 #define MLAI_DEFAULT_EMBED_MODEL  "text-embedding-004"
 
+extern void mlk_emit_display_raw(const char *Mime, const char *Data, size_t Len);
+static uint64_t g_mlai_stream_seq = 0;
+
 /* ============================================================================
  * Helpers: Environment / Secret Lookup, Options Parsing, Base64, JSON
  * ============================================================================ */
@@ -91,7 +94,7 @@ static const char *mlai_opt_str(ml_value_t *Opts, const char *Key) {
 
 static int mlai_opt_bool(ml_value_t *Opts, const char *Key, int Default) {
     if (!Opts || !ml_is(Opts, MLMapT)) return Default;
-    ml_value_t *V = ml_map_search(Opts, ml_string(Key, -1));
+    ml_value_t *V = ml_map_search0(Opts, ml_string(Key, -1));
     if (!V) return Default;
     V = ml_deref(V);
     if (!V || V == MLNil) return 0;
@@ -409,6 +412,357 @@ static ml_value_t *mlai_agy_prompt_impl(
     return TextVal;
 }
 
+/* ============================================================================
+ * Shared Live Markdown Stream Emitter & SSE Parser (for agy::stream & gemini::stream)
+ * ============================================================================ */
+
+static void mlai_emit_md_stream(
+    const char *StreamId,
+    const char *Provider,
+    const char *Model,
+    const char *Text,
+    size_t TextLen,
+    int Done
+) {
+    ml_value_t *Payload = ml_map();
+    ml_map_insert(Payload, ml_cstring("id"), ml_string_copy(StreamId, (int)strlen(StreamId)));
+    ml_map_insert(Payload, ml_cstring("provider"), ml_string_copy(Provider, (int)strlen(Provider)));
+    if (Model && *Model) {
+        ml_map_insert(Payload, ml_cstring("model"), ml_string_copy(Model, (int)strlen(Model)));
+    }
+    ml_map_insert(Payload, ml_cstring("text"), ml_string_copy(Text ? Text : "", (int)TextLen));
+    ml_map_insert(Payload, ml_cstring("done"), ml_boolean(Done));
+
+    char *Json = NULL;
+    size_t JsonLen = 0;
+    ml_value_t *Err = mlai_json_encode_str(Payload, &Json, &JsonLen);
+    if (!Err && Json) {
+        mlk_emit_display_raw("application/vnd.minilang.markdown-stream+json", Json, JsonLen);
+        free(Json);
+    }
+}
+
+typedef struct {
+    int IsAgy;
+    char StreamId[64];
+    const char *Provider;
+    const char *Model;
+    int Display;
+    ml_value_t *OnChunk;
+    ml_value_t *CallbackErr;
+    char *StreamErr;
+    char *LineBuf;
+    size_t LineLen;
+    size_t LineCap;
+    char *FullBuf;
+    size_t FullLen;
+    size_t FullCap;
+    ml_value_t *FinishReason;
+    ml_value_t *Usage;
+    ml_value_t *ConvId;
+    ml_value_t *SugCode;
+    ml_value_t *SugLang;
+    ml_value_t *DurMs;
+    int SawDelta;
+} mlai_sse_ctx_t;
+
+static void mlai_sse_append_full(mlai_sse_ctx_t *Ctx, const char *S, size_t L) {
+    if (!S || L == 0) return;
+    if (Ctx->FullLen + L + 1 > Ctx->FullCap) {
+        size_t NewCap = Ctx->FullCap ? Ctx->FullCap * 2 : 1024;
+        while (NewCap < Ctx->FullLen + L + 1) NewCap *= 2;
+        char *Next = (char *)realloc(Ctx->FullBuf, NewCap);
+        if (!Next) return;
+        Ctx->FullBuf = Next;
+        Ctx->FullCap = NewCap;
+    }
+    memcpy(Ctx->FullBuf + Ctx->FullLen, S, L);
+    Ctx->FullLen += L;
+    Ctx->FullBuf[Ctx->FullLen] = '\0';
+}
+
+static int mlai_sse_handle_delta(mlai_sse_ctx_t *Ctx, const char *Text, size_t Len) {
+    if (!Text || Len == 0) return 0;
+    Ctx->SawDelta = 1;
+    mlai_sse_append_full(Ctx, Text, Len);
+    if (Ctx->Display) {
+        mlai_emit_md_stream(Ctx->StreamId, Ctx->Provider, Ctx->Model, Ctx->FullBuf, Ctx->FullLen, 0);
+    }
+    if (Ctx->OnChunk && Ctx->OnChunk != MLNil) {
+        ml_value_t *ChunkVal = ml_string_copy(Text, (int)Len);
+        ml_value_t *Args[1] = {ChunkVal};
+        ml_value_t *Res = ml_simple_call(Ctx->OnChunk, 1, Args);
+        if (ml_is_error(Res)) {
+            Ctx->CallbackErr = Res;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int mlai_sse_process_line(mlai_sse_ctx_t *Ctx, const char *Line, size_t Len) {
+    while (Len > 0 && (Line[Len - 1] == '\r' || Line[Len - 1] == '\n')) Len--;
+    if (Len == 0) return 0;
+    if (Len < 5 || strncmp(Line, "data:", 5) != 0) return 0;
+    const char *Payload = Line + 5;
+    size_t PLen = Len - 5;
+    while (PLen > 0 && (*Payload == ' ' || *Payload == '\t')) { Payload++; PLen--; }
+    if (PLen == 0 || (PLen == 6 && strncmp(Payload, "[DONE]", 6) == 0)) return 0;
+
+    ml_value_t *Obj = ml_json_decode(Payload, PLen);
+    if (!Obj || ml_is_error(Obj) || !ml_is(Obj, MLMapT)) return 0;
+
+    if (Ctx->IsAgy) {
+        ml_value_t *ErrV = ml_map_search(Obj, ml_cstring("error"));
+        if (ErrV && ml_is(ml_deref(ErrV), MLStringT)) {
+            const char *Es = ml_string_value(ml_deref(ErrV));
+            if (Es && *Es && !Ctx->StreamErr) {
+                Ctx->StreamErr = strdup(Es);
+            }
+            return 0;
+        }
+        ml_value_t *DeltaV = ml_map_search(Obj, ml_cstring("delta"));
+        if (DeltaV && ml_is(ml_deref(DeltaV), MLStringT)) {
+            ml_value_t *D = ml_deref(DeltaV);
+            return mlai_sse_handle_delta(Ctx, ml_string_value(D), ml_string_length(D));
+        }
+        ml_value_t *DoneV = ml_map_search(Obj, ml_cstring("done"));
+        if (DoneV && ml_is(ml_deref(DoneV), MLBooleanT) && ml_boolean_value(ml_deref(DoneV))) {
+            ml_value_t *V = ml_map_search(Obj, ml_cstring("conversation_id"));
+            if (V) Ctx->ConvId = ml_deref(V);
+            V = ml_map_search(Obj, ml_cstring("suggested_code"));
+            if (V) Ctx->SugCode = ml_deref(V);
+            V = ml_map_search(Obj, ml_cstring("suggested_lang"));
+            if (V) Ctx->SugLang = ml_deref(V);
+            V = ml_map_search(Obj, ml_cstring("duration_ms"));
+            if (V) Ctx->DurMs = ml_deref(V);
+            if (!Ctx->SawDelta) {
+                V = ml_map_search(Obj, ml_cstring("response"));
+                if (V && ml_is(ml_deref(V), MLStringT)) {
+                    ml_value_t *R = ml_deref(V);
+                    return mlai_sse_handle_delta(Ctx, ml_string_value(R), ml_string_length(R));
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* Gemini SSE chunk */
+    ml_value_t *ErrObj = ml_map_search(Obj, ml_cstring("error"));
+    if (ErrObj && ml_is(ml_deref(ErrObj), MLMapT)) {
+        ml_value_t *Msg = ml_map_search(ml_deref(ErrObj), ml_cstring("message"));
+        if (Msg && ml_is(ml_deref(Msg), MLStringT) && !Ctx->StreamErr) {
+            Ctx->StreamErr = strdup(ml_string_value(ml_deref(Msg)));
+        }
+        return 0;
+    }
+    ml_value_t *U = ml_map_search(Obj, ml_cstring("usageMetadata"));
+    if (U) Ctx->Usage = ml_deref(U);
+
+    ml_value_t *Cands = ml_map_search(Obj, ml_cstring("candidates"));
+    if (Cands && ml_is(ml_deref(Cands), MLListT) && ml_list_length(ml_deref(Cands)) > 0) {
+        ml_value_t *First = ml_deref(ml_list_get(ml_deref(Cands), 1));
+        if (ml_is(First, MLMapT)) {
+            ml_value_t *Fr = ml_map_search(First, ml_cstring("finishReason"));
+            if (Fr && ml_deref(Fr) != MLNil) Ctx->FinishReason = ml_deref(Fr);
+            ml_value_t *Content = ml_map_search(First, ml_cstring("content"));
+            if (Content && ml_is(ml_deref(Content), MLMapT)) {
+                ml_value_t *Parts = ml_map_search(ml_deref(Content), ml_cstring("parts"));
+                if (Parts && ml_is(ml_deref(Parts), MLListT)) {
+                    ML_LIST_FOREACH(ml_deref(Parts), PNode) {
+                        ml_value_t *Part = ml_deref(PNode->Value);
+                        if (!ml_is(Part, MLMapT)) continue;
+                        ml_value_t *Thought = ml_map_search(Part, ml_cstring("thought"));
+                        if (Thought && ml_is(ml_deref(Thought), MLBooleanT) && ml_boolean_value(ml_deref(Thought))) {
+                            continue;
+                        }
+                        ml_value_t *TxtV = ml_map_search(Part, ml_cstring("text"));
+                        if (!TxtV || !ml_is(ml_deref(TxtV), MLStringT)) continue;
+                        ml_value_t *T = ml_deref(TxtV);
+                        if (mlai_sse_handle_delta(Ctx, ml_string_value(T), ml_string_length(T)) != 0) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int mlai_sse_chunk_cb(const char *Data, size_t Len, void *UserData) {
+    mlai_sse_ctx_t *Ctx = (mlai_sse_ctx_t *)UserData;
+    if (!Data || Len == 0) return 0;
+    if (Ctx->LineLen + Len + 1 > Ctx->LineCap) {
+        size_t NewCap = Ctx->LineCap ? Ctx->LineCap * 2 : 2048;
+        while (NewCap < Ctx->LineLen + Len + 1) NewCap *= 2;
+        char *Next = (char *)realloc(Ctx->LineBuf, NewCap);
+        if (!Next) return 1;
+        Ctx->LineBuf = Next;
+        Ctx->LineCap = NewCap;
+    }
+    memcpy(Ctx->LineBuf + Ctx->LineLen, Data, Len);
+    Ctx->LineLen += Len;
+    Ctx->LineBuf[Ctx->LineLen] = '\0';
+
+    size_t Start = 0;
+    for (size_t I = 0; I < Ctx->LineLen; ++I) {
+        if (Ctx->LineBuf[I] == '\n') {
+            int Abort = mlai_sse_process_line(Ctx, Ctx->LineBuf + Start, I - Start);
+            Start = I + 1;
+            if (Abort != 0) return 1;
+        }
+    }
+    if (Start > 0) {
+        size_t Rem = Ctx->LineLen - Start;
+        if (Rem > 0) memmove(Ctx->LineBuf, Ctx->LineBuf + Start, Rem);
+        Ctx->LineLen = Rem;
+        Ctx->LineBuf[Rem] = '\0';
+    }
+    return 0;
+}
+
+static ml_value_t *mlai_agy_stream_impl(
+    const char *Prompt,
+    ml_value_t *Opts,
+    ml_value_t *OnChunk,
+    const char **OutConvId
+) {
+    if (OutConvId) *OutConvId = NULL;
+    const char *Base = getenv("MINILANG_INTERNAL_URL");
+    if (!Base || !*Base) {
+        return ml_error("AgyError", "agy server API is unavailable (MINILANG_INTERNAL_URL not set)");
+    }
+
+    ml_value_t *Req = ml_map();
+    ml_map_insert(Req, ml_cstring("prompt"), ml_string_copy(Prompt, (int)strlen(Prompt)));
+    const char *Sys = mlai_opt_str(Opts, "system");
+    if (Sys) ml_map_insert(Req, ml_cstring("system"), ml_string_copy(Sys, (int)strlen(Sys)));
+    const char *Model = mlai_opt_str(Opts, "model");
+    if (Model) ml_map_insert(Req, ml_cstring("model"), ml_string_copy(Model, (int)strlen(Model)));
+    const char *Effort = mlai_opt_str(Opts, "effort");
+    if (Effort) ml_map_insert(Req, ml_cstring("effort"), ml_string_copy(Effort, (int)strlen(Effort)));
+    const char *Mode = mlai_opt_str(Opts, "mode");
+    if (Mode) ml_map_insert(Req, ml_cstring("mode"), ml_string_copy(Mode, (int)strlen(Mode)));
+    const char *ConvId = mlai_opt_str(Opts, "conversation_id");
+    if (ConvId) ml_map_insert(Req, ml_cstring("conversation_id"), ml_string_copy(ConvId, (int)strlen(ConvId)));
+
+    int64_t TimeoutSecs = 120;
+    if (mlai_opt_int(Opts, "timeout", &TimeoutSecs) && TimeoutSecs > 0) {
+        ml_map_insert(Req, ml_cstring("timeout_secs"), ml_integer(TimeoutSecs));
+    } else if (mlai_opt_int(Opts, "timeout_secs", &TimeoutSecs) && TimeoutSecs > 0) {
+        ml_map_insert(Req, ml_cstring("timeout_secs"), ml_integer(TimeoutSecs));
+    }
+
+    char Cwd[4096];
+    if (getcwd(Cwd, sizeof(Cwd))) {
+        ml_map_insert(Req, ml_cstring("cwd"), ml_string_copy(Cwd, (int)strlen(Cwd)));
+    }
+
+    char *JsonBody = NULL;
+    size_t BodyLen = 0;
+    ml_value_t *EncErr = mlai_json_encode_str(Req, &JsonBody, &BodyLen);
+    if (EncErr) return EncErr;
+
+    size_t Blen = strlen(Base);
+    while (Blen > 0 && Base[Blen - 1] == '/') Blen--;
+    size_t UrlCap = Blen + 32;
+    char *Url = (char *)malloc(UrlCap);
+    if (!Url) {
+        free(JsonBody);
+        return ml_error("AgyError", "Out of memory");
+    }
+    snprintf(Url, UrlCap, "%.*s/api/agy/prompt-stream", (int)Blen, Base);
+
+    const char *Token = getenv("MINILANG_INTERNAL_TOKEN");
+    char TokHdr[512];
+    const char *Headers[3] = {NULL, NULL, NULL};
+    int HIdx = 0;
+    if (Token && *Token) {
+        snprintf(TokHdr, sizeof(TokHdr), "X-Internal-Token: %s", Token);
+        Headers[HIdx++] = TokHdr;
+    }
+
+    mlai_sse_ctx_t Ctx;
+    memset(&Ctx, 0, sizeof(Ctx));
+    Ctx.IsAgy = 1;
+    snprintf(Ctx.StreamId, sizeof(Ctx.StreamId), "ai-stream-%llu", (unsigned long long)(++g_mlai_stream_seq));
+    Ctx.Provider = "agy";
+    Ctx.Model = Model ? Model : "agy";
+    Ctx.Display = mlai_opt_bool(Opts, "display", 1);
+    Ctx.OnChunk = OnChunk;
+    Ctx.FinishReason = MLNil;
+    Ctx.Usage = MLNil;
+    Ctx.ConvId = MLNil;
+    Ctx.SugCode = MLNil;
+    Ctx.SugLang = MLNil;
+    Ctx.DurMs = MLNil;
+
+    long Status = 0;
+    ml_value_t *StreamRes = mlio_http_stream_raw(
+        "POST",
+        Url,
+        HIdx > 0 ? Headers : NULL,
+        JsonBody,
+        BodyLen,
+        (long)TimeoutSecs + 15L,
+        mlai_sse_chunk_cb,
+        &Ctx,
+        &Status
+    );
+    free(JsonBody);
+    free(Url);
+
+    if (Ctx.LineLen > 0 && !Ctx.CallbackErr) {
+        mlai_sse_process_line(&Ctx, Ctx.LineBuf, Ctx.LineLen);
+    }
+
+    if (Ctx.Display && Ctx.FullLen > 0) {
+        mlai_emit_md_stream(Ctx.StreamId, Ctx.Provider, Ctx.Model, Ctx.FullBuf, Ctx.FullLen, 1);
+    }
+
+    ml_value_t *Ret = NULL;
+    if (Ctx.CallbackErr) {
+        Ret = Ctx.CallbackErr;
+    } else if (Ctx.StreamErr) {
+        Ret = ml_error("AgyError", "%s", Ctx.StreamErr);
+    } else if (ml_is_error(StreamRes)) {
+        Ret = StreamRes;
+    } else if (Status >= 400) {
+        Ret = ml_error("AgyError", "agy stream failed with HTTP %ld", Status);
+    } else {
+        ml_value_t *TextVal = Ctx.FullLen > 0 ? ml_string_copy(Ctx.FullBuf, (int)Ctx.FullLen) : ml_string("", 0);
+        if (OutConvId && ml_is(Ctx.ConvId, MLStringT)) {
+            *OutConvId = ml_string_value(Ctx.ConvId);
+        }
+        int WantFull = mlai_opt_bool(Opts, "full", 0) || mlai_opt_bool(Opts, "raw", 0);
+        int WantJson = mlai_opt_bool(Opts, "json", 0);
+        if (WantFull) {
+            ml_value_t *Out = ml_map();
+            ml_map_insert(Out, ml_cstring("provider"), ml_cstring("agy"));
+            ml_map_insert(Out, ml_cstring("text"), TextVal);
+            ml_map_insert(Out, ml_cstring("conversation_id"), Ctx.ConvId);
+            ml_map_insert(Out, ml_cstring("suggested_code"), Ctx.SugCode);
+            ml_map_insert(Out, ml_cstring("suggested_lang"), Ctx.SugLang);
+            ml_map_insert(Out, ml_cstring("duration_ms"), Ctx.DurMs);
+            if (WantJson && ml_is(TextVal, MLStringT)) {
+                ml_value_t *Parsed = mlai_decode_json_response_text(ml_string_value(TextVal), ml_string_length(TextVal));
+                if (!ml_is_error(Parsed)) ml_map_insert(Out, ml_cstring("json"), Parsed);
+            }
+            Ret = Out;
+        } else if (WantJson && ml_is(TextVal, MLStringT)) {
+            Ret = mlai_decode_json_response_text(ml_string_value(TextVal), ml_string_length(TextVal));
+        } else {
+            Ret = TextVal;
+        }
+    }
+
+    free(Ctx.LineBuf);
+    free(Ctx.FullBuf);
+    free(Ctx.StreamErr);
+    return Ret;
+}
+
 static ml_value_t *mlai_agy_status_impl(void) {
     long Status = 0;
     ml_value_t *Resp = mlai_agy_http("GET", "/api/agy/status", NULL, 10L, &Status);
@@ -581,22 +935,12 @@ static ml_value_t *mlai_gemini_extract_error(ml_value_t *Resp, long Status) {
     return ml_error("GeminiError", "Gemini API request failed with HTTP status %ld", Status);
 }
 
-static ml_value_t *mlai_gemini_generate_contents(
+static ml_value_t *mlai_build_gemini_request(
     ml_value_t *Contents,
     ml_value_t *Opts,
-    int ForceFull
+    ml_value_t **OutToolHandlers
 ) {
-    const char *ApiKey = mlai_resolve_gemini_key(Opts);
-    if (!ApiKey || !*ApiKey) {
-        return ml_error(
-            "GeminiError",
-            "Gemini API key not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in Secrets Vault / env, or pass api_key is \"...\"."
-        );
-    }
-    const char *Base = mlai_resolve_gemini_base(Opts);
-    const char *Model = mlai_resolve_gemini_model(Opts, MLAI_DEFAULT_GEMINI_MODEL);
-    if (strncmp(Model, "models/", 7) == 0) Model += 7;
-
+    if (OutToolHandlers) *OutToolHandlers = NULL;
     ml_value_t *Req = ml_map();
     ml_map_insert(Req, ml_cstring("contents"), Contents);
 
@@ -652,6 +996,113 @@ static ml_value_t *mlai_gemini_generate_contents(
         ml_map_insert(Req, ml_cstring("generationConfig"), GenCfg);
     }
 
+    /* Optional Gemini function / tool declarations: `tools is [...]` or `tools is { name is spec }` */
+    ml_value_t *ToolsOpt = Opts ? ml_map_search(Opts, ml_cstring("tools")) : NULL;
+    if (ToolsOpt && ml_deref(ToolsOpt) != MLNil) {
+        ml_value_t *ToolsVal = ml_deref(ToolsOpt);
+        ml_value_t *Decls = ml_list();
+        ml_value_t *Handlers = ml_map();
+
+        if (ml_is(ToolsVal, MLListT)) {
+            ML_LIST_FOREACH(ToolsVal, TNode) {
+                ml_value_t *Spec = ml_deref(TNode->Value);
+                if (!ml_is(Spec, MLMapT)) continue;
+                ml_value_t *NameV = ml_map_search(Spec, ml_cstring("name"));
+                if (!NameV || !ml_is(ml_deref(NameV), MLStringT)) continue;
+                ml_value_t *NameStr = ml_deref(NameV);
+
+                ml_value_t *Decl = ml_map();
+                ml_map_insert(Decl, ml_cstring("name"), NameStr);
+                ml_value_t *DescV = ml_map_search(Spec, ml_cstring("description"));
+                if (DescV && ml_is(ml_deref(DescV), MLStringT)) {
+                    ml_map_insert(Decl, ml_cstring("description"), ml_deref(DescV));
+                }
+                ml_value_t *ParamsV = ml_map_search(Spec, ml_cstring("parameters"));
+                if (ParamsV && ml_is(ml_deref(ParamsV), MLMapT)) {
+                    ml_map_insert(Decl, ml_cstring("parameters"), ml_deref(ParamsV));
+                }
+                ml_list_put(Decls, Decl);
+
+                ml_value_t *FnV = ml_map_search(Spec, ml_cstring("fn"));
+                if (!FnV) FnV = ml_map_search(Spec, ml_cstring("handler"));
+                if (!FnV) FnV = ml_map_search(Spec, ml_cstring("call"));
+                if (FnV && ml_deref(FnV) != MLNil) {
+                    ml_map_insert(Handlers, NameStr, ml_deref(FnV));
+                }
+            }
+        } else if (ml_is(ToolsVal, MLMapT)) {
+            ML_MAP_FOREACH(ToolsVal, TNode) {
+                ml_value_t *NameStr = ml_deref(TNode->Key);
+                ml_value_t *Val = ml_deref(TNode->Value);
+                if (!ml_is(NameStr, MLStringT)) continue;
+                ml_value_t *Decl = ml_map();
+                ml_map_insert(Decl, ml_cstring("name"), NameStr);
+                if (ml_is(Val, MLMapT)) {
+                    ml_value_t *DescV = ml_map_search(Val, ml_cstring("description"));
+                    if (DescV && ml_is(ml_deref(DescV), MLStringT)) {
+                        ml_map_insert(Decl, ml_cstring("description"), ml_deref(DescV));
+                    }
+                    ml_value_t *ParamsV = ml_map_search(Val, ml_cstring("parameters"));
+                    if (ParamsV && ml_is(ml_deref(ParamsV), MLMapT)) {
+                        ml_map_insert(Decl, ml_cstring("parameters"), ml_deref(ParamsV));
+                    }
+                    ml_value_t *FnV = ml_map_search(Val, ml_cstring("fn"));
+                    if (!FnV) FnV = ml_map_search(Val, ml_cstring("handler"));
+                    if (!FnV) FnV = ml_map_search(Val, ml_cstring("call"));
+                    if (FnV && ml_deref(FnV) != MLNil) {
+                        ml_map_insert(Handlers, NameStr, ml_deref(FnV));
+                    }
+                } else if (Val != MLNil) {
+                    ml_map_insert(Handlers, NameStr, Val);
+                }
+                ml_list_put(Decls, Decl);
+            }
+        }
+
+        if (ml_list_length(Decls) > 0) {
+            ml_value_t *ToolObj = ml_map();
+            ml_map_insert(ToolObj, ml_cstring("functionDeclarations"), Decls);
+            ml_value_t *ToolArr = ml_list();
+            ml_list_put(ToolArr, ToolObj);
+            ml_map_insert(Req, ml_cstring("tools"), ToolArr);
+            if (OutToolHandlers) *OutToolHandlers = Handlers;
+        }
+    }
+
+    return Req;
+}
+
+static ml_value_t *mlai_gemini_generate_contents(
+    ml_value_t *Contents,
+    ml_value_t *Opts,
+    int ForceFull
+) {
+    const char *ApiKey = mlai_resolve_gemini_key(Opts);
+    if (!ApiKey || !*ApiKey) {
+        return ml_error(
+            "GeminiError",
+            "Gemini API key not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in Secrets Vault / env, or pass api_key is \"...\"."
+        );
+    }
+    const char *Base = mlai_resolve_gemini_base(Opts);
+    const char *Model = mlai_resolve_gemini_model(Opts, MLAI_DEFAULT_GEMINI_MODEL);
+    if (strncmp(Model, "models/", 7) == 0) Model += 7;
+
+    /* Copy contents list so multi-round tool calls don't mutate caller's list */
+    ml_value_t *WorkingContents = ml_list();
+    ML_LIST_FOREACH(Contents, CNode) {
+        ml_list_put(WorkingContents, ml_deref(CNode->Value));
+    }
+
+    ml_value_t *ToolHandlers = NULL;
+    ml_value_t *Req = mlai_build_gemini_request(WorkingContents, Opts, &ToolHandlers);
+
+    int64_t MaxRounds = 8;
+    if (mlai_opt_int(Opts, "max_tool_rounds", &MaxRounds)) {
+        if (MaxRounds < 1) MaxRounds = 1;
+        if (MaxRounds > 32) MaxRounds = 32;
+    }
+
     size_t Blen = strlen(Base);
     while (Blen > 0 && Base[Blen - 1] == '/') Blen--;
     size_t UrlCap = Blen + strlen(Model) + 64;
@@ -667,26 +1118,129 @@ static ml_value_t *mlai_gemini_generate_contents(
     snprintf(KeyHdr, strlen(ApiKey) + 32, "x-goog-api-key: %s", ApiKey);
     const char *Headers[2] = {KeyHdr, NULL};
 
-    char *JsonBody = NULL;
-    size_t BodyLen = 0;
-    ml_value_t *EncErr = mlai_json_encode_str(Req, &JsonBody, &BodyLen);
-    if (EncErr) {
-        free(KeyHdr);
-        free(Url);
-        return EncErr;
-    }
-
     int64_t TimeoutSecs = 90;
     if (!mlai_opt_int(Opts, "timeout", &TimeoutSecs) || TimeoutSecs <= 0) TimeoutSecs = 90;
 
-    long Status = 0;
-    ml_value_t *Resp = mlio_http_json_raw("POST", Url, Headers, JsonBody, BodyLen, (long)TimeoutSecs, &Status);
-    free(JsonBody);
+    ml_value_t *ToolCallsLog = ml_list();
+    ml_value_t *Resp = MLNil;
+    int64_t Round = 0;
+
+    for (;;) {
+        ml_map_insert(Req, ml_cstring("contents"), WorkingContents);
+        char *JsonBody = NULL;
+        size_t BodyLen = 0;
+        ml_value_t *EncErr = mlai_json_encode_str(Req, &JsonBody, &BodyLen);
+        if (EncErr) {
+            free(KeyHdr);
+            free(Url);
+            return EncErr;
+        }
+
+        long Status = 0;
+        Resp = mlio_http_json_raw("POST", Url, Headers, JsonBody, BodyLen, (long)TimeoutSecs, &Status);
+        free(JsonBody);
+
+        if (ml_is_error(Resp)) {
+            free(KeyHdr);
+            free(Url);
+            return Resp;
+        }
+        if (Status >= 400) {
+            free(KeyHdr);
+            free(Url);
+            return mlai_gemini_extract_error(Resp, Status);
+        }
+
+        /* Check for Gemini functionCall parts if tools were registered */
+        if (!ToolHandlers || Round >= MaxRounds) break;
+
+        ml_value_t *ModelParts = NULL;
+        ml_value_t *FoundCalls = ml_list();
+        if (ml_is(Resp, MLMapT)) {
+            ml_value_t *Cands = ml_map_search(Resp, ml_cstring("candidates"));
+            if (Cands && ml_is(ml_deref(Cands), MLListT) && ml_list_length(ml_deref(Cands)) > 0) {
+                ml_value_t *First = ml_deref(ml_list_get(ml_deref(Cands), 1));
+                if (ml_is(First, MLMapT)) {
+                    ml_value_t *Content = ml_map_search(First, ml_cstring("content"));
+                    if (Content && ml_is(ml_deref(Content), MLMapT)) {
+                        ml_value_t *Parts = ml_map_search(ml_deref(Content), ml_cstring("parts"));
+                        if (Parts && ml_is(ml_deref(Parts), MLListT)) {
+                            ModelParts = ml_deref(Parts);
+                            ML_LIST_FOREACH(ModelParts, PNode) {
+                                ml_value_t *Part = ml_deref(PNode->Value);
+                                if (!ml_is(Part, MLMapT)) continue;
+                                ml_value_t *Fc = ml_map_search(Part, ml_cstring("functionCall"));
+                                if (Fc && ml_is(ml_deref(Fc), MLMapT)) {
+                                    ml_list_put(FoundCalls, ml_deref(Fc));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ml_list_length(FoundCalls) == 0) break;
+
+        /* Append model turn with functionCall parts */
+        ml_value_t *ModelTurn = ml_map();
+        ml_map_insert(ModelTurn, ml_cstring("role"), ml_cstring("model"));
+        ml_map_insert(ModelTurn, ml_cstring("parts"), ModelParts);
+        ml_list_put(WorkingContents, ModelTurn);
+
+        /* Execute each Minilang tool handler and build functionResponse parts */
+        ml_value_t *RespParts = ml_list();
+        ML_LIST_FOREACH(FoundCalls, FNode) {
+            ml_value_t *Fc = ml_deref(FNode->Value);
+            ml_value_t *NameV = ml_map_search(Fc, ml_cstring("name"));
+            if (!NameV || !ml_is(ml_deref(NameV), MLStringT)) continue;
+            ml_value_t *NameStr = ml_deref(NameV);
+            ml_value_t *ArgsV = ml_map_search(Fc, ml_cstring("args"));
+            ml_value_t *CallArgsMap = (ArgsV && ml_is(ml_deref(ArgsV), MLMapT)) ? ml_deref(ArgsV) : ml_map();
+
+            ml_value_t *LogEntry = ml_map();
+            ml_map_insert(LogEntry, ml_cstring("name"), NameStr);
+            ml_map_insert(LogEntry, ml_cstring("args"), CallArgsMap);
+
+            ml_value_t *FnRespObj = ml_map();
+            ml_value_t *Handler = ml_map_search(ToolHandlers, NameStr);
+            if (!Handler || ml_deref(Handler) == MLNil) {
+                ml_value_t *ErrS = ml_cstring("Tool handler not found");
+                ml_map_insert(FnRespObj, ml_cstring("error"), ErrS);
+                ml_map_insert(LogEntry, ml_cstring("error"), ErrS);
+            } else {
+                ml_value_t *CallArgs[1] = {CallArgsMap};
+                ml_value_t *ToolRes = ml_simple_call(ml_deref(Handler), 1, CallArgs);
+                if (ml_is_error(ToolRes)) {
+                    const char *EMsg = ml_error_message(ToolRes);
+                    ml_value_t *ErrS = ml_string(EMsg ? EMsg : "Tool execution failed", -1);
+                    ml_map_insert(FnRespObj, ml_cstring("error"), ErrS);
+                    ml_map_insert(LogEntry, ml_cstring("error"), ErrS);
+                } else {
+                    ml_value_t *DerefRes = ml_deref(ToolRes);
+                    ml_map_insert(FnRespObj, ml_cstring("result"), DerefRes);
+                    ml_map_insert(LogEntry, ml_cstring("result"), DerefRes);
+                }
+            }
+            ml_list_put(ToolCallsLog, LogEntry);
+
+            ml_value_t *FnResp = ml_map();
+            ml_map_insert(FnResp, ml_cstring("name"), NameStr);
+            ml_map_insert(FnResp, ml_cstring("response"), FnRespObj);
+            ml_value_t *Part = ml_map();
+            ml_map_insert(Part, ml_cstring("functionResponse"), FnResp);
+            ml_list_put(RespParts, Part);
+        }
+
+        ml_value_t *UserTurn = ml_map();
+        ml_map_insert(UserTurn, ml_cstring("role"), ml_cstring("user"));
+        ml_map_insert(UserTurn, ml_cstring("parts"), RespParts);
+        ml_list_put(WorkingContents, UserTurn);
+        Round++;
+    }
+
     free(KeyHdr);
     free(Url);
-
-    if (ml_is_error(Resp)) return Resp;
-    if (Status >= 400) return mlai_gemini_extract_error(Resp, Status);
 
     /* Extract text from candidates[0].content.parts */
     ml_stringbuffer_t TextSb[1] = {ML_STRINGBUFFER_INIT};
@@ -733,6 +1287,7 @@ static ml_value_t *mlai_gemini_generate_contents(
     const char *FinalStr = ml_stringbuffer_get_string(ChosenSb);
     ml_value_t *TextVal = (FinalLen > 0 && FinalStr) ? ml_string_copy(FinalStr, (int)FinalLen) : ml_string("", 0);
 
+    int WantJson = mlai_opt_bool(Opts, "json", 0);
     int WantFull = ForceFull || mlai_opt_bool(Opts, "full", 0) || mlai_opt_bool(Opts, "raw", 0);
     if (WantFull) {
         ml_value_t *Out = ml_map();
@@ -741,6 +1296,7 @@ static ml_value_t *mlai_gemini_generate_contents(
         ml_map_insert(Out, ml_cstring("text"), TextVal);
         ml_map_insert(Out, ml_cstring("finish_reason"), FinishReason);
         ml_map_insert(Out, ml_cstring("usage"), Usage);
+        ml_map_insert(Out, ml_cstring("tool_calls"), ToolCallsLog);
         ml_map_insert(Out, ml_cstring("raw"), Resp);
         if (WantJson) {
             ml_value_t *Parsed = mlai_decode_json_response_text(ml_string_value(TextVal), ml_string_length(TextVal));
@@ -755,7 +1311,128 @@ static ml_value_t *mlai_gemini_generate_contents(
     return TextVal;
 }
 
-static ml_value_t *mlai_gemini_prompt_impl(ml_value_t *PromptVal, ml_value_t *Opts, int ForceFull) {
+static ml_value_t *mlai_gemini_stream_contents(
+    ml_value_t *Contents,
+    ml_value_t *Opts,
+    ml_value_t *OnChunk
+) {
+    const char *ApiKey = mlai_resolve_gemini_key(Opts);
+    if (!ApiKey || !*ApiKey) {
+        return ml_error(
+            "GeminiError",
+            "Gemini API key not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in Secrets Vault / env, or pass api_key is \"...\"."
+        );
+    }
+    const char *Base = mlai_resolve_gemini_base(Opts);
+    const char *Model = mlai_resolve_gemini_model(Opts, MLAI_DEFAULT_GEMINI_MODEL);
+    if (strncmp(Model, "models/", 7) == 0) Model += 7;
+
+    ml_value_t *Req = mlai_build_gemini_request(Contents, Opts, NULL);
+    char *JsonBody = NULL;
+    size_t BodyLen = 0;
+    ml_value_t *EncErr = mlai_json_encode_str(Req, &JsonBody, &BodyLen);
+    if (EncErr) return EncErr;
+
+    size_t Blen = strlen(Base);
+    while (Blen > 0 && Base[Blen - 1] == '/') Blen--;
+    size_t UrlCap = Blen + strlen(Model) + 80;
+    char *Url = (char *)malloc(UrlCap);
+    if (!Url) {
+        free(JsonBody);
+        return ml_error("GeminiError", "Out of memory");
+    }
+    snprintf(Url, UrlCap, "%.*s/models/%s:streamGenerateContent?alt=sse", (int)Blen, Base, Model);
+
+    char *KeyHdr = (char *)malloc(strlen(ApiKey) + 32);
+    if (!KeyHdr) {
+        free(JsonBody);
+        free(Url);
+        return ml_error("GeminiError", "Out of memory");
+    }
+    snprintf(KeyHdr, strlen(ApiKey) + 32, "x-goog-api-key: %s", ApiKey);
+    const char *Headers[2] = {KeyHdr, NULL};
+
+    int64_t TimeoutSecs = 120;
+    if (!mlai_opt_int(Opts, "timeout", &TimeoutSecs) || TimeoutSecs <= 0) TimeoutSecs = 120;
+
+    mlai_sse_ctx_t Ctx;
+    memset(&Ctx, 0, sizeof(Ctx));
+    Ctx.IsAgy = 0;
+    snprintf(Ctx.StreamId, sizeof(Ctx.StreamId), "ai-stream-%llu", (unsigned long long)(++g_mlai_stream_seq));
+    Ctx.Provider = "gemini";
+    Ctx.Model = Model;
+    Ctx.Display = mlai_opt_bool(Opts, "display", 1);
+    Ctx.OnChunk = OnChunk;
+    Ctx.FinishReason = MLNil;
+    Ctx.Usage = MLNil;
+    Ctx.ConvId = MLNil;
+    Ctx.SugCode = MLNil;
+    Ctx.SugLang = MLNil;
+    Ctx.DurMs = MLNil;
+
+    long Status = 0;
+    ml_value_t *StreamRes = mlio_http_stream_raw(
+        "POST",
+        Url,
+        Headers,
+        JsonBody,
+        BodyLen,
+        (long)TimeoutSecs,
+        mlai_sse_chunk_cb,
+        &Ctx,
+        &Status
+    );
+    free(JsonBody);
+    free(KeyHdr);
+    free(Url);
+
+    if (Ctx.LineLen > 0 && !Ctx.CallbackErr) {
+        mlai_sse_process_line(&Ctx, Ctx.LineBuf, Ctx.LineLen);
+    }
+
+    if (Ctx.Display && Ctx.FullLen > 0) {
+        mlai_emit_md_stream(Ctx.StreamId, Ctx.Provider, Ctx.Model, Ctx.FullBuf, Ctx.FullLen, 1);
+    }
+
+    ml_value_t *Ret = NULL;
+    if (Ctx.CallbackErr) {
+        Ret = Ctx.CallbackErr;
+    } else if (Ctx.StreamErr) {
+        Ret = ml_error("GeminiError", "Gemini stream error: %s", Ctx.StreamErr);
+    } else if (ml_is_error(StreamRes)) {
+        Ret = StreamRes;
+    } else if (Status >= 400) {
+        Ret = ml_error("GeminiError", "Gemini stream failed with HTTP status %ld", Status);
+    } else {
+        ml_value_t *TextVal = Ctx.FullLen > 0 ? ml_string_copy(Ctx.FullBuf, (int)Ctx.FullLen) : ml_string("", 0);
+        int WantFull = mlai_opt_bool(Opts, "full", 0) || mlai_opt_bool(Opts, "raw", 0);
+        int WantJson = mlai_opt_bool(Opts, "json", 0);
+        if (WantFull) {
+            ml_value_t *Out = ml_map();
+            ml_map_insert(Out, ml_cstring("provider"), ml_cstring("gemini"));
+            ml_map_insert(Out, ml_cstring("model"), ml_string_copy(Model, (int)strlen(Model)));
+            ml_map_insert(Out, ml_cstring("text"), TextVal);
+            ml_map_insert(Out, ml_cstring("finish_reason"), Ctx.FinishReason);
+            ml_map_insert(Out, ml_cstring("usage"), Ctx.Usage);
+            if (WantJson) {
+                ml_value_t *Parsed = mlai_decode_json_response_text(ml_string_value(TextVal), ml_string_length(TextVal));
+                if (!ml_is_error(Parsed)) ml_map_insert(Out, ml_cstring("json"), Parsed);
+            }
+            Ret = Out;
+        } else if (WantJson) {
+            Ret = mlai_decode_json_response_text(ml_string_value(TextVal), ml_string_length(TextVal));
+        } else {
+            Ret = TextVal;
+        }
+    }
+
+    free(Ctx.LineBuf);
+    free(Ctx.FullBuf);
+    free(Ctx.StreamErr);
+    return Ret;
+}
+
+static ml_value_t *mlai_gemini_prompt_to_contents(ml_value_t *PromptVal, ml_value_t *Opts) {
     ml_value_t *Parts = ml_list();
     if (ml_is(PromptVal, MLStringT)) {
         ml_value_t *P = ml_map();
@@ -778,7 +1455,7 @@ static ml_value_t *mlai_gemini_prompt_impl(ml_value_t *PromptVal, ml_value_t *Op
         return ml_error("TypeError", "gemini::prompt expects a prompt string or list of parts");
     }
 
-    /* Optional `image := ...` or `images := [...]` attachment(s) */
+    /* Optional `image is ...` or `images is [...]` attachment(s) */
     ml_value_t *SingleImg = Opts ? ml_map_search(Opts, ml_cstring("image")) : NULL;
     if (SingleImg && ml_deref(SingleImg) != MLNil) {
         ml_value_t *Part = mlai_build_image_part(SingleImg);
@@ -799,8 +1476,19 @@ static ml_value_t *mlai_gemini_prompt_impl(ml_value_t *PromptVal, ml_value_t *Op
     ml_map_insert(Turn, ml_cstring("parts"), Parts);
     ml_value_t *Contents = ml_list();
     ml_list_put(Contents, Turn);
+    return Contents;
+}
 
+static ml_value_t *mlai_gemini_prompt_impl(ml_value_t *PromptVal, ml_value_t *Opts, int ForceFull) {
+    ml_value_t *Contents = mlai_gemini_prompt_to_contents(PromptVal, Opts);
+    if (ml_is_error(Contents)) return Contents;
     return mlai_gemini_generate_contents(Contents, Opts, ForceFull);
+}
+
+static ml_value_t *mlai_gemini_stream_impl(ml_value_t *PromptVal, ml_value_t *Opts, ml_value_t *OnChunk) {
+    ml_value_t *Contents = mlai_gemini_prompt_to_contents(PromptVal, Opts);
+    if (ml_is_error(Contents)) return Contents;
+    return mlai_gemini_stream_contents(Contents, Opts, OnChunk);
 }
 
 static ml_value_t *mlai_gemini_chat_impl(ml_value_t *Messages, ml_value_t *Opts, int ForceFull) {
@@ -1323,6 +2011,70 @@ ML_FUNCTION(MLAiSession) {
     return (ml_value_t *)mlai_session_new(Prov, Opts);
 }
 
+ML_FUNCTION(MLAgyStream) {
+    ml_value_t *Pos[8];
+    int PosCount = 0;
+    ml_value_t *Opts = mlai_parse_args(Count, Args, 0, 2, Pos, &PosCount, NULL);
+    if (PosCount < 1 || !ml_is(Pos[0], MLStringT)) {
+        return ml_error("TypeError", "agy::stream expects a prompt string");
+    }
+    ml_value_t *OnChunk = (PosCount >= 2 && !ml_is(Pos[1], MLMapT)) ? Pos[1] : NULL;
+    if (PosCount >= 2 && ml_is(Pos[1], MLMapT)) {
+        mlai_merge_map(Opts, Pos[1]);
+    }
+    if (!OnChunk) {
+        ml_value_t *Cb = ml_map_search(Opts, ml_cstring("on_chunk"));
+        if (Cb && ml_deref(Cb) != MLNil) OnChunk = ml_deref(Cb);
+    }
+    return mlai_agy_stream_impl(ml_string_value(Pos[0]), Opts, OnChunk, NULL);
+}
+
+ML_FUNCTION(MLGeminiStream) {
+    ml_value_t *Pos[8];
+    int PosCount = 0;
+    ml_value_t *Opts = mlai_parse_args(Count, Args, 0, 2, Pos, &PosCount, NULL);
+    if (PosCount < 1) {
+        return ml_error("CallError", "gemini::stream requires a prompt string or parts list");
+    }
+    ml_value_t *OnChunk = (PosCount >= 2 && !ml_is(Pos[1], MLMapT)) ? Pos[1] : NULL;
+    if (PosCount >= 2 && ml_is(Pos[1], MLMapT)) {
+        mlai_merge_map(Opts, Pos[1]);
+    }
+    if (!OnChunk) {
+        ml_value_t *Cb = ml_map_search(Opts, ml_cstring("on_chunk"));
+        if (Cb && ml_deref(Cb) != MLNil) OnChunk = ml_deref(Cb);
+    }
+    return mlai_gemini_stream_impl(Pos[0], Opts, OnChunk);
+}
+
+ML_FUNCTION(MLAiStream) {
+    ml_value_t *Pos[8];
+    int PosCount = 0;
+    ml_value_t *Opts = mlai_parse_args(Count, Args, 0, 2, Pos, &PosCount, NULL);
+    if (PosCount < 1) {
+        return ml_error("CallError", "ai::stream requires a prompt string");
+    }
+    ml_value_t *OnChunk = (PosCount >= 2 && !ml_is(Pos[1], MLMapT)) ? Pos[1] : NULL;
+    if (PosCount >= 2 && ml_is(Pos[1], MLMapT)) {
+        mlai_merge_map(Opts, Pos[1]);
+    }
+    if (!OnChunk) {
+        ml_value_t *Cb = ml_map_search(Opts, ml_cstring("on_chunk"));
+        if (Cb && ml_deref(Cb) != MLNil) OnChunk = ml_deref(Cb);
+    }
+    const char *Prov = mlai_pick_provider(Opts);
+    if (strcmp(Prov, "agy") == 0) {
+        if (!ml_is(Pos[0], MLStringT)) {
+            return ml_error("TypeError", "agy stream prompt must be a string");
+        }
+        return mlai_agy_stream_impl(ml_string_value(Pos[0]), Opts, OnChunk, NULL);
+    }
+    if (strcmp(Prov, "gemini") == 0) {
+        return mlai_gemini_stream_impl(Pos[0], Opts, OnChunk);
+    }
+    return ml_error("ValueError", "Unknown AI provider '%s' (expected \"agy\" or \"gemini\")", Prov);
+}
+
 ML_FUNCTION(MLAiStatus) {
     ml_value_t *Out = ml_map();
     ml_map_insert(Out, ml_cstring("agy"), mlai_agy_status_impl());
@@ -1364,6 +2116,7 @@ void ml_ai_init(stringmap_t *Globals) {
         "ask",      AgyPromptFn,
         "run",      AgyPromptFn,
         "complete", AgyCompleteFn,
+        "stream",   MLAgyStream,
         "chat",     MLAgyChat,
         "session",  MLAgySession,
         "status",   MLAgyStatus,
@@ -1378,6 +2131,7 @@ void ml_ai_init(stringmap_t *Globals) {
         "ask",      GemPromptFn,
         "generate", GemPromptFn,
         "complete", GemCompleteFn,
+        "stream",   MLGeminiStream,
         "chat",     MLGeminiChat,
         "session",  MLGeminiSession,
         "embed",    MLGeminiEmbed,
@@ -1395,6 +2149,7 @@ void ml_ai_init(stringmap_t *Globals) {
         "prompt",   AiPromptFn,
         "ask",      AiPromptFn,
         "complete", AiCompleteFn,
+        "stream",   MLAiStream,
         "chat",     MLAiChat,
         "session",  MLAiSession,
         "status",   MLAiStatus,

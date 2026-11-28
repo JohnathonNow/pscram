@@ -56,6 +56,7 @@ const EMBED_JS_MODULES: &[(&str, &str)] = &[
     ("features/managers.js", include_str!("../web/js/features/managers.js")),
     ("features/agy.js", include_str!("../web/js/features/agy.js")),
     ("features/debugger.js", include_str!("../web/js/features/debugger.js")),
+    ("features/editor_tools.js", include_str!("../web/js/features/editor_tools.js")),
 ];
 
 pub struct AppState {
@@ -116,6 +117,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notebook/to-mini", post(api_notebook_to_script))
         .route("/api/notebook/from-script", post(api_notebook_from_script))
         .route("/api/notebook/to-script", post(api_notebook_to_script))
+        .route("/api/notebook/checkpoints", get(api_list_checkpoints).post(api_create_checkpoint))
+        .route("/api/notebook/checkpoints/:id", get(api_get_checkpoint).delete(api_delete_checkpoint))
         // Custom script invocation API
         .route("/invoke", post(api_invoke_root))
         .route("/invoke/*script", post(api_invoke_path))
@@ -148,6 +151,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/:id/stop", post(api_stop_job))
         // Background Services & Cross-UI Messaging API
         .route("/api/services", get(api_list_services).post(api_start_service))
+        .route("/api/services/bus/history", get(api_services_bus_history))
+        .route("/api/services/bus/clear", post(api_services_bus_clear))
+        .route("/api/services/bus/stream", get(api_services_bus_stream))
         .route("/api/services/:name", get(api_get_service).delete(api_delete_service))
         .route("/api/services/:name/stop", post(api_stop_service))
         .route("/api/services/:name/restart", post(api_restart_service))
@@ -170,6 +176,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/agy/status", get(api_agy_status))
         .route("/api/agy/assist", post(api_agy_assist))
         .route("/api/agy/prompt", post(api_agy_prompt))
+        .route("/api/agy/prompt-stream", post(api_agy_prompt_stream))
         .route("/api/agy/cancel", post(api_agy_cancel))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
@@ -1472,6 +1479,35 @@ async fn api_agy_prompt(
     }
 }
 
+async fn api_agy_prompt_stream(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AgyPromptRequest>,
+) -> Response {
+    if req.prompt.trim().is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "Prompt cannot be empty");
+    }
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+
+    let agy = st.agy.clone();
+    tokio::spawn(async move {
+        let _ = agy.prompt_stream(req, ev_tx).await;
+    });
+
+    tokio::spawn(async move {
+        while let Some(val) = ev_rx.recv().await {
+            let payload = serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_string());
+            if sse_tx.send(Ok(Event::default().data(payload))).is_err() {
+                break;
+            }
+        }
+    });
+
+    Sse::new(SseReceiverStream { rx: sse_rx })
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct AgyCancelBody {
     request_id: String,
@@ -2365,4 +2401,274 @@ async fn api_service_events(
     Sse::new(SseReceiverStream { rx: sse_rx })
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response()
+}
+
+// --- Service Message Bus Inspector API (Feature #7) ---
+
+#[derive(Deserialize, Default)]
+struct BusHistoryQuery {
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn api_services_bus_history(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<BusHistoryQuery>,
+) -> Response {
+    let events = st
+        .services
+        .bus_history(q.service.as_deref(), q.topic.as_deref(), q.limit.unwrap_or(150))
+        .await;
+    Json(json!({ "ok": true, "events": events })).into_response()
+}
+
+async fn api_services_bus_clear(State(st): State<Arc<AppState>>) -> Response {
+    let cleared = st.services.clear_bus_history().await;
+    Json(json!({ "ok": true, "cleared": cleared })).into_response()
+}
+
+async fn api_services_bus_stream(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<BusHistoryQuery>,
+) -> Response {
+    let mut rx = st.services.subscribe_bus_tap().await;
+    let svc_filter = q.service.filter(|s| !s.trim().is_empty() && s != "*");
+    let topic_filter = q.topic.filter(|t| !t.trim().is_empty() && t != "*");
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+
+    let _ = sse_tx.send(Ok(Event::default()
+        .event("connected")
+        .data(json!({ "ok": true }).to_string())));
+
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Some(ref sf) = svc_filter {
+                if &ev.service != sf {
+                    continue;
+                }
+            }
+            if let Some(ref tf) = topic_filter {
+                if &ev.topic != tf {
+                    continue;
+                }
+            }
+            let payload = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
+            if sse_tx
+                .send(Ok(Event::default().event("bus").data(payload)))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    Sse::new(SseReceiverStream { rx: sse_rx })
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response()
+}
+
+// --- Notebook Checkpoints API (Feature #9) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NotebookCheckpointRecord {
+    id: String,
+    path: String,
+    label: String,
+    created_at: String,
+    cell_count: usize,
+    doc: NotebookDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NotebookCheckpointMeta {
+    id: String,
+    path: String,
+    label: String,
+    created_at: String,
+    cell_count: usize,
+    size_bytes: u64,
+}
+
+fn notebook_checkpoint_dir(files: &FileStore, rel_path: &str) -> Result<PathBuf, String> {
+    let clean = rel_path.trim().trim_start_matches('/').replace('\\', "/");
+    if clean.is_empty() || clean.contains("..") {
+        return Err("Invalid notebook path for checkpoints".to_string());
+    }
+    // FNV-1a 64-bit hash for stable folder name under .mlnb_checkpoints/
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in clean.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let dir = files
+        .root()
+        .join(".mlnb_checkpoints")
+        .join(format!("{:016x}", hash));
+    Ok(dir)
+}
+
+#[derive(Deserialize)]
+struct CheckpointPathQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct CreateCheckpointBody {
+    path: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    doc: Option<NotebookDocument>,
+}
+
+async fn api_list_checkpoints(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<CheckpointPathQuery>,
+) -> Response {
+    let dir = match notebook_checkpoint_dir(&st.files, &q.path) {
+        Ok(d) => d,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+    };
+    let mut items: Vec<NotebookCheckpointMeta> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                if let Ok(rec) = serde_json::from_str::<NotebookCheckpointRecord>(&raw) {
+                    items.push(NotebookCheckpointMeta {
+                        id: rec.id,
+                        path: rec.path,
+                        label: rec.label,
+                        created_at: rec.created_at,
+                        cell_count: rec.cell_count,
+                        size_bytes,
+                    });
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+    Json(json!({ "ok": true, "checkpoints": items })).into_response()
+}
+
+async fn api_create_checkpoint(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<CreateCheckpointBody>,
+) -> Response {
+    let dir = match notebook_checkpoint_dir(&st.files, &body.path) {
+        Ok(d) => d,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+    };
+    let doc = match body.doc {
+        Some(d) => d,
+        None => match st.files.read_file(&body.path) {
+            Ok(raw) => match serde_json::from_str::<NotebookDocument>(&raw.content) {
+                Ok(d) => d,
+                Err(e) => return api_err(StatusCode::BAD_REQUEST, format!("Invalid notebook JSON: {}", e)),
+            },
+            Err(e) => return api_err(StatusCode::NOT_FOUND, e),
+        },
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create checkpoint dir: {}", e));
+    }
+    let now = chrono::Utc::now();
+    let short_id = uuid::Uuid::new_v4().to_string();
+    let id = format!(
+        "{}-{}",
+        now.format("%Y%m%dT%H%M%S%3fZ"),
+        &short_id[..8]
+    );
+    let label = body
+        .label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Checkpoint".to_string());
+    let rec = NotebookCheckpointRecord {
+        id: id.clone(),
+        path: body.path.clone(),
+        label: label.clone(),
+        created_at: now.to_rfc3339(),
+        cell_count: doc.cells.len(),
+        doc,
+    };
+    let encoded = match serde_json::to_string_pretty(&rec) {
+        Ok(s) => s,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let file_path = dir.join(format!("{}.json", id));
+    if let Err(e) = std::fs::write(&file_path, &encoded) {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write checkpoint: {}", e));
+    }
+    // Prune older checkpoints beyond 30 per notebook
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        if files.len() > 30 {
+            files.sort();
+            let to_remove = files.len() - 30;
+            for old in files.into_iter().take(to_remove) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+    let meta = NotebookCheckpointMeta {
+        id: rec.id,
+        path: rec.path,
+        label: rec.label,
+        created_at: rec.created_at,
+        cell_count: rec.cell_count,
+        size_bytes: encoded.len() as u64,
+    };
+    Json(json!({ "ok": true, "checkpoint": meta })).into_response()
+}
+
+async fn api_get_checkpoint(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<CheckpointPathQuery>,
+) -> Response {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return api_err(StatusCode::BAD_REQUEST, "Invalid checkpoint id");
+    }
+    let dir = match notebook_checkpoint_dir(&st.files, &q.path) {
+        Ok(d) => d,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+    };
+    let p = dir.join(format!("{}.json", id));
+    match std::fs::read_to_string(&p) {
+        Ok(raw) => match serde_json::from_str::<NotebookCheckpointRecord>(&raw) {
+            Ok(rec) => Json(json!({ "ok": true, "checkpoint": rec })).into_response(),
+            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        },
+        Err(_) => api_err(StatusCode::NOT_FOUND, format!("Checkpoint '{}' not found", id)),
+    }
+}
+
+async fn api_delete_checkpoint(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<CheckpointPathQuery>,
+) -> Response {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return api_err(StatusCode::BAD_REQUEST, "Invalid checkpoint id");
+    }
+    let dir = match notebook_checkpoint_dir(&st.files, &q.path) {
+        Ok(d) => d,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e),
+    };
+    let p = dir.join(format!("{}.json", id));
+    let removed = std::fs::remove_file(&p).is_ok();
+    Json(json!({ "ok": true, "removed": removed })).into_response()
 }

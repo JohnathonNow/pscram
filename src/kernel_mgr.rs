@@ -172,6 +172,8 @@ impl KernelSession {
                             traceback: String::new(),
                         }),
                         duration_ms: 0.0,
+                        memory_bytes: None,
+                        memory_delta_bytes: None,
                     });
                 }
                 Err("Kernel exited unexpectedly. Click Restart Kernel to continue.".to_string())
@@ -282,6 +284,8 @@ impl KernelSession {
                                 traceback: String::new(),
                             }),
                             duration_ms: 0.0,
+                            memory_bytes: None,
+                            memory_delta_bytes: None,
                         });
                     }
                     return Err("Kernel exited unexpectedly. Click Restart Kernel to continue.".to_string());

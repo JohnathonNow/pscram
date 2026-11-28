@@ -16,6 +16,7 @@ import {
 } from "./viewers.js";
 import { ensureKernel, renderOutputHtml, hydrateUiDisplays } from "./notebook.js";
 import { openFileAgyPanel, runFileAgy } from "./agy.js";
+import { applyFileDiagnostics, clearFileDiagnostics } from "./editor_tools.js";
 
 // Script /invoke panel controls
 function defaultInvokePayloadFor(path) {
@@ -286,6 +287,11 @@ export function initScriptTools() {
         body: JSON.stringify(reqBody),
       });
       tab._lastRunOutput = resp;
+      if (resp.error) {
+        applyFileDiagnostics(tab, resp.error);
+      } else {
+        clearFileDiagnostics(tab);
+      }
       outBody.innerHTML = renderOutputHtml(resp, resp.execution_count) || `<span style="color:var(--text-muted)">(no output)</span>`;
       hydrateUiDisplays(outBody, resp);
       hydrateMediaPreviews(outBody);
