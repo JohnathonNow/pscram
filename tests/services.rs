@@ -292,3 +292,169 @@ ui::card("Service UI", ui::vbox(lbl, btn)):show
     assert!(svc_client_js.contains("service::call"));
     assert!(svc_client_js.contains("service::send"));
 }
+
+#[test]
+fn test_sample_workspace_taskboard_service_and_ui() {
+    let srv = TestServer::start(&[]);
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let svc_src = std::fs::read_to_string(repo_root.join("sample_workspace/services/taskboard.mini"))
+        .expect("read sample_workspace/services/taskboard.mini");
+    let ui_src = std::fs::read_to_string(repo_root.join("sample_workspace/uis/taskboard.ui"))
+        .expect("read sample_workspace/uis/taskboard.ui");
+
+    write_ws_file(&srv, "services/taskboard.mini", &svc_src);
+    write_ws_file(&srv, "uis/taskboard.ui", &ui_src);
+
+    // 1. Verify the example `.ui` compiles cleanly to MiniJS bytecode
+    let ui_resp = srv.get("/ui/uis/taskboard.ui");
+    assert_eq!(ui_resp.status, 200, "taskboard.ui failed: {}", ui_resp.text());
+    let ui_html = ui_resp.text();
+    assert!(
+        ui_html.contains("const errMsg = null;"),
+        "taskboard.ui had compile error:\n{}",
+        ui_html
+    );
+    assert!(ui_html.contains("service::on") || ui_html.contains("\"service\""));
+
+    // 2. Start the example background service
+    let start_r = srv.post_json(
+        "/api/services",
+        &json!({
+            "name": "taskboard",
+            "script": "services/taskboard.mini",
+            "params": { "room": "Demo Room" }
+        }),
+    );
+    assert_eq!(start_r.status, 200, "start taskboard failed: {}", start_r.text());
+    assert_eq!(start_r.json()["service"]["status"], "running");
+
+    // 3. Connect two UI SSE subscribers to verify cross-UI sync & direct messaging
+    let (rx_tab1, sock_tab1) = connect_sse_ui(srv.port, "taskboard", "ui-tab1");
+    let (rx_tab2, sock_tab2) = connect_sse_ui(srv.port, "taskboard", "ui-tab2");
+
+    let (ev1, _) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 connected");
+    let (ev2, _) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 connected");
+    assert_eq!(ev1, "connected");
+    assert_eq!(ev2, "connected");
+
+    // 4. RPC get_state returns seeded tasks, summary, and both connected clients
+    let state_r = srv.post_json(
+        "/api/services/taskboard/call",
+        &json!({
+            "topic": "get_state",
+            "from": "ui-tab1",
+            "data": {},
+            "timeout_ms": 5000
+        }),
+    );
+    assert_eq!(state_r.status, 200, "get_state failed: {}", state_r.text());
+    let state_plain = &state_r.json()["reply_plain"];
+    assert_eq!(state_plain["room"], "Demo Room");
+    assert_eq!(state_plain["summary"]["total"], 3);
+    assert_eq!(state_plain["client_count"], 2);
+
+    // 5. Add a task from tab1 -> state_changed broadcasts to BOTH tab1 and tab2
+    let add_r = srv.post_json(
+        "/api/services/taskboard/send",
+        &json!({
+            "topic": "add_task",
+            "from": "ui-tab1",
+            "data": { "title": "Ship service demo", "priority": "high", "author": "Alice" }
+        }),
+    );
+    assert_eq!(add_r.status, 200);
+    let (e1, m1) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 add broadcast");
+    let (e2, m2) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 add broadcast");
+    assert_eq!(e1, "message");
+    assert_eq!(e2, "message");
+    assert_eq!(m1["topic"], "state_changed");
+    assert_eq!(m2["topic"], "state_changed");
+    assert_eq!(m1["data"]["value"]["summary"]["value"]["total"]["value"], 4);
+    assert_eq!(m2["data"]["value"]["summary"]["value"]["total"]["value"], 4);
+
+    // 6. Cycle status of newly added task #4: open -> in_progress
+    let cyc_r = srv.post_json(
+        "/api/services/taskboard/call",
+        &json!({
+            "topic": "cycle_status",
+            "from": "ui-tab2",
+            "data": { "id": 4 },
+            "timeout_ms": 5000
+        }),
+    );
+    assert_eq!(cyc_r.status, 200, "cycle_status failed: {}", cyc_r.text());
+    assert_eq!(cyc_r.json()["reply_plain"]["task"]["status"], "in_progress");
+    let (_, _) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 cycle broadcast");
+    let (_, _) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 cycle broadcast");
+
+    // 7. Broadcast announcement reaches both tabs
+    let ann_r = srv.post_json(
+        "/api/services/taskboard/send",
+        &json!({
+            "topic": "announce",
+            "from": "ui-tab1",
+            "data": { "text": "Standup in 5 minutes", "author": "Alice" }
+        }),
+    );
+    assert_eq!(ann_r.status, 200);
+    let (_, a1) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 announce");
+    let (_, a2) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 announce");
+    assert_eq!(a1["topic"], "announcement");
+    assert_eq!(a2["topic"], "announcement");
+    assert_eq!(a2["data"]["value"]["text"]["value"], "Standup in 5 minutes");
+
+    // 8. Direct ping from ui-tab2 delivers private "pong" ONLY to ui-tab2
+    let ping_r = srv.post_json(
+        "/api/services/taskboard/send",
+        &json!({
+            "topic": "ping",
+            "from": "ui-tab2",
+            "data": {}
+        }),
+    );
+    assert_eq!(ping_r.status, 200);
+    let (_, p2) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 direct pong");
+    assert_eq!(p2["topic"], "pong");
+    assert_eq!(p2["data"]["value"]["to"]["value"], "ui-tab2");
+    assert!(
+        rx_tab1.recv_timeout(Duration::from_millis(250)).is_err(),
+        "ui-tab1 must not receive ui-tab2's direct pong"
+    );
+
+    // 9. Clear done tasks and delete a task
+    let clr_r = srv.post_json(
+        "/api/services/taskboard/call",
+        &json!({
+            "topic": "clear_done",
+            "from": "ui-tab1",
+            "data": {},
+            "timeout_ms": 5000
+        }),
+    );
+    assert_eq!(clr_r.status, 200);
+    assert_eq!(clr_r.json()["reply_plain"]["cleared"], 1);
+    let (_, _) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 clear broadcast");
+    let (_, _) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 clear broadcast");
+
+    let del_r = srv.post_json(
+        "/api/services/taskboard/call",
+        &json!({
+            "topic": "delete_task",
+            "from": "ui-tab1",
+            "data": { "id": 4 },
+            "timeout_ms": 5000
+        }),
+    );
+    assert_eq!(del_r.status, 200);
+    assert_eq!(del_r.json()["reply_plain"]["ok"], true);
+    let (_, _) = rx_tab1.recv_timeout(Duration::from_secs(5)).expect("tab1 delete broadcast");
+    let (_, _) = rx_tab2.recv_timeout(Duration::from_secs(5)).expect("tab2 delete broadcast");
+
+    // 10. Clean shutdown
+    let _ = sock_tab1.shutdown(std::net::Shutdown::Both);
+    let _ = sock_tab2.shutdown(std::net::Shutdown::Both);
+    let stop_r = srv.post_json("/api/services/taskboard/stop", &json!({}));
+    assert_eq!(stop_r.status, 200);
+    assert_eq!(stop_r.json()["service"]["status"], "stopped");
+}

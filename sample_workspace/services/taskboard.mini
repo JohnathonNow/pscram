@@ -1,0 +1,262 @@
+:> Example Background Service: Real-Time Shared Task Board
+:>
+:> Demonstrates persistent state, pub/sub broadcasts (`service::broadcast`),
+:> direct client messaging (`service::send("ui-...", ...)`), request-reply RPC
+:> (`service::reply`), and connected UI tracking (`service::clients`).
+:>
+:> Start from the script editor's "Service" button, from the Services Manager,
+:> from Minilang (`service::start("taskboard", "services/taskboard.mini")`),
+:> or simply open `/ui/uis/taskboard.ui` (which auto-starts it if needed).
+:> Open `/ui/uis/taskboard.ui` in two browser tabs to watch live real-time sync!
+
+let me := service::self()
+let svc_name := (me and me["name"]) or "taskboard"
+let room_name := Params["room"] or "Team Board"
+
+var next_id := 1
+var tasks := []
+var activity := []
+
+fun add_activity(kind, text, by) do
+    activity:put({
+        "kind" is kind,
+        "text" is text,
+        "by" is by,
+        "at" is string(now())
+    })
+    loop
+        while activity:count > 20
+        activity:pull
+    end
+end
+
+fun create_task(title, priority, status, author) do
+    let item := {
+        "id" is next_id,
+        "title" is title,
+        "priority" is priority,
+        "status" is status,
+        "author" is author,
+        "updated_at" is string(now())
+    }
+    next_id := next_id + 1
+    tasks:put(item)
+    ret item
+end
+
+fun normalize_priority(raw) do
+    let p := if raw then string(raw):lower:trim else "medium" end
+    if p = "high" or p = "medium" or p = "low" then
+        ret p
+    end
+    ret "medium"
+end
+
+fun next_status(cur) do
+    if cur = "open" then
+        ret "in_progress"
+    elseif cur = "in_progress" then
+        ret "done"
+    else
+        ret "open"
+    end
+end
+
+fun build_snapshot() do
+    var open_cnt := 0
+    var prog_cnt := 0
+    var done_cnt := 0
+    var high_cnt := 0
+    var med_cnt := 0
+    var low_cnt := 0
+    for t in tasks do
+        if t["status"] = "open" then
+            open_cnt := open_cnt + 1
+        elseif t["status"] = "in_progress" then
+            prog_cnt := prog_cnt + 1
+        elseif t["status"] = "done" then
+            done_cnt := done_cnt + 1
+        end
+        if t["priority"] = "high" then
+            high_cnt := high_cnt + 1
+        elseif t["priority"] = "medium" then
+            med_cnt := med_cnt + 1
+        else
+            low_cnt := low_cnt + 1
+        end
+    end
+    let connected := service::clients()
+    ret {
+        "service" is svc_name,
+        "room" is room_name,
+        "tasks" is tasks,
+        "summary" is {
+            "total" is tasks:count,
+            "open" is open_cnt,
+            "in_progress" is prog_cnt,
+            "done" is done_cnt,
+            "high" is high_cnt,
+            "medium" is med_cnt,
+            "low" is low_cnt
+        },
+        "clients" is connected,
+        "client_count" is connected:count,
+        "activity" is activity
+    }
+end
+
+if not (Params["seed"] = false) then
+    create_task("Open this UI in a second browser tab to see live sync", "high", "open", "system")
+    create_task("Try advancing a task status or broadcasting an announcement", "medium", "in_progress", "system")
+    create_task("Click Direct Ping to test targeted UI messaging", "low", "done", "system")
+    add_activity("system", 'Initialized "{room_name}" with {tasks:count} starter tasks', svc_name)
+else
+    add_activity("system", 'Initialized empty "{room_name}"', svc_name)
+end
+
+println('[{svc_name}] Service started for "{room_name}" ({tasks:count} tasks)')
+
+loop
+    let msg := service::recv(5000)
+    if msg then
+        let topic := msg["topic"]
+        let data := msg["data"]
+        let sender := msg["from"] or "client"
+
+        if topic = "get_state" then
+            let snap := build_snapshot()
+            if msg["reply_to"] then
+                service::reply(msg, snap)
+            else
+                service::broadcast("state_changed", snap)
+            end
+
+        elseif topic = "add_task" then
+            let raw_title := (data and data["title"]) or ""
+            let title := string(raw_title):trim
+            if title:length > 0 then
+                let prio := normalize_priority(data and data["priority"])
+                let author := (data and data["author"]) or sender
+                let created := create_task(title, prio, "open", author)
+                add_activity("add", 'Added #{created["id"]}: {title} ({prio})', author)
+                println('[{svc_name}] +task #{created["id"]} "{title}" by {author}')
+                let snap := build_snapshot()
+                service::broadcast("state_changed", snap)
+                if msg["reply_to"] then
+                    service::reply(msg, {"ok" is true, "task" is created, "state" is snap})
+                end
+            else
+                if msg["reply_to"] then
+                    service::reply(msg, {"ok" is false, "error" is "Task title cannot be empty"})
+                end
+            end
+
+        elseif topic = "cycle_status" then
+            let target_id := data and data["id"]
+            var updated := nil
+            for t in tasks do
+                if t["id"] = target_id then
+                    t["status"] := next_status(t["status"])
+                    t["updated_at"] := string(now())
+                    updated := t
+                end
+            end
+            if updated then
+                add_activity("status", 'Moved #{updated["id"]} "{updated["title"]}" -> {updated["status"]}', sender)
+                println('[{svc_name}] ~task #{updated["id"]} -> {updated["status"]}')
+                let snap := build_snapshot()
+                service::broadcast("state_changed", snap)
+                if msg["reply_to"] then
+                    service::reply(msg, {"ok" is true, "task" is updated, "state" is snap})
+                end
+            elseif msg["reply_to"] then
+                service::reply(msg, {"ok" is false, "error" is "Task not found"})
+            end
+
+        elseif topic = "delete_task" then
+            let target_id := data and data["id"]
+            let kept := []
+            var removed := nil
+            for t in tasks do
+                if t["id"] = target_id then
+                    removed := t
+                else
+                    kept:put(t)
+                end
+            end
+            tasks := kept
+            if removed then
+                add_activity("delete", 'Deleted #{removed["id"]}: {removed["title"]}', sender)
+                println('[{svc_name}] -task #{removed["id"]}')
+                let snap := build_snapshot()
+                service::broadcast("state_changed", snap)
+                if msg["reply_to"] then
+                    service::reply(msg, {"ok" is true, "removed" is removed, "state" is snap})
+                end
+            elseif msg["reply_to"] then
+                service::reply(msg, {"ok" is false, "error" is "Task not found"})
+            end
+
+        elseif topic = "clear_done" then
+            let kept := []
+            var cleared := 0
+            for t in tasks do
+                if t["status"] = "done" then
+                    cleared := cleared + 1
+                else
+                    kept:put(t)
+                end
+            end
+            tasks := kept
+            add_activity("clear", 'Cleared {cleared} completed task(s)', sender)
+            println('[{svc_name}] cleared {cleared} done task(s)')
+            let snap := build_snapshot()
+            service::broadcast("state_changed", snap)
+            if msg["reply_to"] then
+                service::reply(msg, {"ok" is true, "cleared" is cleared, "state" is snap})
+            end
+
+        elseif topic = "announce" then
+            let raw_text := if type(data) = string then data else (data and data["text"]) or "" end
+            let text := string(raw_text):trim
+            if text:length > 0 then
+                let author := (if type(data) = map then data["author"] else nil end) or sender
+                add_activity("announce", text, author)
+                println('[{svc_name}] announce from {author}: {text}')
+                let delivered := service::broadcast("announcement", {
+                    "text" is text,
+                    "from" is author,
+                    "timestamp" is string(now())
+                })
+                if msg["reply_to"] then
+                    service::reply(msg, {"ok" is true, "delivered" is delivered})
+                end
+            elseif msg["reply_to"] then
+                service::reply(msg, {"ok" is false, "error" is "Announcement text cannot be empty"})
+            end
+
+        elseif topic = "ping" then
+            let connected := service::clients()
+            let pong := {
+                "to" is sender,
+                "service" is svc_name,
+                "room" is room_name,
+                "task_count" is tasks:count,
+                "client_count" is connected:count,
+                "timestamp" is string(now())
+            }
+            if sender:starts("ui-") then
+                :> Direct message targeted ONLY to the requesting UI client
+                service::send(sender, "pong", pong)
+            end
+            if msg["reply_to"] then
+                service::reply(msg, pong)
+            end
+
+        elseif topic = "quit" then
+            service::broadcast("service_stopping", {"service" is svc_name, "by" is sender})
+            println('[{svc_name}] Shutting down at request of {sender}')
+            exit
+        end
+    end
+end

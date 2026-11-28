@@ -1,0 +1,382 @@
+:> Example Service-Backed UI: Real-Time Shared Task Board
+:> Served at /ui/uis/taskboard.ui (or /ui/taskboard.ui)
+:>
+:> Connects to the persistent background service `services/taskboard.mini`
+:> (auto-starting it on mount if it isn't running yet) and demonstrates:
+:>   - `service::status`, `service::start`, `service::restart`, `service::stop`
+:>   - `service::on` / `service::off` (real-time SSE broadcasts & direct messages)
+:>   - `service::send` (fire-and-forget mutations & private direct ping)
+:>   - `service::call` (request-reply RPC for initial snapshot & refresh)
+:>   - `service::client_id` (unique per-tab UI identity)
+:>
+:> Tip: Open this URL in two browser tabs side by side to watch live sync!
+
+let SVC := "taskboard"
+let SCRIPT := "services/taskboard.mini"
+
+var latest_state := nil
+var current_filter := "all"
+var event_lines := []
+
+fun esc(v) do
+    let s := string(v or "")
+    ret s:replace("&", "&amp;"):replace("<", "&lt;"):replace(">", "&gt;")
+end
+
+fun status_label(st) do
+    if st = "in_progress" then
+        ret "In Progress"
+    elseif st = "done" then
+        ret "Done"
+    else
+        ret "Open"
+    end
+end
+
+fun status_variant(st) do
+    if st = "done" then
+        ret "success"
+    elseif st = "in_progress" then
+        ret "warning"
+    else
+        ret "info"
+    end
+end
+
+fun priority_variant(pr) do
+    if pr = "high" then
+        ret "danger"
+    elseif pr = "medium" then
+        ret "warning"
+    else
+        ret "info"
+    end
+end
+
+:> --- Header & Status Widgets ---
+let conn_badge := ui::badge("Connecting...", "warning")
+let client_meta := ui::text("Initializing UI client...")
+let banner_view := ui::html("")
+
+:> --- Task Form Widgets ---
+let author_inp := ui::input("Your name", "Alice", width is "140px")
+let title_inp := ui::input("Add a shared task...", "", style is "flex:1;min-width:200px")
+let prio_sel := ui::select(["high", "medium", "low"], "medium")
+
+:> --- Board & Filter Widgets ---
+let filter_sel := ui::select(["all", "open", "in_progress", "done"], "all")
+let summary_html := ui::html("<span style='color:var(--text-muted)'>Waiting for service state...</span>")
+let task_list_box := ui::vbox(gap is 8)
+
+:> --- Table & Chart Widgets ---
+let tasks_table := ui::table([], "Shared Tasks")
+let status_chart := ui::chart({
+    "type" is "bar",
+    "title" is "Tasks by Status",
+    "data" is {"Open" is 0, "In Progress" is 0, "Done" is 0}
+})
+
+:> --- Broadcast & Events Widgets ---
+let announce_inp := ui::input("Broadcast a live message to all open tabs...", "", style is "flex:1;min-width:220px")
+let events_html := ui::html("<p style='color:var(--text-muted);margin:0'><em>No events received yet.</em></p>")
+
+fun append_event(tag, detail) do
+    event_lines:put('<li><span class="mlui-badge mlui-badge-info">{esc(tag)}</span> {esc(detail)}</li>')
+    loop
+        while event_lines:count > 25
+        event_lines:pull
+    end
+    let items := []
+    var i := event_lines:count
+    loop
+        while i >= 1
+        items:put(event_lines[i])
+        i := i - 1
+    end
+    events_html:set_html('<ul style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px">{items:join}</ul>')
+end
+
+fun render_state(snap) do
+    if not snap then ret nil end
+    latest_state := snap
+    let tasks := snap["tasks"] or []
+    let summary := snap["summary"] or {}
+    let total := summary["total"] or tasks:count
+    let open_cnt := summary["open"] or 0
+    let prog_cnt := summary["in_progress"] or 0
+    let done_cnt := summary["done"] or 0
+    let client_cnt := snap["client_count"] or 0
+    let me := service::client_id()
+
+    conn_badge:set_text('Connected · {snap["service"] or SVC}')
+    client_meta:set_text('Room: {snap["room"] or "Team Board"} · {client_cnt} connected UI(s) · Tab ID: {me}')
+
+    summary_html:set_html(
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">' +
+        '<span class="mlui-badge mlui-badge-info">Total: {total}</span>' +
+        '<span class="mlui-badge mlui-badge-info">Open: {open_cnt}</span>' +
+        '<span class="mlui-badge mlui-badge-warning">In Progress: {prog_cnt}</span>' +
+        '<span class="mlui-badge mlui-badge-success">Done: {done_cnt}</span>' +
+        '</div>'
+    )
+
+    :> Render interactive task rows
+    task_list_box:clear
+    var shown := 0
+    for t in tasks do
+        let st := t["status"] or "open"
+        if current_filter = "all" or current_filter = st then
+            shown := shown + 1
+            let tid := t["id"]
+            let title := t["title"] or ""
+            let pr := t["priority"] or "medium"
+            let by := t["author"] or "client"
+
+            let next_lbl := if st = "open" then "Start" elseif st = "in_progress" then "Complete" else "Reopen" end
+            let cycle_btn := ui::button(next_lbl, fun() do
+                service::send(SVC, "cycle_status", {"id" is tid})
+            end, variant is "secondary")
+
+            let del_btn := ui::button("Delete", fun() do
+                service::send(SVC, "delete_task", {"id" is tid})
+            end, variant is "danger")
+
+            let row := ui::panel(
+                ui::hbox(
+                    ui::badge('#{tid}', "info"),
+                    ui::badge(pr:upper, priority_variant(pr)),
+                    ui::badge(status_label(st), status_variant(st)),
+                    ui::text(title, style is "flex:1;font-weight:500"),
+                    ui::text('by {by}', style is "color:var(--text-muted);font-size:12px"),
+                    cycle_btn,
+                    del_btn,
+                    gap is 8
+                )
+            )
+            task_list_box:append(row)
+        end
+    end
+
+    if shown = 0 then
+        task_list_box:append(ui::text("No tasks match the current filter.", style is "color:var(--text-muted);padding:8px 0"))
+    end
+
+    :> Update Table & Chart tab widgets live
+    tasks_table:set_data(tasks)
+    status_chart:set_spec({
+        "type" is "bar",
+        "title" is "Tasks by Status",
+        "data" is {
+            "Open" is open_cnt,
+            "In Progress" is prog_cnt,
+            "Done" is done_cnt
+        }
+    })
+end
+
+fun fetch_state() do
+    service::call(SVC, "get_state", {}, fun(res, err) do
+        if err then
+            conn_badge:set_text("RPC Error")
+            banner_view:set_html('<div class="mlui-error-banner">{esc(err)}</div>')
+        else
+            banner_view:set_html("")
+            render_state(res)
+            append_event("rpc:get_state", 'Synced {res["summary"]["total"]} task(s)')
+        end
+    end)
+end
+
+fun subscribe_service() do
+    service::off(SVC)
+
+    service::on(SVC, "state_changed", fun(data, msg) do
+        render_state(data)
+        append_event("broadcast:state_changed", 'Board updated ({data["summary"]["total"]} tasks, {data["client_count"]} UIs)')
+    end)
+
+    service::on(SVC, "announcement", fun(data, msg) do
+        let from := (data and data["from"]) or "unknown"
+        let text := (data and data["text"]) or ""
+        banner_view:set_html(
+            '<div style="padding:8px 12px;border-radius:6px;background:rgba(122,162,247,0.14);border:1px solid rgba(122,162,247,0.35)">' +
+            '<strong>Announcement from {esc(from)}:</strong> {esc(text)}' +
+            '</div>'
+        )
+        append_event("broadcast:announcement", '{from}: {text}')
+    end)
+
+    service::on(SVC, "pong", fun(data, msg) do
+        let cnt := (data and data["task_count"]) or 0
+        let cli := (data and data["client_count"]) or 0
+        let to_id := (data and data["to"]) or service::client_id()
+        banner_view:set_html(
+            '<div style="padding:8px 12px;border-radius:6px;background:rgba(74,222,128,0.14);border:1px solid rgba(74,222,128,0.35)">' +
+            '<strong>Direct Pong (only for {esc(to_id)}):</strong> Service healthy · {cnt} task(s) · {cli} connected UI(s)' +
+            '</div>'
+        )
+        append_event("direct:pong", 'Private reply to {to_id} ({cnt} tasks, {cli} UIs)')
+    end)
+
+    service::on(SVC, "service_stopping", fun(data, msg) do
+        conn_badge:set_text("Stopped")
+        append_event("broadcast:service_stopping", "Service shut down")
+    end)
+end
+
+fun connect_or_start() do
+    conn_badge:set_text("Connecting...")
+    service::status(SVC, fun(info, err) do
+        if not err and info and info["status"] = "running" then
+            subscribe_service()
+            fetch_state()
+        else
+            conn_badge:set_text("Starting service...")
+            service::start(SVC, SCRIPT, {"room" is "Team Board"}, fun(started, serr) do
+                if serr then
+                    conn_badge:set_text("Start Failed")
+                    banner_view:set_html('<div class="mlui-error-banner">Could not start {esc(SCRIPT)}: {esc(serr)}</div>')
+                else
+                    append_event("lifecycle", 'Auto-started background service "{SVC}"')
+                    subscribe_service()
+                    fetch_state()
+                end
+            end)
+        end
+    end)
+end
+
+:> --- Event Bindings ---
+filter_sel:on_change(fun(val) do
+    current_filter := val
+    if latest_state then render_state(latest_state) end
+end)
+
+let submit_task := fun() do
+    let title := title_inp:value:trim
+    if title:length = 0 then ret nil end
+    let author := author_inp:value:trim
+    service::send(SVC, "add_task", {
+        "title" is title,
+        "priority" is prio_sel:value,
+        "author" is if author:length > 0 then author else service::client_id() end
+    })
+    title_inp:set_value("")
+end
+
+let add_form := ui::form(
+    ui::hbox(
+        ui::label("Author:"), author_inp,
+        title_inp,
+        prio_sel,
+        ui::button("Add Task", submit_task),
+        gap is 8
+    ),
+    submit_task
+)
+
+let submit_announce := fun() do
+    let text := announce_inp:value:trim
+    if text:length = 0 then ret nil end
+    let author := author_inp:value:trim
+    service::send(SVC, "announce", {
+        "text" is text,
+        "author" is if author:length > 0 then author else service::client_id() end
+    })
+    announce_inp:set_value("")
+end
+
+let announce_form := ui::form(
+    ui::hbox(
+        announce_inp,
+        ui::button("Broadcast to All UIs", submit_announce),
+        gap is 8
+    ),
+    submit_announce
+)
+
+let refresh_btn := ui::button("Refresh (RPC)", fun() do
+    fetch_state()
+end, variant is "secondary")
+
+let ping_btn := ui::button("Direct Ping", fun() do
+    service::send(SVC, "ping", {})
+end, variant is "secondary")
+
+let restart_btn := ui::button("Restart Service", fun() do
+    conn_badge:set_text("Restarting...")
+    service::restart(SVC, fun(info, err) do
+        if err then
+            banner_view:set_html('<div class="mlui-error-banner">{esc(err)}</div>')
+        else
+            append_event("lifecycle", 'Restarted service "{SVC}"')
+            subscribe_service()
+            fetch_state()
+        end
+    end)
+end, variant is "secondary")
+
+let stop_btn := ui::button("Stop Service", fun() do
+    service::stop(SVC, fun(info, err) do
+        if err then
+            banner_view:set_html('<div class="mlui-error-banner">{esc(err)}</div>')
+        else
+            service::off(SVC)
+            conn_badge:set_text("Stopped")
+            append_event("lifecycle", 'Stopped service "{SVC}"')
+        end
+    end)
+end, variant is "danger")
+
+let connect_btn := ui::button("Start / Reconnect", fun() do
+    connect_or_start()
+end, variant is "primary")
+
+let clear_done_btn := ui::button("Clear Done", fun() do
+    service::send(SVC, "clear_done", {})
+end, variant is "secondary")
+
+let board_tab := ui::vbox(
+    ui::hbox(
+        summary_html,
+        ui::label("Filter:"), filter_sel,
+        clear_done_btn,
+        gap is 10
+    ),
+    task_list_box,
+    gap is 10
+)
+
+let analytics_tab := ui::vbox(
+    status_chart,
+    tasks_table,
+    gap is 12
+)
+
+let events_tab := ui::vbox(
+    announce_form,
+    ui::divider(),
+    ui::heading("Live Service Event Stream", 4),
+    events_html,
+    gap is 10
+)
+
+ui::card("Real-Time Shared Task Board (Background Service Demo)",
+    ui::vbox(
+        ui::hbox(conn_badge, client_meta, gap is 10),
+        ui::hbox(connect_btn, refresh_btn, ping_btn, restart_btn, stop_btn, gap is 8),
+        banner_view,
+        ui::divider(),
+        add_form,
+        ui::divider(),
+        ui::tabs({
+            "Board" is board_tab,
+            "Table & Chart" is analytics_tab,
+            "Broadcast & Events" is events_tab
+        }),
+        gap is 10
+    ),
+    on_mount is fun() do
+        connect_or_start()
+    end
+):show

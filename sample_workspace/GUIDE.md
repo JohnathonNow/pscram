@@ -596,6 +596,8 @@ end
 ui::show(ui::card("Shared Counter", ui::vbox(readout, btn)))
 ```
 
+> **Try the full ready-to-run example:** Start [services/taskboard.mini](services/taskboard.mini) and open [uis/taskboard.ui](uis/taskboard.ui) (at `/ui/uis/taskboard.ui`, which also auto-starts the service if it isn't running yet) in two browser tabs side by side to test real-time pub/sub broadcasts, request-reply RPC, targeted direct messages (`service::send("ui-...", ...)`), live tables/charts, and service lifecycle controls.
+
 ### Prompting `agy` & Gemini (`ai`, `agy`, and `gemini` Modules)
 
 Minilang includes built-in modules for programmatically prompting both the local **Google Antigravity CLI (`agy`)** and the **Google Gemini REST API** directly from notebooks, `.mini` scripts, background jobs, and services — including multi-turn sessions, structured JSON outputs, multimodal images, and embeddings.
